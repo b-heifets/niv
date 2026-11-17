@@ -9,6 +9,7 @@ pub struct Config {
     pub axis: Axis,
     pub initial_slice: Option<usize>,
     pub step: usize,
+    pub rotation: u16,
     pub window: Option<(f32, f32)>,
     pub max_pixels: usize,
     pub max_fps: u32,
@@ -24,7 +25,8 @@ USAGE
 OPTIONS
   -a, --axis x|y|z       Voxel index axis for slicing (NIV_AXIS or NII_AXIS; default z)
       --slice N          Start at zero-based slice N (default: center)
-      --step N           Default movement step (default: 1)
+      --step N           Base slice stride (default: 1)
+  -r, --rotate DEGREES  Rotate view clockwise: 0,90,180,270 (NIV_ROTATE; default 0)
   -w, --window LOW,HIGH  Grayscale window (default: sampled nonzero 1%-99.5%)
       --max-pixels N     Max raster pixels sent per frame (default: 350000)
       --fps N            Maximum redraw FPS (default: 30; useful over Tailscale)
@@ -36,10 +38,11 @@ OPTIONS
 KEYS
   Up/Right or k/l       Next slice (positive voxel index)
   Down/Left or j/h      Previous slice
-  Shift+arrow / HJKL    10x movement; Ctrl+arrow 25x; Alt+arrow 50x
-  [ and ]               Halve or double movement step (1..256)
+  Alt+arrow             2x movement; Shift+arrow / HJKL 5x; Ctrl+arrow 10x
+  [ and ]               Halve or double base stride (1..256)
   PgUp / PgDn           +/-25 slices; Home / End first/last
   x / y / z / a         Pick axis / cycle axes
+  r / R                 Rotate view clockwise / counterclockwise 90 degrees
   f / v                 Flip horizontal / vertical view
   + / -                 Narrow / widen grayscale window (contrast)
   , / .                 Shift window down / up (brightness)
@@ -49,7 +52,7 @@ KEYS
 EXAMPLES
   niv brain.nii.gz
   NIV_AXIS=y niv /path/to/brain.nii.gz --fps 12
-  niv brain.nii.gz -a x --window 0,3000 --step 2
+  niv brain.nii.gz -a x --rotate 90 --window 0,3000 --step 2
   niv brain.nii.gz --bench 50
 
 Axes are NIfTI ARRAY INDICES, not anatomical RAS/LPS axes. Physical aspect ratio
@@ -62,6 +65,9 @@ pub fn parse() -> Result<Option<Config>> {
         &env::var("NIV_AXIS")
             .or_else(|_| env::var("NII_AXIS"))
             .unwrap_or_else(|_| "z".to_owned()),
+    )?;
+    let mut rotation = parse_rotation(
+        &env::var("NIV_ROTATE").unwrap_or_else(|_| "0".to_owned()),
     )?;
     let mut path = None;
     let mut initial_slice = None;
@@ -87,7 +93,7 @@ pub fn parse() -> Result<Option<Config>> {
         // Handle both "--option value" and "--option=value" forms.
         let (flag, inline_value) = arg.split_once('=').map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
         let needs_value = matches!(flag, "-a" | "--axis" | "--slice" | "--step" | "-w" |
-            "--window" | "--max-pixels" | "--fps" | "--bench");
+            "--window" | "-r" | "--rotate" | "--max-pixels" | "--fps" | "--bench");
         if needs_value {
             let val = if let Some(v) = inline_value { v.to_owned() }
                 else { args.next().with_context(|| format!("{flag} needs a value"))? };
@@ -95,6 +101,7 @@ pub fn parse() -> Result<Option<Config>> {
                 "-a" | "--axis" => axis = Axis::parse(&val)?,
                 "--slice" => initial_slice = Some(val.parse().context("--slice requires a nonnegative integer")?),
                 "--step" => step = parse_range(&val, flag, 1, 256)?,
+                "-r" | "--rotate" => rotation = parse_rotation(&val)?,
                 "-w" | "--window" => window = Some(parse_window(&val)?),
                 "--max-pixels" => max_pixels = parse_range(&val, flag, 1_000, 4_000_000)?,
                 "--fps" => max_fps = parse_range(&val, flag, 1, 120)? as u32,
@@ -109,7 +116,7 @@ pub fn parse() -> Result<Option<Config>> {
     }
     Ok(Some(Config {
         path: path.context("Missing NIfTI file. See: niv --help")?,
-        axis, initial_slice, step, window, max_pixels, max_fps,
+        axis, initial_slice, step, rotation, window, max_pixels, max_fps,
         enhanced_keys, benchmark_frames,
     }))
 }
@@ -120,6 +127,16 @@ fn parse_range(s: &str, flag: &str, low: usize, high: usize) -> Result<usize> {
         bail!("{flag} must be between {low} and {high}");
     }
     Ok(value)
+}
+
+fn parse_rotation(s: &str) -> Result<u16> {
+    match s {
+        "0" => Ok(0),
+        "90" => Ok(90),
+        "180" => Ok(180),
+        "270" => Ok(270),
+        _ => bail!("Rotation must be 0, 90, 180, or 270 degrees"),
+    }
 }
 
 fn parse_window(s: &str) -> Result<(f32, f32)> {
@@ -140,6 +157,12 @@ mod tests {
         assert_eq!(parse_window("-5, 10").unwrap(), (-5., 10.));
         assert!(parse_window("5,5").is_err());
         assert!(parse_window("NaN,2").is_err());
+    }
+    #[test]
+    fn test_rotation() {
+        assert_eq!(parse_rotation("90").unwrap(), 90);
+        assert!(parse_rotation("45").is_err());
+        assert!(parse_rotation("-90").is_err());
     }
     #[test]
     fn test_range() {

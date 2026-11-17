@@ -97,6 +97,20 @@ impl Volume {
         }
     }
 
+    /// Exact finite minimum/maximum, including zero-valued background.
+    /// This is computed only once at startup, not during each redraw.
+    pub fn data_range(&self) -> (f32, f32) {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &v in self.data.iter() {
+            if v.is_finite() {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        if lo.is_infinite() { (0.0, 0.0) } else { (lo, hi) }
+    }
+
     /// Deterministic subsample of finite, non-zero voxels for contrast limits.
     /// This avoids sorting or copying millions of voxels.
     pub fn auto_window(&self) -> (f32, f32) {
@@ -127,6 +141,14 @@ mod tests {
         assert_eq!(v.sample(Axis::Y, 1, 2, 4), 214.);
         assert_eq!(v.sample(Axis::Z, 4, 2, 1), 214.);
         assert_eq!(v.plane(Axis::X).0, 4);
+    }
+    #[test]
+    fn data_range_includes_zeros_and_ignores_nan() {
+        let v = Volume {
+            data: Array3::from_shape_vec((2,2,1), vec![0., 10., f32::NAN, -1.]).unwrap(),
+            spacing: [1.; 3],
+        };
+        assert_eq!(v.data_range(), (-1., 10.));
     }
     #[test]
     fn window_ignores_zeros_and_nonfinite() {

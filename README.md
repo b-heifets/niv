@@ -1,155 +1,176 @@
 # niv
 
-**A fast, keyboard-driven, grayscale NIfTI slice viewer for Ghostty and Rex.**
+Fast, keyboard-driven grayscale NIfTI slice viewer for Ghostty, Rex, and other
+terminals supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
+Standalone Rust binary. Runs on macOS and Linux (including remote Rex/Tailscale
+sessions). No libghostty, Python runtime, or direct Rex integration is required.
 
-Standalone Rust binary; no Python runtime, GUI framework, libghostty, or direct Rex API needed. The only terminal graphics dependency is **Kitty graphics protocol**. Intended for macOS (Ghostty/Rex) and Linux machines accessed through Rex/Tailscale.
+> **v0.3 experimental release.** The Rust compiler and a compatible graphical
+> terminal were not available in the development environment, so the Rust build
+> and interactive appearance still need testing locally. NIfTI physical/anatomical
+> reorientation and atlas contours are not implemented yet.
 
-> Status: **v0.2 prototype.** The source has unit tests, but the creation environment had no Rust toolchain or terminal to compile it or visually test it. Compile/test locally before relying on it. Anatomical orientation is **not yet implemented**; see limitations.
+## Build and install
 
-## Quick start
-
-Install Rust if needed: <https://rustup.rs/>. Then, from the extracted project directory:
-
-```sh
-cargo install --path .
-```
-
-`~/.cargo/bin` should be on your zsh `$PATH`. If it is not:
+Install [Rust](https://rustup.rs/) if needed, then run from the project root:
 
 ```sh
-export PATH="$HOME/.cargo/bin:$PATH"
+cargo test
+cargo install --path . --force
 ```
 
-Run the included sample:
+Run in Rex/Ghostty (this works from your atlas directory):
 
 ```sh
-niv data/sample.nii.gz
+niv atlas_CCFv3_2020_30um.nii.gz --axis x --rotate 90
 ```
 
-Or your volume:
+Or directly from the source tree after `cargo build --release`:
 
 ```sh
-niv /path/to/brain.nii.gz
-niv /path/to/brain.nii.gz --axis y
-niv /path/to/brain.nii.gz --axis z --window 0,3000
+./target/release/niv data/sample.nii.gz --rotate 90
 ```
 
-Optional environment default (put in `~/.zshrc` if wanted):
+To set defaults in zsh, add to `~/.zshrc`:
 
 ```sh
-export NIV_AXIS=z
+export NIV_AXIS=x
+export NIV_ROTATE=90
 ```
 
-Legacy `NII_AXIS` is also recognized; `NIV_AXIS` takes precedence, and CLI `--axis` overrides both.
+CLI `--axis` and `--rotate` take precedence over environment variables.
+`NII_AXIS` is accepted as a legacy fallback for `NIV_AXIS`.
 
-### Keyboard reference
+## Keyboard controls
 
-| Key(s) | Behavior |
+| Key | Action |
 | --- | --- |
-| `↑`, `→`, `k`, `l` | Next slice (increasing voxel index) |
-| `↓`, `←`, `j`, `h` | Previous slice |
-| `Shift`+arrow or `H J K L` | Movement ×10 |
-| `Ctrl`+arrow | Movement ×25 |
-| `Alt`+arrow | Movement ×50 |
-| `[` / `]` | Halve / double persistent movement step (1–256) |
-| `PageUp` / `PageDown` | Move +25 / −25 slices |
-| `Home` / `End` | First / last slice |
-| `x` / `y` / `z` | Switch voxel index axis; preserve fractional slice position |
-| `a` | Cycle voxel axes |
-| `f` / `v` | Flip horizontally / vertically |
-| `+` / `-` | Narrow / widen grayscale window (contrast) |
-| `,` / `.` | Shift intensity window down / up (brightness) |
-| `0` | Reset intensity window |
-| `q` / `Esc` / `Ctrl+C` | Quit |
+| `↑` / `→` / `k` / `l` | Next slice (+1 by default) |
+| `↓` / `←` / `j` / `h` | Previous slice (−1 by default) |
+| Alt + navigation key | ×2 |
+| Shift + navigation key or uppercase `HJKL` | ×5 |
+| Ctrl + navigation key | ×10 |
+| `r` / `R` | Rotate screen image clockwise / counterclockwise by 90° |
+| `x`, `y`, `z` | Change voxel-index slicing axis |
+| `a` | Cycle index axes |
+| `f` / `v` | Flip horizontally / vertically *on screen* |
+| `+` / `-` | Narrow / widen grayscale window |
+| `,` / `.` | Shift window down / up |
+| `0` | Reset automatically chosen or initial intensity window |
+| `[` / `]` | Halve / double **stride** (base slice increment) |
+| PageUp / PageDown | Move ±25 slices |
+| Home / End | First / last slice |
+| `q`, Esc, Ctrl+C | Quit |
 
-Terminal/multiplexer key forwarding varies; `Ctrl+h` and `Ctrl+j` can conflict with Backspace/Return. Shift+arrow, uppercase vim keys, and `[ ]` are reliable alternatives. If enhanced key reporting behaves unexpectedly, use `--no-enhanced-keys`.
+**Stride** defaults to 1 and is only shown in the header when greater than 1.
+If stride = 4, an unmodified navigation key moves 4 slices, Alt moves 8,
+Shift moves 20, and Ctrl moves 40. Use `[` to decrease stride again.
+The CLI spelling `--step` is retained for compatibility.
 
-### Options
+Key modifier support depends on the terminal and Rex's keyboard forwarding.
+Some combinations such as Ctrl+h are traditionally Backspace. If modifier
+reporting causes trouble, try `--no-enhanced-keys`.
+
+## Display
+
+The top bar shows filename, `X×Y×Z` voxel dimensions, index axis,
+zero-based slice index, clockwise screen rotation, and stride only if not 1.
+There is no `niv` prefix.
+
+Below the image:
 
 ```text
--a, --axis x|y|z         slice along array X/Y/Z (default NIV_AXIS, NII_AXIS, z)
-    --slice N            start at zero-based index N (default middle)
-    --step N             initial movement step (1..256)
--w, --window LOW,HIGH    fixed display intensity limits
-    --max-pixels N       rendered image pixel budget, default 350000
-    --fps N              cap drawing frames per second, default 30
-    --no-enhanced-keys   disable Kitty enhanced-keyboard negotiation
-    --bench N            encode N frames without terminal output; print timings
--h, --help               full CLI help
+data: 0.000..1327.000 | display: 9.000..1300.000
+arrows/hjkl slices | Alt 2x Shift 5x Ctrl 10x | xyz axis | r/R rotate | f/v flip | +/- contrast
 ```
 
-Automatic display range uses a sparse deterministic sample of finite nonzero voxels (approximately 1st–99.5th percentile). The viewer does **not modify** source data. NIfTI `scl_slope` / `scl_inter` are respected by the `nifti` loader, and data are stored as `f32` in RAM so uint16 input won't wrap or overflow during rendering.
+- **data**: exact finite minimum and maximum of the loaded 3D volume,
+  including zero-valued background; calculated once at load time.
+- **display**: actual minimum/maximum grayscale window. Values at or below the
+  lower bound are black; those at or above the upper bound are white.
+  These values change with `+/-` and `,/.` and reset with `0`.
 
-## Run through Rex / Tailscale
+The first window is chosen from a sparse sample of nonzero voxels (approximately
+1st and 99.5th percentiles). The file is never modified.
 
-1. Install the binary **on the machine where you execute `niv`**. For a remote Linux Rex session, build `niv` on that Linux machine (`cargo install --path .`) or copy a Linux-compatible binary.
-2. Start it in a Rex terminal block. No `TERM=kitty` spoofing is needed: the program writes the Kitty graphics protocol directly.
-3. Try `python3 examples/kitty_probe.py` in the *same session* if images fail to appear. It tests whether the Kitty graphics response comes back through Rex.
-4. For a slower remote connection, reduce per-frame transfer size and frame rate:
+`--rotate` accepts only `0`, `90`, `180`, or `270`, measured clockwise in the
+terminal image. Rotation and flips are **display-only**; they do not interpret
+or change NIfTI sform/qform anatomical orientation.
 
-   ```sh
-   niv volume.nii.gz --max-pixels 120000 --fps 12
-   ```
+## Options
 
-Rendering can be fast even if the terminal or network takes time to transmit/decode frames. Direct zlib-compressed RGB frames are base64-encoded into 4096-byte chunks to pass safely over terminal sessions.
+```text
+-a, --axis x|y|z          Slice along raw NIfTI array index (default: NIV_AXIS / NII_AXIS / z)
+-r, --rotate 0|90|180|270  Clockwise display rotation (default: NIV_ROTATE / 0)
+    --slice N             Start at zero-based slice N (default: center)
+    --step N              Base slice stride (1..256; default 1)
+-w, --window LOW,HIGH     Manual grayscale window
+    --max-pixels N        Maximum transmitted raster pixels (default 350000)
+    --fps N               Maximum redraw FPS (default 30)
+    --no-enhanced-keys    Disable enhanced keyboard mode
+    --bench N             Time N slice render/encode operations; don't write graphics
+-h, --help                Show help
+-V, --version             Version
+```
 
-**Performance test without graphics:**
+Examples:
 
 ```sh
-niv data/sample.nii.gz --bench 100
-niv /path/to/brain.nii.gz -a z --bench 50 --max-pixels 120000
+niv brain.nii.gz --axis z --rotate 90
+niv brain.nii.gz --axis y --window 0,3000
+niv brain.nii.gz --max-pixels 120000 --fps 12   # Remote Rex/Tailscale
+niv brain.nii.gz --bench 100                     # No terminal image needed
 ```
 
-The benchmark measures rasterization, zlib compression, and base64 encoding; it **does not** measure the Rex/network/terminal graphics path.
+## Flicker and performance
 
-## Memory and speed
+v0.2 removed the previous Kitty image and cleared the *entire* terminal on
+**every** frame. That created a blank background between successive slices.
 
-- `.nii.gz` is fully decompressed/decoded **once** into a 3D `ndarray::Array3<f32>`; thereafter switching X/Y/Z planes is O(number of displayed pixels), not O(size of volume).
-- A `440 × 267 × 380` volume occupies **~170 MiB** for the `f32` voxel array. Peak load memory is higher because the compressed/decompressed source and conversion buffers may temporarily coexist.
-- A uniform volume is windowed to avoid division by zero; NaN and infinite pixels render black.
-- The raster uses **nearest-neighbor** sampling, and its aspect ratio uses NIfTI voxel spacing. If the image has fewer pixels than the viewport, some nearest-neighbor upsampling happens before transfer.
-- The renderer limits both the image's pixel count and redraw rate, and coalesces bursts of keyboard events. `--max-pixels` and `--fps` can be tuned separately.
-- Compression uses `flate2` with a fast zlib setting; Kitty graphics uses RGB24 plus direct transfers (`f=24`, `o=z`, `t=d`).
+v0.3 avoids clearing the image region during normal redraws: it gives each
+new frame a fresh Kitty image ID, sends and places the complete image **while
+keeping the previous image visible**, then deletes the previous image. Only
+the three text lines are cleared/updated. This reduces the source of flashing
+observed in v0.2, but real smoothness still depends on Ghostty/Rex rendering,
+network bandwidth, and protocol buffering. A terminal might not present all
+updates atomically; please test both locally and through Rex/Tailscale.
 
-## Limitations / development roadmap
+Internally `.nii.gz` is decompressed once to an `ndarray::Array3<f32>` (~170 MiB
+for a 440×267×380 volume; peak memory during load is higher). All axes can
+then be sampled directly. The image is rendered with nearest-neighbor sampling,
+fast zlib RGB24 compression, and Kitty graphics in <=4096-character chunks.
+NIfTI `scl_slope`/`scl_inter` are handled by the reader. A `uint16` input does
+not overflow because the internal grayscale computation uses `f32`.
 
-1. **Voxel axes only.** `x/y/z` correspond to array index axes; the display is *not* yet reoriented to anatomical RAS/LPS/PIR, nor does it apply `sform`/`qform` to reslice oblique volumes. `f`/`v` manually change visual flips but don't create correct anatomical labels. If axes are aligned to an atlas, the index slices are still useful.
-2. **3D single-volume only.** 4D/time series with more than one frame are not supported. Singleton trailing dimensions are accepted. No atlas overlay yet.
-3. **No mouse or cursor value inspector** yet. The status line displays zero-based slice index and axis, not physical coordinates.
-4. Kitty graphics support is **assumed**. Terminal/remote-multiplexer versions that do not pass the protocol will show text but no image; there is no ANSI fallback in this version. Use `examples/kitty_probe.py` to check.
-5. Full-volume memory loading can be expensive for giant images. For those, a later mode could decompress once to an on-disk uncompressed `.nii` and memory map it; lazy access directly into arbitrary planes of a standard `.nii.gz` is not efficient.
-6. Future atlas overlay: load a separate Allen CCFv3 2020 label volume, align it in world coordinates using affines, draw nearest-neighbor boundaries as an RGB overlay, and display region acronym/name/color/ID in an information panel.
+The terminal image resolution is capped independently from the text-cell
+placement size. Remote performance can be improved using `--max-pixels` and
+`--fps` without changing the source image or the selected slice.
 
-## Development
+## Troubleshooting
 
-```sh
-# Recreate a synthetic 96x80x64 float32 NIfTI using only the Python stdlib
-python3 examples/make_sample.py
-# The generated file appears in the current working directory as sample.nii.gz
+- If you still have v0.2 in `$PATH`, reinstall with `cargo install --path . --force`.
+  Check `niv --version` (expect `niv 0.3.0`) and `which niv`.
+- If the image fails entirely in a Rex session, run `python3 examples/kitty_probe.py`
+  in the **same session** to test graphics protocol support.
+- If remote updates flash or lag, try `--max-pixels 120000 --fps 12`.
+- If `r`/`R` are flipped relative to your preference, use `--rotate 270` initially.
+- For compile issues, run `cargo test` and `cargo build --release` and share
+  the error output; this release was not compiled in its creation environment.
 
-cargo fmt
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-./target/release/niv data/sample.nii.gz
-```
+## Source layout
 
-### Code organization
+- `src/config.rs`: CLI and environment defaults
+- `src/volume.rs`: NIfTI loading, scale factors, voxel sampling, ranges
+- `src/render.rs`: view geometry, 90° rotations, flips, nearest-neighbor RGB
+- `src/kitty.rs`: zlib/base64 frame encoding, Kitty image transmission and replacement
+- `src/app.rs`: navigation state, stride, contrast, key events
+- `src/main.rs`: event loop, double-frame lifetime, terminal UI, benchmark
+- `examples/kitty_probe.py`: self-contained graphics probe
+- `examples/make_sample.py`: sample generator (standard-library Python)
+- `data/sample.nii.gz`: synthetic test volume
 
-- `src/config.rs`: CLI and environment configuration
-- `src/volume.rs`: NIfTI decoding/scaling, axis indexing, automatic intensity window
-- `src/render.rs`: viewport geometry, grayscale nearest-neighbor RGB rasterization
-- `src/kitty.rs`: fast zlib+base64 Kitty image transmission and selective cleanup
-- `src/app.rs`: view state and keybindings
-- `src/main.rs`: terminal lifecycle, status display, redraw scheduling and benchmark
-- `examples/kitty_probe.py`: self-contained protocol support test
-- `examples/make_sample.py`: synthetic test NIfTI generator
+Current limitations: raw index axes rather than anatomical reorientation;
+only one 3D image at a time; no atlas overlay, region inspector, or world-space
+coordinates. The volume and associated image data are read-only.
 
-### References
-
-- [NIfTI-rs `nifti` 0.18](https://docs.rs/nifti/0.18.0/nifti/)
-- [Crossterm 0.29](https://docs.rs/crossterm/0.29.0/crossterm/)
-- [Kitty terminal graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
-- [Ghostty terminal features](https://ghostty.org/docs/features)
-
-MIT-licensed. No data files are modified by the viewer.
+MIT license.

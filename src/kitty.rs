@@ -42,6 +42,19 @@ pub fn send<W: Write>(out: &mut W, image_id: u32, frame: &Encoded, geom: Geometr
     Ok(())
 }
 
+/// Place the replacement before deleting the previous image. Kitty image IDs
+/// must be distinct; reusing a live ID implicitly removes its placements.
+/// Callers should allocate monotonically increasing IDs so the new frame is
+/// above the old frame if both briefly occupy the same screen location.
+pub fn replace<W: Write>(out: &mut W, image_id: u32, frame: &Encoded,
+    geom: Geometry, previous_id: Option<u32>) -> io::Result<()> {
+    send(out, image_id, frame, geom)?;
+    if let Some(previous) = previous_id {
+        delete(out, previous)?;
+    }
+    Ok(())
+}
+
 /// Uppercase I frees this application's placement and image storage; unlike
 /// a=d with no id, this does not delete other applications' images.
 pub fn delete<W: Write>(out: &mut W, image_id: u32) -> io::Result<()> {
@@ -51,6 +64,17 @@ pub fn delete<W: Write>(out: &mut W, image_id: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replacement_places_new_before_deleting_old() {
+        let frame = encode_rgb(&[0u8; 3]).unwrap();
+        let geom = Geometry { cols: 1, rows: 1, width: 1, height: 1 };
+        let mut output = Vec::new();
+        replace(&mut output, 51, &frame, geom, Some(50)).unwrap();
+        let sequence = String::from_utf8(output).unwrap();
+        let new_at = sequence.find("i=51").unwrap();
+        let old_at = sequence.find("a=d,d=I,i=50").unwrap();
+        assert!(new_at < old_at);
+    }
     #[test]
     fn encodes_valid_chunked_kitty_sequence() {
         // Incompressible enough to require many 4096-byte chunks.

@@ -61,35 +61,69 @@ fn crop(s: String, cols: u16) -> String {
     s.chars().take(cols as usize).collect()
 }
 
-fn draw(out: &mut impl Write, vol: &Volume, app: &App, max_pixels: usize, id: u32) -> Result<()> {
+/// Owns one active Kitty image and allocates a fresh ID for every frame.
+/// This is deliberately NOT a fixed-ID re-transmission: Kitty removes old
+/// placements when overwriting an existing image ID.
+struct FrameState {
+    next_id: u32,
+    active_id: Option<u32>,
+}
+impl FrameState {
+    fn new() -> Self {
+        let pid = std::process::id();
+        Self { next_id: 3_000_000u32.wrapping_add(pid.wrapping_mul(10_000)), active_id: None }
+    }
+    fn allocate(&mut self) -> u32 {
+        let id = self.next_id.max(1);
+        self.next_id = id.wrapping_add(1).max(1);
+        id
+    }
+    fn clear(&mut self, out: &mut impl Write) -> Result<()> {
+        if let Some(id) = self.active_id.take() {
+            kitty::delete(out, id)?;
+        }
+        Ok(())
+    }
+}
+
+fn draw(out: &mut impl Write, vol: &Volume, app: &App,
+    data_range: (f32, f32), max_pixels: usize, frames: &mut FrameState) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     if cols < 20 || rows < 8 {
-        kitty::delete(out, id)?;
-        queue!(out, MoveTo(0, 0), Clear(ClearType::All), Print("Resize terminal (min 20x8)"))?;
+        frames.clear(out)?;
+        queue!(out, MoveTo(0, 0), Clear(ClearType::All),
+            Print("Resize terminal (min 20x8)"))?;
         out.flush()?;
         return Ok(());
     }
-    let start = Instant::now();
     let geometry = render::geometry(vol, app, cols, rows, max_pixels);
     let rgb = render::grayscale(vol, app, geometry.width, geometry.height);
     let frame = kitty::encode_rgb(&rgb)?;
-    let process_ms = start.elapsed().as_secs_f64() * 1_000.0;
 
-    kitty::delete(out, id)?;
-    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+    // Only clear text lines. Clearing the whole screen on every keypress
+    // would erase the previous Kitty placement and expose a blank frame.
     let dims = vol.dims();
-    let header = format!("niv | {} | {}x{}x{} | index axis {} | slice {}/{} | step {}",
+    let stride = if app.stride > 1 {
+        format!(" | stride {}", app.stride)
+    } else { String::new() };
+    let header = format!("{} | {}x{}x{} | axis {} | slice {}/{} | rot {}{}",
         app.path, dims[0], dims[1], dims[2], app.axis.label(),
-        app.index, vol.depth(app.axis) - 1, app.step);
-    queue!(out, MoveTo(0, 0), Print(crop(header, cols)), MoveTo(0, 1))?;
-    kitty::send(out, id, &frame, geometry)?;
-    let status = format!("window {:.3}..{:.3} | {}x{}px | {:.1}ms render+encode | {:.0}KB zlib | flips H:{} V:{}",
-        app.window.0, app.window.1, geometry.width, geometry.height,
-        process_ms, frame.bytes as f64 / 1024.0,
-        if app.flip_h { "on" } else { "off" }, if app.flip_v { "on" } else { "off" });
-    let help = "arrows/hjkl scroll | Shift 10x Ctrl 25x Alt 50x | [] step | xyz axis | f/v flip | +/- contrast | q quit";
-    queue!(out, MoveTo(0, rows - 2), Print(crop(status, cols)),
-        MoveTo(0, rows - 1), Print(crop(help.into(), cols)))?;
+        app.index, vol.depth(app.axis) - 1, app.rotation, stride);
+    queue!(out, MoveTo(0, 0), Clear(ClearType::CurrentLine),
+        Print(crop(header, cols)), MoveTo(0, 1))?;
+
+    // Transmit and place NEW pixels while OLD pixels remain visible.
+    // Delete old image only after the complete new placement command.
+    let next = frames.allocate();
+    kitty::replace(out, next, &frame, geometry, frames.active_id)?;
+    frames.active_id = Some(next);
+
+    let status = format!("data: {:.3}..{:.3} | display: {:.3}..{:.3}",
+        data_range.0, data_range.1, app.window.0, app.window.1);
+    let help = "arrows/hjkl slices | Alt 2x Shift 5x Ctrl 10x | xyz axis | r/R rotate | f/v flip | +/- contrast";
+    queue!(out,
+        MoveTo(0, rows - 2), Clear(ClearType::CurrentLine), Print(crop(status, cols)),
+        MoveTo(0, rows - 1), Clear(ClearType::CurrentLine), Print(crop(help.into(), cols)))?;
     out.flush()?;
     Ok(())
 }
@@ -133,9 +167,10 @@ fn run() -> Result<()> {
         bail!("--slice {index} is outside axis {} (0..{})", config.axis.label(), vol.depth(config.axis)-1);
     }
     let window = config.window.unwrap_or_else(|| vol.auto_window());
+    let data_range = vol.data_range();
     let name = config.path.file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| config.path.display().to_string());
-    let mut app = App::new(config.axis, index, config.step, window, name);
+    let mut app = App::new(config.axis, index, config.step, config.rotation, window, name);
     if let Some(count) = config.benchmark_frames {
         println!("load: {load_secs:.2}s");
         return benchmark(&vol, &mut app, &config, count);
@@ -146,8 +181,9 @@ fn run() -> Result<()> {
 
     let _guard = TerminalGuard::enter(config.enhanced_keys)?;
     let mut out = io::stdout().lock();
-    let id = 3_000_000u32.wrapping_add(std::process::id());
-    draw(&mut out, &vol, &app, config.max_pixels, id)?;
+    let mut frames = FrameState::new();
+    queue!(out, Clear(ClearType::All))?; // Once, on entering alt-screen.
+    draw(&mut out, &vol, &app, data_range, config.max_pixels, &mut frames)?;
     let frame_interval = Duration::from_secs_f64(1.0 / config.max_fps as f64);
     let mut last_draw = Instant::now();
     let mut pending = false;
@@ -161,7 +197,7 @@ fn run() -> Result<()> {
                 match event::read()? {
                     Event::Key(key) => match app.key(&vol, key) {
                         Action::Quit => {
-                            kitty::delete(&mut out, id)?;
+                            frames.clear(&mut out)?;
                             out.flush()?;
                             return Ok(());
                         }
@@ -175,7 +211,7 @@ fn run() -> Result<()> {
             }
         }
         if pending && last_draw.elapsed() >= frame_interval {
-            draw(&mut out, &vol, &app, config.max_pixels, id)?;
+            draw(&mut out, &vol, &app, data_range, config.max_pixels, &mut frames)?;
             last_draw = Instant::now();
             pending = false;
         }
