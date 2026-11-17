@@ -4,6 +4,14 @@ use anyhow::{bail, Context, Result};
 
 use crate::volume::Axis;
 
+#[derive(Clone, Debug)]
+pub struct OverlaySpec {
+    pub path: PathBuf,
+    pub window: Option<(f32, f32)>,
+    pub color: [u8; 3],
+    pub opacity: f32,
+}
+
 pub struct Config {
     pub path: PathBuf,
     pub axis: Axis,
@@ -11,6 +19,12 @@ pub struct Config {
     pub step: usize,
     pub rotation: u16,
     pub window: Option<(f32, f32)>,
+    pub overlays: Vec<OverlaySpec>,
+    pub atlas_path: Option<PathBuf>,
+    pub atlas_wireframe: bool,
+    pub atlas_color: [u8; 3],
+    pub atlas_width: usize,
+    pub lut_path: Option<PathBuf>,
     pub max_pixels: usize,
     pub max_fps: u32,
     pub enhanced_keys: bool,
@@ -28,6 +42,15 @@ OPTIONS
       --step N           Base slice stride (default: 1)
   -r, --rotate DEGREES  Rotate view clockwise: 0,90,180,270 (NIV_ROTATE; default 0)
   -w, --window LOW,HIGH  Grayscale window (default: sampled nonzero 1%-99.5%)
+      --overlay FILE     Add an intensity layer (repeatable, drawn in CLI order)
+      --overlay-window LOW,HIGH  Window for most recently added overlay
+      --overlay-color HEX  Tint for most recent overlay (default #ffb84d)
+      --overlay-opacity 0..1  Opacity for most recent overlay (default .8)
+      --atlas FILE       Solid ID label atlas; draw between-voxel contours
+      --atlas-wireframe FILE  Precomputed binary or ID wireframe volume
+      --lut FILE.csv     CCFv3 table with Region_ID,Region,Abbr,R,G,B
+      --atlas-color HEX Fallback outline color (#ffffff)
+      --atlas-width N    Outline thickness in pixels, 1..3 (default 1)
       --max-pixels N     Max raster pixels sent per frame (default: 350000)
       --fps N            Maximum redraw FPS (default: 30; useful over Tailscale)
       --no-enhanced-keys Disable Kitty enhanced keyboard mode (for problematic muxes)
@@ -47,12 +70,17 @@ KEYS
   + / -                 Narrow / widen grayscale window (contrast)
   , / .                 Shift window down / up (brightness)
   0                     Reset window
+  b                     Toggle atlas outlines
+  o                     Toggle additional intensity overlays
   q / Esc / Ctrl+C      Quit
 
 EXAMPLES
   niv brain.nii.gz
   NIV_AXIS=y niv /path/to/brain.nii.gz --fps 12
   niv brain.nii.gz -a x --rotate 90 --window 0,3000 --step 2
+  niv brain.nii.gz --atlas atlas.nii.gz --lut CCFv3-2020_regional_summary.csv
+  niv brain.nii.gz --overlay zstat.nii.gz --overlay-window 2,6 --overlay-color ff5555
+  niv brain.nii.gz --atlas-wireframe atlas_W_IDs.nii.gz --lut CCFv3-2020_regional_summary.csv
   niv brain.nii.gz --bench 50
 
 Axes are NIfTI ARRAY INDICES, not anatomical RAS/LPS axes. Physical aspect ratio
@@ -73,6 +101,12 @@ pub fn parse() -> Result<Option<Config>> {
     let mut initial_slice = None;
     let mut step = 1;
     let mut window = None;
+    let mut overlays: Vec<OverlaySpec> = Vec::new();
+    let mut atlas_path = None;
+    let mut atlas_wireframe = false;
+    let mut atlas_color = [255, 255, 255];
+    let mut atlas_width = 1;
+    let mut lut_path = None;
     let mut max_pixels = 350_000;
     let mut max_fps = 30;
     let mut enhanced_keys = true;
@@ -93,7 +127,9 @@ pub fn parse() -> Result<Option<Config>> {
         // Handle both "--option value" and "--option=value" forms.
         let (flag, inline_value) = arg.split_once('=').map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
         let needs_value = matches!(flag, "-a" | "--axis" | "--slice" | "--step" | "-w" |
-            "--window" | "-r" | "--rotate" | "--max-pixels" | "--fps" | "--bench");
+            "--window" | "-r" | "--rotate" | "--max-pixels" | "--fps" | "--bench" | "--overlay" |
+            "--overlay-window" | "--overlay-color" | "--overlay-opacity" |
+            "--atlas" | "--atlas-wireframe" | "--atlas-color" | "--atlas-width" | "--lut");
         if needs_value {
             let val = if let Some(v) = inline_value { v.to_owned() }
                 else { args.next().with_context(|| format!("{flag} needs a value"))? };
@@ -103,6 +139,26 @@ pub fn parse() -> Result<Option<Config>> {
                 "--step" => step = parse_range(&val, flag, 1, 256)?,
                 "-r" | "--rotate" => rotation = parse_rotation(&val)?,
                 "-w" | "--window" => window = Some(parse_window(&val)?),
+                "--overlay" => overlays.push(OverlaySpec {
+                    path: PathBuf::from(val), window: None, color: [255, 184, 77], opacity: 0.8,
+                }),
+                "--overlay-window" => {
+                    overlays.last_mut().context("--overlay-window requires a preceding --overlay")?.window = Some(parse_window(&val)?);
+                },
+                "--overlay-color" => {
+                    overlays.last_mut().context("--overlay-color requires a preceding --overlay")?.color = parse_color(&val)?;
+                },
+                "--overlay-opacity" => {
+                    overlays.last_mut().context("--overlay-opacity requires a preceding --overlay")?.opacity = parse_opacity(&val)?;
+                },
+                "--atlas" | "--atlas-wireframe" => {
+                    if atlas_path.is_some() { bail!("Use only one of --atlas / --atlas-wireframe"); }
+                    atlas_wireframe = flag == "--atlas-wireframe";
+                    atlas_path = Some(PathBuf::from(val));
+                },
+                "--atlas-color" => atlas_color = parse_color(&val)?,
+                "--atlas-width" => atlas_width = parse_range(&val, flag, 1, 3)?,
+                "--lut" => lut_path = Some(PathBuf::from(val)),
                 "--max-pixels" => max_pixels = parse_range(&val, flag, 1_000, 4_000_000)?,
                 "--fps" => max_fps = parse_range(&val, flag, 1, 120)? as u32,
                 "--bench" => benchmark_frames = Some(parse_range(&val, flag, 1, 10_000)?),
@@ -116,9 +172,27 @@ pub fn parse() -> Result<Option<Config>> {
     }
     Ok(Some(Config {
         path: path.context("Missing NIfTI file. See: niv --help")?,
-        axis, initial_slice, step, rotation, window, max_pixels, max_fps,
+        axis, initial_slice, step, rotation, window,
+        overlays, atlas_path, atlas_wireframe, atlas_color, atlas_width, lut_path,
+        max_pixels, max_fps,
         enhanced_keys, benchmark_frames,
     }))
+}
+
+fn parse_opacity(s: &str) -> Result<f32> {
+    let x: f32 = s.parse().context("Opacity must be a number in [0, 1]")?;
+    if !x.is_finite() || !(0.0..=1.0).contains(&x) { bail!("Opacity must be in [0, 1]"); }
+    Ok(x)
+}
+
+fn parse_color(s: &str) -> Result<[u8; 3]> {
+    let s = s.trim_start_matches('#');
+    if s.len() != 6 { bail!("Color must be a 6-digit RGB hex value, e.g. ff0000"); }
+    Ok([
+        u8::from_str_radix(&s[0..2], 16).context("Invalid color red hex pair")?,
+        u8::from_str_radix(&s[2..4], 16).context("Invalid color green hex pair")?,
+        u8::from_str_radix(&s[4..6], 16).context("Invalid color blue hex pair")?,
+    ])
 }
 
 fn parse_range(s: &str, flag: &str, low: usize, high: usize) -> Result<usize> {
@@ -157,6 +231,13 @@ mod tests {
         assert_eq!(parse_window("-5, 10").unwrap(), (-5., 10.));
         assert!(parse_window("5,5").is_err());
         assert!(parse_window("NaN,2").is_err());
+    }
+    #[test]
+    fn test_color_and_opacity() {
+        assert_eq!(parse_color("#ff0080").unwrap(), [255,0,128]);
+        assert!(parse_color("white").is_err());
+        assert_eq!(parse_opacity(".5").unwrap(), 0.5);
+        assert!(parse_opacity("1.5").is_err());
     }
     #[test]
     fn test_rotation() {

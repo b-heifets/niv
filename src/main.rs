@@ -2,6 +2,7 @@
 mod app;
 mod config;
 mod kitty;
+mod layers;
 mod render;
 mod volume;
 
@@ -13,6 +14,7 @@ use std::{
 use anyhow::{bail, Result};
 use app::{Action, App};
 use config::Config;
+use layers::Layers;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -86,7 +88,7 @@ impl FrameState {
     }
 }
 
-fn draw(out: &mut impl Write, vol: &Volume, app: &App,
+fn draw(out: &mut impl Write, vol: &Volume, layers: &Layers, app: &App,
     data_range: (f32, f32), max_pixels: usize, frames: &mut FrameState) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     if cols < 20 || rows < 8 {
@@ -97,7 +99,7 @@ fn draw(out: &mut impl Write, vol: &Volume, app: &App,
         return Ok(());
     }
     let geometry = render::geometry(vol, app, cols, rows, max_pixels);
-    let rgb = render::grayscale(vol, app, geometry.width, geometry.height);
+    let rgb = render::composite(vol, app, layers, geometry.width, geometry.height);
     let frame = kitty::encode_rgb(&rgb)?;
 
     // Only clear text lines. Clearing the whole screen on every keypress
@@ -118,9 +120,22 @@ fn draw(out: &mut impl Write, vol: &Volume, app: &App,
     kitty::replace(out, next, &frame, geometry, frames.active_id)?;
     frames.active_id = Some(next);
 
-    let status = format!("data: {:.3}..{:.3} | display: {:.3}..{:.3}",
+    let mut status = format!("data: {:.3}..{:.3} | display: {:.3}..{:.3}",
         data_range.0, data_range.1, app.window.0, app.window.1);
-    let help = "arrows/hjkl slices | Alt 2x Shift 5x Ctrl 10x | xyz axis | r/R rotate | f/v flip | +/- contrast";
+    if let Some(atlas) = &layers.atlas {
+        status.push_str(if app.show_atlas { " | atlas:on" } else { " | atlas:off" });
+        if app.show_atlas {
+            if let Some(region) = layers.center_region(app.axis, app.index) {
+                status.push_str(&format!(" | center: {region}"));
+            }
+        }
+        if atlas.wireframe { status.push_str(" [wireframe]"); }
+    }
+    if !layers.overlays.is_empty() {
+        status.push_str(&format!(" | overlays:{}{}", layers.overlays.len(),
+            if app.show_overlays { "" } else { " (off)" }));
+    }
+    let help = "arrows/hjkl slice | Alt 2x Shift 5x Ctrl 10x | xyz axis | r/R rotate | b atlas | o overlays | +/- contrast";
     queue!(out,
         MoveTo(0, rows - 2), Clear(ClearType::CurrentLine), Print(crop(status, cols)),
         MoveTo(0, rows - 1), Clear(ClearType::CurrentLine), Print(crop(help.into(), cols)))?;
@@ -128,7 +143,7 @@ fn draw(out: &mut impl Write, vol: &Volume, app: &App,
     Ok(())
 }
 
-fn benchmark(vol: &Volume, app: &mut App, config: &Config, count: usize) -> Result<()> {
+fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, config: &Config, count: usize) -> Result<()> {
     let geometry = render::geometry(vol, app, 110, 36, config.max_pixels);
     let start = Instant::now();
     let mut rgb_time = Duration::ZERO;
@@ -137,7 +152,7 @@ fn benchmark(vol: &Volume, app: &mut App, config: &Config, count: usize) -> Resu
     for i in 0..count {
         app.index = i * vol.depth(app.axis) / count;
         let t = Instant::now();
-        let rgb = render::grayscale(vol, app, geometry.width, geometry.height);
+        let rgb = render::composite(vol, app, layers, geometry.width, geometry.height);
         rgb_time += t.elapsed();
         let t = Instant::now();
         compressed += kitty::encode_rgb(&rgb)?.bytes;
@@ -168,12 +183,13 @@ fn run() -> Result<()> {
     }
     let window = config.window.unwrap_or_else(|| vol.auto_window());
     let data_range = vol.data_range();
+    let layers = Layers::load(&config, &vol)?;
     let name = config.path.file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| config.path.display().to_string());
     let mut app = App::new(config.axis, index, config.step, config.rotation, window, name);
     if let Some(count) = config.benchmark_frames {
         println!("load: {load_secs:.2}s");
-        return benchmark(&vol, &mut app, &config, count);
+        return benchmark(&vol, &layers, &mut app, &config, count);
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("niv needs a real terminal for interactive graphics. Use --bench N for a noninteractive test.");
@@ -183,7 +199,7 @@ fn run() -> Result<()> {
     let mut out = io::stdout().lock();
     let mut frames = FrameState::new();
     queue!(out, Clear(ClearType::All))?; // Once, on entering alt-screen.
-    draw(&mut out, &vol, &app, data_range, config.max_pixels, &mut frames)?;
+    draw(&mut out, &vol, &layers, &app, data_range, config.max_pixels, &mut frames)?;
     let frame_interval = Duration::from_secs_f64(1.0 / config.max_fps as f64);
     let mut last_draw = Instant::now();
     let mut pending = false;
@@ -211,7 +227,7 @@ fn run() -> Result<()> {
             }
         }
         if pending && last_draw.elapsed() >= frame_interval {
-            draw(&mut out, &vol, &app, data_range, config.max_pixels, &mut frames)?;
+            draw(&mut out, &vol, &layers, &app, data_range, config.max_pixels, &mut frames)?;
             last_draw = Instant::now();
             pending = false;
         }

@@ -13,6 +13,8 @@ pub struct App {
     pub path: String,
     pub flip_h: bool,
     pub flip_v: bool,
+    pub show_atlas: bool,
+    pub show_overlays: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +25,7 @@ impl App {
         window: (f32, f32), path: String) -> Self {
         Self {
             axis, index, stride, rotation, window, default_window: window, path,
-            flip_h: false, flip_v: false,
+            flip_h: false, flip_v: false, show_atlas: true, show_overlays: true,
         }
     }
 
@@ -73,6 +75,8 @@ impl App {
             KeyCode::Char('R') => self.rotation = (self.rotation + 270) % 360,
             KeyCode::Char('f') => self.flip_h = !self.flip_h,
             KeyCode::Char('v') => self.flip_v = !self.flip_v,
+            KeyCode::Char('b') => self.show_atlas = !self.show_atlas,
+            KeyCode::Char('o') => self.show_overlays = !self.show_overlays,
             KeyCode::Char('0') => self.window = self.default_window,
             KeyCode::Char('+') | KeyCode::Char('=') => self.scale_window(0.8),
             KeyCode::Char('-') | KeyCode::Char('_') => self.scale_window(1.25),
@@ -110,7 +114,7 @@ mod tests {
     use ndarray::Array3;
 
     fn example() -> Volume {
-        Volume { data: Array3::zeros((20,30,100)), spacing: [1.;3] }
+        Volume { data: Array3::zeros((20,30,100)), spacing: [1.;3], sform: None }
     }
     #[test]
     fn navigation_rotation_and_window() {

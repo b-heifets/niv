@@ -42,6 +42,8 @@ impl Axis {
 pub struct Volume {
     pub data: Array3<f32>,
     pub spacing: [f32; 3],
+    /// S-form transform when supplied by NIfTI, used to reject misregistered overlays.
+    pub sform: Option<[[f32; 4]; 3]>,
 }
 
 impl Volume {
@@ -54,6 +56,10 @@ impl Volume {
         if !(3..=7).contains(&rank) || (4..=rank).any(|axis| dims[axis] != 1) {
             bail!("Only 3D NIfTI volumes are supported (header dimensions {:?})", dims);
         }
+        let header = object.header();
+        let sform = if header.sform_code != 0 {
+            Some([header.srow_x, header.srow_y, header.srow_z])
+        } else { None };
         let mut spacing = [1f32; 3];
         for (axis, s) in spacing.iter_mut().enumerate() {
             let value = object.header().pixdim[axis + 1].abs();
@@ -73,7 +79,29 @@ impl Volume {
         if dynamic.ndim() != 3 { bail!("Only 3D volumes are supported (got {:?})", dynamic.shape()); }
         let data = dynamic.into_dimensionality::<Ix3>()?;
         if data.shape().contains(&0) { bail!("NIfTI volume has a zero-sized axis"); }
-        Ok(Self { data, spacing })
+        Ok(Self { data, spacing, sform })
+    }
+
+    /// Only voxel-to-voxel overlays are supported. We intentionally reject
+    /// mismatched grids instead of silently displaying a misregistered atlas.
+    pub fn validate_grid(&self, other: &Self) -> Result<()> {
+        if self.dims() != other.dims() {
+            bail!("NIfTI grid dimensions differ: {:?} vs {:?}; resample before layering", self.dims(), other.dims());
+        }
+        if self.spacing.iter().zip(other.spacing.iter())
+            .any(|(a,b)| (a-b).abs() > 1e-4 * a.max(*b).max(1.0)) {
+            bail!("NIfTI voxel spacing differs: {:?} vs {:?}; resample before layering", self.spacing, other.spacing);
+        }
+        match (&self.sform, &other.sform) {
+            (Some(a), Some(b)) => {
+                if (0..3).any(|r| (0..4).any(|c| (a[r][c] - b[r][c]).abs() > 1e-3)) {
+                    bail!("NIfTI sform transforms differ; resample into the same grid before layering");
+                }
+            },
+            (None, None) => {},
+            _ => bail!("One NIfTI has an sform transform but the other does not; align the headers/grids before layering"),
+        }
+        Ok(())
     }
 
     pub fn dims(&self) -> [usize; 3] {
@@ -132,7 +160,7 @@ mod tests {
     use ndarray::Array3;
 
     fn synthetic() -> Volume {
-        Volume { data: Array3::from_shape_fn((3,4,5), |(x,y,z)| (x*100+y*10+z) as f32), spacing: [1.,2.,3.] }
+        Volume { data: Array3::from_shape_fn((3,4,5), |(x,y,z)| (x*100+y*10+z) as f32), spacing: [1.,2.,3.], sform: None }
     }
     #[test]
     fn axis_sampling() {
@@ -143,16 +171,27 @@ mod tests {
         assert_eq!(v.plane(Axis::X).0, 4);
     }
     #[test]
+    fn rejects_misaligned_overlay_grid() {
+        let a = synthetic();
+        let mut b = synthetic();
+        assert!(a.validate_grid(&b).is_ok());
+        b.spacing[1] = 3.;
+        assert!(a.validate_grid(&b).is_err());
+        b.spacing = a.spacing;
+        b.sform = Some([[1.,0.,0.,0.], [0.,1.,0.,0.], [0.,0.,1.,0.]]);
+        assert!(a.validate_grid(&b).is_err());
+    }
+    #[test]
     fn data_range_includes_zeros_and_ignores_nan() {
         let v = Volume {
             data: Array3::from_shape_vec((2,2,1), vec![0., 10., f32::NAN, -1.]).unwrap(),
-            spacing: [1.; 3],
+            spacing: [1.; 3], sform: None,
         };
         assert_eq!(v.data_range(), (-1., 10.));
     }
     #[test]
     fn window_ignores_zeros_and_nonfinite() {
-        let v = Volume { data: Array3::from_shape_vec((2,2,2), vec![0., 0., 10., 20., 30., f32::NAN, 40., 100.]).unwrap(), spacing: [1.;3] };
+        let v = Volume { data: Array3::from_shape_vec((2,2,2), vec![0., 0., 10., 20., 30., f32::NAN, 40., 100.]).unwrap(), spacing: [1.;3], sform: None };
         let (lo, hi) = v.auto_window();
         assert_eq!(lo, 10.);
         assert!(hi >= 40.);

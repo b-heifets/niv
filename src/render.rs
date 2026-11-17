@@ -103,7 +103,7 @@ mod tests {
         // We compare grayscale red channel at each output pixel.
         let vol = Volume {
             data: Array3::from_shape_fn((2, 3, 1), |(x,y,_)| (10*x + 20*y) as f32),
-            spacing: [1.;3],
+            spacing: [1.;3], sform: None,
         };
         let mut app = App::new(Axis::Z, 0, 1, 0, (0., 255.), "test".into());
         let red = |rgb: Vec<u8>| rgb.chunks_exact(3).map(|p| p[0]).collect::<Vec<_>>();
@@ -119,5 +119,188 @@ mod tests {
         assert_eq!(red(grayscale(&vol, &app, 2, 3)), [50, 40, 30, 20, 10, 0]);
         app.flip_v = true;
         assert_eq!(red(grayscale(&vol, &app, 2, 3)), [10, 0, 30, 20, 50, 40]);
+    }
+}
+
+/// Composite all intensity volumes bottom-to-top, then the atlas on top.
+/// The atlas and overlays are required to be on precisely the same voxel grid.
+pub fn composite(vol: &Volume, app: &App, layers: &crate::layers::Layers,
+    width: usize, height: usize) -> Vec<u8> {
+    let mut rgb = grayscale(vol, app, width, height);
+    let (sw, sh, _) = vol.plane(app.axis);
+    let swapped = app.rotation % 180 != 0;
+    let oriented_w = if swapped { sh } else { sw };
+    let oriented_h = if swapped { sw } else { sh };
+    let horizontal: Vec<usize> = (0..width).map(|x| {
+        let h = (x * oriented_w / width).min(oriented_w-1);
+        if app.flip_h { oriented_w - 1 - h } else { h }
+    }).collect();
+    let vertical: Vec<usize> = (0..height).map(|y| {
+        let v = (y * oriented_h / height).min(oriented_h-1);
+        if app.flip_v { oriented_h - 1 - v } else { v }
+    }).collect();
+
+    if app.show_overlays {
+        for overlay in &layers.overlays {
+            let (lo, hi) = overlay.window;
+            for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
+                for (x, px) in row.chunks_exact_mut(3).enumerate() {
+                    let (h, v) = inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation);
+                    let value = overlay.vol.sample(app.axis, app.index, h, v);
+                    // Values <= lower display bound are truly transparent.
+                    if !value.is_finite() || value <= lo { continue; }
+                    let strength = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+                    let alpha = overlay.opacity * strength;
+                    for c in 0..3 {
+                        px[c] = (px[c] as f32 * (1.0-alpha) +
+                            overlay.color[c] as f32 * alpha).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    if app.show_atlas {
+        if let Some(atlas) = &layers.atlas {
+            if atlas.wireframe {
+                // A precomputed wireframe already marks voxels. Its IDs are
+                // used directly for colors; 1 means binary-only wireframe.
+                for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
+                    for (x, px) in row.chunks_exact_mut(3).enumerate() {
+                        let (h, v) = inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation);
+                        let id = crate::layers::label_id(atlas.vol.sample(app.axis, app.index, h, v));
+                        if id > 0 { px.copy_from_slice(&atlas.color(id)); }
+                    }
+                }
+            } else {
+                draw_atlas_edges(&mut rgb, width, height, app, atlas, sw, sh);
+            }
+        }
+    }
+    rgb
+}
+
+#[inline]
+fn inverse_rotation(x: usize, y: usize, sw: usize, sh: usize, rotate: u16) -> (usize,usize) {
+    match rotate {
+        0 => (x, sh-1-y),
+        90 => (y, x),
+        180 => (sw-1-x, y),
+        270 => (sw-1-y, sh-1-x),
+        _ => unreachable!(),
+    }
+}
+
+/// Map integer source voxel FACE coordinates to output pixel edges.
+/// The atlas is drawn AFTER all intensity overlays and therefore cannot be
+/// occluded by any of them. Edges stay between the nearest-neighbor cells.
+fn project(app: &App, h: usize, v: usize, sw: usize, sh: usize,
+    width: usize, height: usize) -> (i32, i32) {
+    let (mut x, mut y, ow, oh) = match app.rotation {
+        0 => (h, sh-v, sw, sh),
+        90 => (v, h, sh, sw),
+        180 => (sw-h, v, sw, sh),
+        270 => (sh-v, sw-h, sh, sw),
+        _ => unreachable!(),
+    };
+    if app.flip_h { x = ow - x; }
+    if app.flip_v { y = oh - y; }
+    let px = ((x as f64 * width as f64 / ow as f64).round() as i32)
+        .clamp(0, width as i32 - 1);
+    let py = ((y as f64 * height as f64 / oh as f64).round() as i32)
+        .clamp(0, height as i32 - 1);
+    (px, py)
+}
+
+fn paint(rgb: &mut [u8], width: usize, height: usize, x: i32, y: i32,
+    color: [u8; 3], thick: usize) {
+    // Even widths extend toward +x/+y, odd widths centered.
+    let neg = ((thick - 1) / 2) as i32;
+    for yy in y-neg..y-neg+thick as i32 {
+        for xx in x-neg..x-neg+thick as i32 {
+            if xx >= 0 && yy >= 0 && (xx as usize) < width && (yy as usize) < height {
+                let off = (yy as usize * width + xx as usize) * 3;
+                rgb[off..off+3].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
+fn draw_face(rgb: &mut [u8], width: usize, height: usize, app: &App,
+    sw: usize, sh: usize, p: (usize, usize), q: (usize, usize),
+    color: [u8; 3], thick: usize) {
+    let (x0, y0) = project(app, p.0, p.1, sw, sh, width, height);
+    let (x1, y1) = project(app, q.0, q.1, sw, sh, width, height);
+    if x0 == x1 {
+        for y in y0.min(y1)..=y0.max(y1) { paint(rgb,width,height,x0,y,color,thick); }
+    } else {
+        for x in x0.min(x1)..=x0.max(x1) { paint(rgb,width,height,x,y0,color,thick); }
+    }
+}
+
+fn draw_atlas_edges(rgb: &mut [u8], width: usize, height: usize, app: &App,
+    atlas: &crate::layers::Atlas, sw: usize, sh: usize) {
+    use crate::layers::label_id;
+    // Horizontal-axis neighbors: draw face at h, for each v.
+    for v in 0..sh {
+        for h in 0..=sw {
+            let left = if h == 0 { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h-1,v)) };
+            let right = if h == sw { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h,v)) };
+            if left != right && (left != 0 || right != 0) {
+                let id = if right != 0 { right } else { left };
+                draw_face(rgb,width,height,app,sw,sh,(h,v),(h,v+1),atlas.color(id),atlas.width);
+            }
+        }
+    }
+    // Vertical-axis neighbors: face at v, for each h.
+    for v in 0..=sh {
+        for h in 0..sw {
+            let low = if v == 0 { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h,v-1)) };
+            let high = if v == sh { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h,v)) };
+            if low != high && (low != 0 || high != 0) {
+                let id = if high != 0 { high } else { low };
+                draw_face(rgb,width,height,app,sw,sh,(h,v),(h+1,v),atlas.color(id),atlas.width);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+    use crate::{layers::{Atlas, IntensityOverlay, Layers}, volume::Axis};
+    use ndarray::Array3;
+    use std::collections::HashMap;
+    fn volume(a: Vec<f32>) -> Volume {
+        Volume { data: Array3::from_shape_vec((3,1,1),a).unwrap(), spacing:[1.;3], sform:None }
+    }
+    #[test]
+    fn overlays_are_transparent_below_min_and_ordered() {
+        let base = volume(vec![100.,100.,100.]);
+        let top = volume(vec![0., 2., 9.]);
+        let atlas = volume(vec![0., 0., 0.]);
+        let layers = Layers { overlays: vec![IntensityOverlay {
+            vol:top, window:(2., 9.), color:[255,0,0], opacity:1.0 }],
+            atlas: Some(Atlas { vol: atlas, wireframe:true, fallback:[0,255,0],width:1,regions:HashMap::new() }) };
+        let mut app = App::new(Axis::Z,0,1,0,(0.,255.),"test".into());
+        let rgb = composite(&base,&app,&layers,3,1);
+        assert_eq!(&rgb[0..3], &[100,100,100]);
+        assert_eq!(&rgb[3..6], &[100,100,100]);
+        assert_eq!(&rgb[6..9], &[255,0,0]);
+        app.show_overlays=false;
+        assert_eq!(&composite(&base,&app,&layers,3,1)[6..9], &[100,100,100]);
+    }
+    #[test]
+    fn boundaries_project_to_faces_not_voxel_centers() {
+        let base=volume(vec![0.,0.,0.]);
+        let label=volume(vec![3.,3.,4.]);
+        let layers=Layers { overlays:vec![], atlas:Some(Atlas {
+            vol:label, wireframe:false,fallback:[255,0,255],width:1,regions:HashMap::new()
+        }) };
+        let app = App::new(Axis::Z,0,1,0,(0.,1.),"test".into());
+        let rgb = composite(&base,&app,&layers,30,10);
+        // Internal boundary between source h=1 and h=2 -> x=20, not center x=15 or 25.
+        assert_eq!(&rgb[(5*30+20)*3..(5*30+20)*3+3], &[255,0,255]);
+        assert_eq!(&rgb[(5*30+15)*3..(5*30+15)*3+3], &[0,0,0]);
     }
 }
