@@ -1,243 +1,134 @@
 # niv
 
-Keyboard-driven NIfTI slice viewer for Kitty-compatible terminals (Ghostty,
-Rex, remote Rex/Tailscale), implemented in Rust. Volume data is loaded once;
-per-frame work is nearest-neighbor rasterization, compositing, and compressed
-Kitty graphics. No direct Rex or libghostty dependency.
+Fast keyboard-driven NIfTI slice viewer for Kitty-compatible terminals, including Ghostty and Rex. It is a standalone Rust executable. It reads each NIfTI volume once into RAM, displays grayscale and colored intensity layers, and draws an optional Allen CCFv3 ID-atlas contour as the top layer.
 
-**v0.5 — experimental.** This source release has not been compiled or tested
-interactively in the build environment (no Rust toolchain or terminal graphics
-available here). Run `cargo test`, then test inside Ghostty/Rex on your Mac.
+**v0.6 — experimental.** The source has been checked, but cannot be compiled or tested with Kitty/Rex in this environment. Please run `cargo test` and try it locally before committing.
 
-## Install / update
+## Build / update
 
-From the project directory:
-
-```sh
+```bash
+cd ~/Documents/_GitHub/niv
 cargo test
 cargo install --path . --force
-niv --version  # 0.4.0
+niv --version
 ```
 
-## Mouse hover and voxel inspector (v0.5)
+To test without a terminal graphics client:
 
-Hover over the image to see the **raw (not windowed) voxel value of every image
-layer**, array-space X/Y/Z indices, and the atlas's region abbreviation, full
-name, and ID. The inspector uses the correct voxel across X/Y/Z, screen rotation,
-and flips. Mouse movement only updates text, without retransmitting the image.
-The terminal must forward mouse motion (SGR mouse tracking); iOS Rex touch
-input may not generate hover events.
-
-**Keyboard fallback** (also useful for precise inspection): press `i` to toggle
-inspection mode. A small crosshair appears; arrows or `hjkl` move the inspector
-one voxel in screen coordinates; Alt/Shift/Ctrl multiply movement by 2/5/10.
-Use PgUp/PgDn to move 25 slices while inspecting, and `i` again to return
-arrows/`hjkl` to slice scrolling. Mouse motion does not override the keyboard
-crosshair while inspection mode is active.
-
-Default mouse input is cell-based, so inspected position has terminal-cell
-resolution. On terminals supporting **SGR 1016 pixel mouse coordinates**, you
-can opt into finer precision:
-
-```sh
-niv data/sample.nii.gz --atlas data/demo_atlas.nii.gz \
-    --lut data/demo_lut.csv --mouse-pixels
+```bash
+niv data/sample.nii.gz --bench 50
 ```
 
-Try `--mouse-pixels` locally in Ghostty first. Some multiplexers and iOS
-clients do not support forwarding pixel coordinates: if hovering stops working,
-remove that flag. Mouse hover is still terminal-dependent, and no attempt is
-made to guess which coordinate unit the mux actually forwarded.
+## Try the included aligned atlas demo
 
-If you use a *precomputed* wireframe, the outline volume may be zero in the
-interior of a labeled region, so it cannot provide reliable region names.
-Pass a matching solid label atlas only for inspection:
+```bash
+niv data/sample.nii.gz --axis z \
+  --overlay data/demo_activation.nii.gz --overlay-window 0.5,4 \
+  --atlas data/demo_atlas.nii.gz --lut data/demo_lut.csv
+```
 
-```sh
+The bundled `data/sample.nii.gz`, `data/demo_atlas.nii.gz` and `data/demo_activation.nii.gz` share a grid. The CCF regional summary itself is **not bundled**; use the local copy from UNRAVEL or download it separately.
+
+## Compact interface
+
+Normal mode reserves one line above and three lines below the viewer. No image dimensions, axis, rotation, title or quit hint are shown. The title line shows a bold **Region:** and the region abbreviation/name in the atlas LUT color when inspecting a voxel; otherwise it shows the atlas file name. Atlas and other NIfTI basenames have the `.nii.gz` suffix removed. The atlas title shares the region line when space allows.
+
+The first bottom line shows the **selected layer** (name, palette, display min/max and actual data range). The second line shows raw intensities for **all loaded layers** at the hovered/keyboard-inspected voxel (compact index:value pairs). The last line is a dim keyboard hint. Region colors come from the loaded CSV LUT.
+
+`Tab` switches to **image-only** mode: all text is hidden, and the viewer scales to the maximum available terminal area while preserving physical aspect ratio. `Tab` again restores the compact interface. `t` optionally opens a compact layer list, shrinking the viewer only while it is open. Press `1` for the base image, `2` for the first overlay, and so forth, up to `9`.
+
+### Slice and viewer controls
+
+| Keys | Action |
+| --- | --- |
+| Arrow keys or `h`/`j`/`k`/`l` | Move slices (or move crosshair when inspecting) |
+| Shift + direction | ×2 |
+| Ctrl + direction | ×3 |
+| Alt/Option + direction | ×4 |
+| `[` / `]` | Decrease/increase base stride by exactly 1 (range 1–256) |
+| Mouse wheel / two-finger trackpad scroll | Change slices using current stride and modifier multipliers |
+| PgUp / PgDn | Change slices by 25, even when inspecting |
+| Home / End | First/last slice |
+| `x` / `y` / `z` | Set slicing axis (array index axis) |
+| `r` / `R` | Rotate view 90° clockwise/counterclockwise |
+| `f` / `v` | Flip horizontally/vertically |
+| `a` | Show/hide atlas |
+| `o` | Toggle all intensity overlays |
+| `i` | Keyboard inspector on/off (arrows then move crosshair) |
+| `Tab` | Toggle image-only mode |
+| `t` | Show/hide compact list of layers |
+| `q`, `Esc`, Ctrl+C | Exit (when not editing) |
+
+Mouse gestures work when the terminal and any Rex/SSH intermediates forward scroll and mouse events. Touch on iOS Rex may not generate mouse-hover events; keyboard inspection remains available. To request pixel-precision mouse coordinates on terminals supporting SGR 1016, pass `--mouse-pixels` (test in local Ghostty first). Mouse movement updates **only the inspector text**, not the large Kitty image.
+
+### Selected-layer controls
+
+| Keys | Action |
+| --- | --- |
+| `1`–`9` | Select base (1) or overlay (2 and above) |
+| `e` | Type `min,max` and press Enter (Esc cancels) |
+| `m` / `M` | Type minimum or maximum individually |
+| `c` | Cycle grayscale → warm → cool → saturated → grayscale |
+| `+` / `-` | Narrow / widen selected layer's display window |
+| `,` / `.` | Shift selected layer's window down/up |
+| `0` | Reset selected layer's original window |
+| Space | Show/hide the selected overlay (not the base) |
+
+**Color scales:** gray uses black→white; warm uses red→yellow; cool uses blue→cyan. Saturated assigns each layer a stable, distinct vivid hue, rendered from dark→bright. CLI `--overlay-color HEX` starts that layer in its legacy fixed-tint mode; press `c` to switch to grayscale and cycle onward. The default background is grayscale.
+
+The base image is always opaque. Overlays are rendered in CLI order. Values at or below an overlay's **display minimum** are transparent, transitioning gradually to its set opacity at the maximum. The atlas is always composited last, above all intensity layers.
+
+## Atlas overlays
+
+### Solid ID atlas (recommended)
+
+```bash
+niv mean_IF.nii.gz --axis x --rotate 90 \
+  --atlas atlas_CCFv3_2020_30um.nii.gz \
+  --lut CCFv3-2020_regional_summary.csv
+```
+
+The viewer generates boundaries between adjacent region IDs on each slice, located at **voxel faces**. This is a precise, unsmoothed wireframe, not a vector/spline renderer. The experimental smoothed raster contours from v0.5 did not improve appearance and were removed, along with `--atlas-style` and its `g` shortcut. The `--max-pixels` flag was also removed; it was an independent transmission-resolution cap, not a smoothing control. Image resolution now follows the terminal pixel/cell dimensions, which can increase bandwidth on large displays. `--fps 12` may help remote Rex connections.
+
+LUT CSV columns: `Region_ID`, `Region`, `Abbr`, `R`, `G`, `B` (see [UNRAVEL reference](https://github.com/b-heifets/UNRAVEL/blob/dev/unravel/core/csvs/CCFv3-2020_regional_summary.csv)). Without a LUT, regions display only numeric IDs and the outline uses the fallback `--atlas-color`.
+
+### Precomputed UNRAVEL wireframe
+
+```bash
 niv mean_IF.nii.gz \
   --atlas-wireframe atlas_CCFv3_2020_30um_W_IDs.nii.gz \
   --atlas-labels atlas_CCFv3_2020_30um.nii.gz \
   --lut CCFv3-2020_regional_summary.csv
 ```
 
-The label volume is loaded once into RAM; its voxels are never painted over
-the grayscale image. The atlas LUT is required for abbreviations/names (without
-it you see only numeric IDs). All volumes must have matching array grids.
+Binary `_W` and ID-valued `_W_IDs` wireframes are both supported. Only the *solid label atlas* supplies region identity away from precomputed wireframe voxels; pass `--atlas-labels` for accurate hover lookup in this mode. Precomputed wireframe voxels are painted directly, not as between-voxel boundaries.
 
-## Smooth atlas outlines (v0.5)
+### Multiple intensity images
 
-Solid label atlas outlines default to `--atlas-style smooth`. This mode
-extracts boundaries on voxel **faces**, paints 1px antialiased strokes, and
-rounds ordinary 90° contour corners by 0.22 source voxels using short
-quadratic curves. This is a fast *raster* approximation to vector curves,
-not a high-resolution spline fitted to atlas anatomy. Multi-region junctions
-are deliberately not rounded, and small labeled areas are retained.
-
-```sh
-niv mean_IF.nii.gz --atlas atlas_CCFv3_2020_30um.nii.gz \
-  --lut CCFv3-2020_regional_summary.csv --atlas-style smooth \
-  --max-pixels 800000
-```
-
-Press `g` to switch between **smooth** and **voxel** while running. Voxel mode
-uses the precise unsmoothed boundaries from v0.4 and should be preferred when
-preserving exact segmentation geometry is more important than aesthetics.
-For local Ghostty you can try a larger `--max-pixels` for finer anti-aliasing;
-for remote Rex, use a lower limit (e.g. `120000`) and `--fps 12`.
-
-Precomputed `_W` and `_W_IDs` wireframes remain voxel-mask rendering even if
-`--atlas-style smooth` is requested: a wireframe mask does not contain enough
-label topology to recover curved **between-voxel** contours. For smooth lines,
-load the solid label atlas with `--atlas`.
-
-### Solid label atlas — recommended
-
-Given a background NIfTI and an identically registered Allen CCFv3 2020
-label atlas, compute the **outline on the fly**, on 2D voxel *faces* (not
-voxel centers). No precomputed wireframe is required:
-
-```sh
-niv mean_IF.nii.gz --axis x --rotate 90 \
+```bash
+niv mean_IF.nii.gz --window 0,1200 \
+  --overlay zstat_positive.nii.gz --overlay-window 2,6 --overlay-color ff6644 \
+  --overlay zstat_negative.nii.gz --overlay-window 2,6 --overlay-color 4499ff \
   --atlas atlas_CCFv3_2020_30um.nii.gz \
-  --lut CCFv3-2020_regional_summary.csv \
-  --atlas-width 1
+  --lut CCFv3-2020_regional_summary.csv
 ```
 
-The LUT file is the [UNRAVEL CCFv3-2020 regional summary CSV](https://github.com/b-heifets/UNRAVEL/blob/dev/unravel/core/csvs/CCFv3-2020_regional_summary.csv).
-It uses `Region_ID` (the atlas NIfTI voxel value), `Region`, `Abbr`, and
-`R,G,B` channels. The CSV is **not bundled** with this project; use your
-existing UNRAVEL copy or download it:
+`--overlay-window`, `--overlay-color`, `--overlay-opacity` apply to the preceding `--overlay`. All loaded 3D files must be on the **same voxel grid**. The tool checks dimensions, spacing and sforms, but does not resample or yet fully validate qforms. The X/Y/Z axes refer to raw NIfTI array indices, not affine-derived anatomical orientation.
 
-```sh
-curl -fL https://raw.githubusercontent.com/b-heifets/UNRAVEL/dev/unravel/core/csvs/CCFv3-2020_regional_summary.csv -o CCFv3-2020_regional_summary.csv
-```
+## Other CLI options
 
-`--atlas-color ffffff` is the fallback color if no LUT is supplied or an ID
-is absent from it. `--atlas-width 1` draws the thinnest contours; 2 or 3 are
-available for very small terminal views.
+See `niv --help`. Useful options include `--slice N`, `--step N`, `--rotate 90`, `--fps 12`, `--mouse-pixels`, `--no-enhanced-keys` and `--bench 100`. `NIV_AXIS`, `NII_AXIS` and `NIV_ROTATE` are supported. `--atlas-width 1` is the default pixel outline thickness.
 
-### Precomputed wireframe
+Kitty graphics frames are encoded using RGB24 + zlib + base64. New frames are placed before the old placement is deleted, avoiding intentional blanking on normal slice changes; changing layout intentionally clears the screen once. Bandwidth and smoothness still depend on Rex and your terminal.
 
-Both output types from UNRAVEL's [`atlas_wireframe` (`wf`)](https://github.com/b-heifets/UNRAVEL/blob/dev/unravel/image_tools/atlas/wireframe.py)
-are accepted:
+## Code structure
 
-```sh
-# Recommended: ID-valued wireframe. Color each nonzero boundary voxel via LUT.
-niv mean_IF.nii.gz --atlas-wireframe atlas_CCFv3_2020_30um_W_IDs.nii.gz --lut CCFv3-2020_regional_summary.csv
+- `src/volume.rs`: NIfTI decoding, grid validation and scaling
+- `src/render.rs`: nearest-neighbor slices, color maps, compositing, voxel-face contours
+- `src/layers.rs`: layered images, palettes, atlas LUT and region lookup
+- `src/app.rs`: navigation, fullscreen, layer selection and text-based range editor
+- `src/main.rs`: terminal lifecycle, small status UI, scroll and mouse events
+- `src/kitty.rs`: compressed Kitty image protocol
+- `examples/`: demo NIfTI generators and Kitty test utility
 
-# Binary wireframe: all nonzero voxels get the same fallback color.
-niv mean_IF.nii.gz --atlas-wireframe atlas_CCFv3_2020_30um_W.nii.gz --atlas-color ffffff
-```
-
-A precomputed wireframe is already a **voxel mask**, so lines from this
-mode occupy the wireframe voxels. To draw boundaries *between* voxels as
-requested, prefer `--atlas` with the full solid label atlas.
-
-### Multiple intensities under the atlas
-
-Additional volumes are overlaid **in command-line order** above the grayscale
-base, *below* the atlas. Intensities at or below each overlay's lower display
-limit are fully transparent. Values above the lower limit become progressively
-more opaque until the upper limit, when they reach `--overlay-opacity`.
-
-```sh
-niv mean_IF.nii.gz --axis x --rotate 90 --window 0,1200 \
-  --overlay zstat_positive.nii.gz --overlay-window 2,6 --overlay-color ff6644 --overlay-opacity 0.80 \
-  --overlay zstat_negative.nii.gz --overlay-window 2,6 --overlay-color 4499ff --overlay-opacity 0.75 \
-  --atlas atlas_CCFv3_2020_30um.nii.gz --lut CCFv3-2020_regional_summary.csv
-```
-
-Each `--overlay-window`, `--overlay-color`, and `--overlay-opacity` modifies
-**the most recently declared `--overlay`**. Overlay windows are static in v0.4;
-the interactive `+/-` and `,/.` controls still adjust the base grayscale
-window only. All volumes must be voxel-aligned. Mismatched dimensions,
-pixel spacing, or sform transforms are rejected with an error rather than
-silently drawn out of register. When NIfTI sform is missing, the tool **cannot
-fully verify qform alignment**: check registration yourself. No resampling or
-world-coordinate anatomical orientation is implemented yet.
-
-### Try the included aligned demo
-
-Included `data/sample.nii.gz`, `data/demo_atlas.nii.gz`,
-`data/demo_activation.nii.gz`, and `data/demo_lut.csv` all share the same
-NIfTI grid. Test without any lab data:
-
-```sh
-niv data/sample.nii.gz --axis z \
-  --overlay data/demo_activation.nii.gz --overlay-window 0.5,4.0 --overlay-color ff6644 \
-  --atlas data/demo_atlas.nii.gz --lut data/demo_lut.csv
-```
-
-To regenerate all these sample files without third-party Python packages:
-
-```sh
-cd data
-python3 ../examples/make_sample.py
-cd ..
-python3 examples/make_layer_demo.py
-```
-
-## Keyboard shortcuts
-
-| Key | Action |
-| --- | --- |
-| Arrows / `hjkl` | Scroll through slices |
-| Alt / Shift / Ctrl + navigation | ×2 / ×5 / ×10 slice motion |
-| `[` / `]` | Halve / double base slice stride |
-| `x`, `y`, `z`, `a` | Select raw NIfTI array axis / cycle |
-| `r` / `R` | Rotate display clockwise/counterclockwise by 90° |
-| `f` / `v` | Flip horizontally/vertically |
-| `b` | Show/hide topmost atlas outline |
-| `g` | Toggle smooth/voxel contour style (solid atlas only) |
-| Mouse hover | Show raw value of base/each overlay and atlas region |
-| `i` | Keyboard inspector on/off (arrows/hjkl move crosshair) |
-| `o` | Show/hide all additional intensity overlays |
-| `+` / `-` | Narrow / widen base grayscale window |
-| `,` / `.` / `0` | Shift base grayscale window / reset |
-| PgUp/PgDn, Home/End | Jump through slices |
-| `q` / Esc / Ctrl+C | Quit |
-
-`--axis`, `--rotate`, and the `NIV_AXIS`, `NIV_ROTATE` environment variables
-are supported as in v0.3. `NII_AXIS` is a fallback for `NIV_AXIS`. `--fps 12
---max-pixels 120000` can help remote sessions. `--bench 100` renders frames
-without a terminal and includes overlays in its timing.
-
-## Rendering details and limitations
-
-- Solid label atlas: scan adjacent 2D labels, project faces between voxels into
-  display pixels, draw one-pixel colored lines **last**. This is fast for a
-  single plane and keeps the outline visible above all image layers.
-- Precomputed atlas: draw nonzero mask voxels after image overlays. A wireframe
-  `_W_IDs` atlas uses those voxel values as LUT lookup IDs.
-- No full-screen clearing on normal slice changes: fresh Kitty image placement
-  is transmitted before the old frame is deleted (same behavior as v0.3).
-- The status displays the data and grayscale display range, layer counts, and
-  layer-by-layer intensity, and full region text at the hovered or keyboard-
-  inspected voxel.
-- The loader uses `ndarray::Array3<f32>` for each 3D NIfTI; a 440×267×380
-  image occupies ~170 MiB **per volume** after decompression. Loading two
-  additional intensities and an atlas uses roughly four times the base image
-  memory, plus temporary allocations.
-- Grayscale base image is never transparent (black at/below the lower window
-  limit). Additional intensity layers are transparent at/below their own
-  lower bounds. Colors are composited into one RGB frame to avoid Kitty
-  multi-placement synchronization issues over Rex.
-- The voxel indices correspond to array X/Y/Z, **not affine-derived
-  anatomical axes**. Rotation is display-only. Atlas alignment must be
-  established in voxel coordinates before loading.
-- The LUT colors are literal region RGB channels from the CSV; there is no
-  hierarchy filtering, region-name search, or adjustable alpha for atlas lines
-  in this first version.
-
-## Code layout
-
-- `src/main.rs`: terminal state, mouse input, low-overhead inspector footer, status and benchmark
-- `src/config.rs`: CLI and layer options
-- `src/volume.rs`: NIfTI loading and strict matching-grid checks
-- `src/layers.rs`: overlay and atlas structures; CSV LUT parsing
-- `src/render.rs`: nearest-neighbor mapping, alpha compositing, smoothed or exact voxel-face contours, cursor mapping
-- `src/kitty.rs`: zlib+base64 Kitty graphics protocol
-- `src/app.rs`: keyboard controls and toggles
-- `examples/make_layer_demo.py`: generate aligned demo volumes
-
-Licensed MIT; CCF color CSV is provided separately by UNRAVEL.
+MIT license. The upstream CCF LUT is maintained separately by UNRAVEL.

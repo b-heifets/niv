@@ -19,17 +19,28 @@ pub fn encode_rgb(rgb: &[u8]) -> Result<Encoded> {
     writer.write_all(rgb)?;
     let compressed = writer.finish()?;
     let bytes = compressed.len();
-    Ok(Encoded { payload: STANDARD.encode(compressed), bytes })
+    Ok(Encoded {
+        payload: STANDARD.encode(compressed),
+        bytes,
+    })
 }
 
 /// Send a Kitty graphics command in 4096-byte base64 chunks. q=1 suppresses
 /// successful acknowledgements (otherwise their ESC sequences can become key events).
-pub fn send<W: Write>(out: &mut W, image_id: u32, frame: &Encoded, geom: Geometry) -> io::Result<()> {
+pub fn send<W: Write>(
+    out: &mut W,
+    image_id: u32,
+    frame: &Encoded,
+    geom: Geometry,
+) -> io::Result<()> {
     let mut chunks = frame.payload.as_bytes().chunks(CHUNK).peekable();
     if let Some(first) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
-        write!(out, "\x1b_Ga=T,f=24,t=d,o=z,s={},v={},i={image_id},c={},r={},C=1,q=1,m={more};",
-            geom.width, geom.height, geom.cols, geom.rows)?;
+        write!(
+            out,
+            "\x1b_Ga=T,f=24,t=d,o=z,s={},v={},i={image_id},c={},r={},C=1,q=1,m={more};",
+            geom.width, geom.height, geom.cols, geom.rows
+        )?;
         out.write_all(first)?;
         out.write_all(b"\x1b\\")?;
         while let Some(chunk) = chunks.next() {
@@ -46,8 +57,13 @@ pub fn send<W: Write>(out: &mut W, image_id: u32, frame: &Encoded, geom: Geometr
 /// must be distinct; reusing a live ID implicitly removes its placements.
 /// Callers should allocate monotonically increasing IDs so the new frame is
 /// above the old frame if both briefly occupy the same screen location.
-pub fn replace<W: Write>(out: &mut W, image_id: u32, frame: &Encoded,
-    geom: Geometry, previous_id: Option<u32>) -> io::Result<()> {
+pub fn replace<W: Write>(
+    out: &mut W,
+    image_id: u32,
+    frame: &Encoded,
+    geom: Geometry,
+    previous_id: Option<u32>,
+) -> io::Result<()> {
     send(out, image_id, frame, geom)?;
     if let Some(previous) = previous_id {
         delete(out, previous)?;
@@ -67,7 +83,12 @@ mod tests {
     #[test]
     fn replacement_places_new_before_deleting_old() {
         let frame = encode_rgb(&[0u8; 3]).unwrap();
-        let geom = Geometry { cols: 1, rows: 1, width: 1, height: 1 };
+        let geom = Geometry {
+            cols: 1,
+            rows: 1,
+            width: 1,
+            height: 1,
+        };
         let mut output = Vec::new();
         replace(&mut output, 51, &frame, geom, Some(50)).unwrap();
         let sequence = String::from_utf8(output).unwrap();
@@ -82,7 +103,12 @@ mod tests {
             .map(|i| ((i.wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 12) & 255) as u8)
             .collect();
         let frame = encode_rgb(&pixels).unwrap();
-        let geom = Geometry { cols: 20, rows: 10, width: 400, height: 300 };
+        let geom = Geometry {
+            cols: 20,
+            rows: 10,
+            width: 400,
+            height: 300,
+        };
         let mut result = Vec::new();
         send(&mut result, 42, &frame, geom).unwrap();
         let text = String::from_utf8(result).unwrap();
