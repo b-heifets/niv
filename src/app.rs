@@ -3,18 +3,28 @@ use crate::{
     volume::{Axis, Volume},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditField {
     Both,
     Minimum,
     Maximum,
+    LayerOpacity,
+    AtlasOpacity,
+    AddPath,
 }
 
 pub struct WindowEdit {
     pub field: EditField,
     pub text: String,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Popup {
+    Help,
+    Info,
 }
 
 pub struct App {
@@ -25,6 +35,7 @@ pub struct App {
     pub window: (f32, f32),
     pub default_window: (f32, f32),
     pub base_palette: Palette,
+    pub base_opacity: f32,
     pub path: String,
     pub atlas_name: Option<String>,
     pub selected: usize, // 0 = base; subsequent indices = overlay layers
@@ -37,14 +48,17 @@ pub struct App {
     pub inspect_mode: bool,
     pub probe: Option<(usize, usize)>,
     pub edit: Option<WindowEdit>,
+    pub popup: Option<Popup>,
+    pub notice: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Quit,
     Redraw,
     Ui,
     Layout,
+    LoadOverlay(PathBuf),
     None,
 }
 
@@ -65,6 +79,7 @@ impl App {
             window,
             default_window: window,
             base_palette: Palette::Gray,
+            base_opacity: 1.0,
             path,
             atlas_name: None,
             selected: 0,
@@ -77,6 +92,8 @@ impl App {
             inspect_mode: false,
             probe: None,
             edit: None,
+            popup: None,
+            notice: None,
         }
     }
 
@@ -209,6 +226,14 @@ impl App {
         });
     }
 
+    pub fn selected_opacity(&self, layers: &Layers) -> f32 {
+        if self.selected == 0 {
+            self.base_opacity
+        } else {
+            layers.overlays[self.selected - 1].opacity
+        }
+    }
+
     fn edit_key(&mut self, layers: &mut Layers, key: KeyCode) -> Action {
         let Some(editor) = self.edit.as_mut() else {
             return Action::None;
@@ -220,8 +245,49 @@ impl App {
             }
             KeyCode::Enter => {
                 let (field, text) = (editor.field, editor.text.trim().to_owned());
-                let current = self.selected_window(layers);
-                let result = parse_edit(field, &text, current);
+                if field == EditField::AddPath {
+                    if text.is_empty() {
+                        if let Some(e) = self.edit.as_mut() {
+                            e.error = Some("Enter an image path".into());
+                        }
+                        return Action::Ui;
+                    }
+                    self.edit = None;
+                    let path = if let Some(rest) = text.strip_prefix("~/") {
+                        std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("~"))
+                            .join(rest)
+                    } else {
+                        PathBuf::from(text)
+                    };
+                    return Action::LoadOverlay(path);
+                }
+                if field == EditField::LayerOpacity || field == EditField::AtlasOpacity {
+                    let value = text
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+                    return if let Some(value) = value {
+                        if field == EditField::AtlasOpacity {
+                            if let Some(atlas) = &mut layers.atlas {
+                                atlas.opacity = value;
+                            }
+                        } else if self.selected == 0 {
+                            self.base_opacity = value;
+                        } else {
+                            layers.overlays[self.selected - 1].opacity = value;
+                        }
+                        self.edit = None;
+                        Action::Redraw
+                    } else {
+                        if let Some(e) = self.edit.as_mut() {
+                            e.error = Some("Opacity must be 0..1".into());
+                        }
+                        Action::Ui
+                    };
+                }
+                let result = parse_edit(field, &text, self.selected_window(layers));
                 match result {
                     Ok(window) => {
                         self.set_window(layers, window);
@@ -229,8 +295,8 @@ impl App {
                         Action::Redraw
                     }
                     Err(error) => {
-                        if let Some(editor) = self.edit.as_mut() {
-                            editor.error = Some(error);
+                        if let Some(e) = self.edit.as_mut() {
+                            e.error = Some(error);
                         }
                         Action::Ui
                     }
@@ -242,8 +308,10 @@ impl App {
                 Action::Ui
             }
             KeyCode::Char(c)
-                if (c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | '+' | 'e' | 'E'))
-                    && editor.text.len() < 64 =>
+                if editor.text.len() < 1024
+                    && (editor.field == EditField::AddPath
+                        || (c.is_ascii_digit()
+                            || matches!(c, ',' | '.' | '-' | '+' | 'e' | 'E'))) =>
             {
                 editor.text.push(c);
                 editor.error = None;
@@ -261,6 +329,19 @@ impl App {
         if self.edit.is_some() {
             return self.edit_key(layers, key.code);
         }
+        if let Some(popup) = self.popup {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('/') => {
+                    self.popup = None;
+                    Action::Layout
+                }
+                KeyCode::Char('I') if popup == Popup::Info => {
+                    self.popup = None;
+                    Action::Layout
+                }
+                _ => Action::None,
+            };
+        }
         if key.code == KeyCode::Esc
             || key.code == KeyCode::Char('q')
             || (key.code == KeyCode::Char('c') && m.contains(KeyModifiers::CONTROL))
@@ -268,6 +349,43 @@ impl App {
             return Action::Quit;
         }
         match key.code {
+            KeyCode::Char('?') | KeyCode::Char('/') => {
+                self.popup = Some(Popup::Help);
+                Action::Layout
+            }
+            KeyCode::Char('I') => {
+                self.popup = Some(Popup::Info);
+                Action::Layout
+            }
+            KeyCode::Char('n') => {
+                self.edit = Some(WindowEdit {
+                    field: EditField::AddPath,
+                    text: String::new(),
+                    error: None,
+                });
+                Action::Ui
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                let field = if key.code == KeyCode::Char('O') {
+                    EditField::AtlasOpacity
+                } else {
+                    EditField::LayerOpacity
+                };
+                if field == EditField::AtlasOpacity && layers.atlas.is_none() {
+                    self.notice = Some("No atlas loaded".into());
+                    return Action::Ui;
+                }
+                self.edit = Some(WindowEdit {
+                    field,
+                    text: String::new(),
+                    error: None,
+                });
+                Action::Ui
+            }
+            KeyCode::Char(';') => {
+                self.selected = (self.selected + 1) % (layers.overlays.len() + 1);
+                Action::Ui
+            }
             KeyCode::Tab => {
                 self.fullscreen = !self.fullscreen;
                 Action::Layout
@@ -341,10 +459,6 @@ impl App {
             }
             KeyCode::Char('v') => {
                 self.flip_v = !self.flip_v;
-                Action::Redraw
-            }
-            KeyCode::Char('o') => {
-                self.show_overlays = !self.show_overlays;
                 Action::Redraw
             }
             KeyCode::Char('i') => {
@@ -449,6 +563,7 @@ fn parse_edit(field: EditField, text: &str, current: (f32, f32)) -> Result<(f32,
         }
         EditField::Minimum => (parse(text)?, current.1),
         EditField::Maximum => (current.0, parse(text)?),
+        _ => return Err("Not an intensity range".into()),
     };
     if lo >= hi {
         return Err("Display minimum must be less than maximum".to_owned());
@@ -466,6 +581,7 @@ mod tests {
             data: Array3::zeros((20, 30, 100)),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         }
     }
     fn key(
@@ -674,6 +790,78 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert_eq!(layers.overlays[0].window, (2., 6.));
+    }
+    #[test]
+    fn help_and_opacity_editing() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 2, 1, 0, (0., 100.), "base".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.popup, Some(Popup::Help));
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.popup, None);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+        );
+        for c in "0.4".chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!((app.base_opacity - 0.4).abs() < 1e-6);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        );
+        for c in "~/test.nii.gz".chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
+        assert!(matches!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ),
+            Action::LoadOverlay(_)
+        ));
     }
     #[test]
     fn editor_validation() {

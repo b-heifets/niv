@@ -42,13 +42,6 @@ impl Axis {
             Self::Z => [h, v, slice],
         }
     }
-    pub fn cycle(self) -> Self {
-        match self {
-            Self::X => Self::Y,
-            Self::Y => Self::Z,
-            Self::Z => Self::X,
-        }
-    }
     pub fn plane_axes(self) -> (usize, usize) {
         match self {
             Self::X => (1, 2), // horizontal index Y; vertical index Z
@@ -63,6 +56,8 @@ pub struct Volume {
     pub spacing: [f32; 3],
     /// S-form transform when supplied by NIfTI, used to reject misregistered overlays.
     pub sform: Option<[[f32; 4]; 3]>,
+    /// Datatype stored in the original NIfTI header before f32 conversion.
+    pub datatype: i16,
 }
 
 impl Volume {
@@ -80,6 +75,7 @@ impl Volume {
             );
         }
         let header = object.header();
+        let datatype = header.datatype;
         let sform = if header.sform_code != 0 {
             Some([header.srow_x, header.srow_y, header.srow_z])
         } else {
@@ -119,6 +115,7 @@ impl Volume {
             data,
             spacing,
             sform,
+            datatype,
         })
     }
 
@@ -197,27 +194,33 @@ impl Volume {
         }
     }
 
-    /// Deterministic subsample of finite, non-zero voxels for contrast limits.
-    /// This avoids sorting or copying millions of voxels.
+    /// Exact finite data range, with a nonzero window for constant volumes.
+    /// Values <= display minimum are transparent, by design.
     pub fn auto_window(&self) -> (f32, f32) {
-        let stride = (self.data.len() / 120_000).max(1);
-        let mut samples: Vec<f32> = self
-            .data
-            .iter()
-            .step_by(stride)
-            .copied()
-            .filter(|v| v.is_finite() && *v != 0.0)
-            .collect();
-        if samples.is_empty() {
-            return (0.0, 1.0);
-        }
-        samples.sort_unstable_by(f32::total_cmp);
-        let lo = samples[(samples.len() - 1) / 100];
-        let hi = samples[((samples.len() - 1) as f64 * 0.995) as usize];
+        let (lo, hi) = self.data_range();
         if lo < hi {
             (lo, hi)
         } else {
-            (lo - 0.5, lo + 0.5)
+            (lo - 0.5, hi + 0.5)
+        }
+    }
+
+    pub fn datatype_name(&self) -> &'static str {
+        match self.datatype {
+            2 => "uint8",
+            4 => "int16",
+            8 => "int32",
+            16 => "float32",
+            64 => "float64",
+            128 => "RGB24",
+            256 => "int8",
+            512 => "uint16",
+            768 => "uint32",
+            1024 => "int64",
+            1280 => "uint64",
+            1536 => "float128",
+            1792 => "complex128",
+            _ => "other",
         }
     }
 }
@@ -232,6 +235,7 @@ mod tests {
             data: Array3::from_shape_fn((3, 4, 5), |(x, y, z)| (x * 100 + y * 10 + z) as f32),
             spacing: [1., 2., 3.],
             sform: None,
+            datatype: 16,
         }
     }
     #[test]
@@ -259,11 +263,12 @@ mod tests {
             data: Array3::from_shape_vec((2, 2, 1), vec![0., 10., f32::NAN, -1.]).unwrap(),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         assert_eq!(v.data_range(), (-1., 10.));
     }
     #[test]
-    fn window_ignores_zeros_and_nonfinite() {
+    fn window_defaults_to_full_finite_range() {
         let v = Volume {
             data: Array3::from_shape_vec(
                 (2, 2, 2),
@@ -272,9 +277,9 @@ mod tests {
             .unwrap(),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         let (lo, hi) = v.auto_window();
-        assert_eq!(lo, 10.);
-        assert!(hi >= 40.);
+        assert_eq!((lo, hi), (0., 100.));
     }
 }

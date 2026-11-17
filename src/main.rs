@@ -7,7 +7,7 @@ mod render;
 mod volume;
 
 use anyhow::{bail, Result};
-use app::{Action, App, EditField};
+use app::{Action, App, EditField, Popup};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
@@ -15,7 +15,9 @@ use crossterm::{
         MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use layers::Layers;
@@ -155,10 +157,13 @@ fn intensity(v: f32) -> String {
     if !v.is_finite() {
         return v.to_string();
     }
-    if v != 0. && (v.abs() < 0.0001 || v.abs() >= 1e7) {
-        format!("{v:.4e}")
+    format!("{v:.7}")
+}
+fn compact_number(v: f32) -> String {
+    if v.is_finite() && v.abs() < 100_000.0 {
+        format!("{v:.5}")
     } else {
-        format!("{v:.3}")
+        format!("{v:.5e}")
     }
 }
 fn rgb_color(rgb: [u8; 3]) -> Color {
@@ -169,13 +174,14 @@ fn rgb_color(rgb: [u8; 3]) -> Color {
     }
 }
 
-fn line(out: &mut impl Write, row: u16, s: &str, cols: u16, fg: Color) -> Result<()> {
+fn line(out: &mut impl Write, row: u16, s: &str, cols: u16, fg: Color, x: u16) -> Result<()> {
     queue!(
         out,
         MoveTo(0, row),
         Clear(ClearType::CurrentLine),
+        MoveTo(x, row),
         SetForegroundColor(fg),
-        Print(crop(s, cols as usize)),
+        Print(crop(s, cols.saturating_sub(x) as usize)),
         ResetColor
     )?;
     Ok(())
@@ -188,13 +194,7 @@ fn selected_name<'a>(app: &'a App, layers: &'a Layers) -> &'a str {
         &layers.overlays[app.selected - 1].name
     }
 }
-fn selected_data_range(app: &App, layers: &Layers, base_range: (f32, f32)) -> (f32, f32) {
-    if app.selected == 0 {
-        base_range
-    } else {
-        layers.overlays[app.selected - 1].data_range
-    }
-}
+
 fn selected_visible(app: &App, layers: &Layers) -> bool {
     app.selected == 0 || (app.show_overlays && layers.overlays[app.selected - 1].visible)
 }
@@ -204,98 +204,62 @@ fn draw_ui(
     vol: &Volume,
     layers: &Layers,
     app: &App,
-    base_range: (f32, f32),
+    _base_range: (f32, f32),
     view: ViewLayout,
 ) -> Result<()> {
     if app.fullscreen {
         return Ok(());
     }
     let (cols, rows) = terminal::size()?;
-    // First row: bold region label and LUT color, followed by dim atlas file name.
+    let x = view.x;
     queue!(out, MoveTo(0, 0), Clear(ClearType::CurrentLine))?;
-    let mut consumed = 0usize;
-    if let Some((h, v)) = app.probe {
-        if let Some((label, color)) = layers.region_details(app.axis, app.index, h, v) {
-            let prefix = "Region: ";
-            queue!(out, SetAttribute(Attribute::Bold), Print(prefix))?;
-            consumed += prefix.chars().count();
-            let remaining = (cols as usize).saturating_sub(consumed);
-            let label = crop(&label, remaining);
-            if let Some(color) = color {
-                queue!(out, SetForegroundColor(rgb_color(color)))?;
+    if layers.atlas.is_some() {
+        let (w, h, _) = vol.plane(app.axis);
+        let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
+        if let Some((label, color)) = layers.region_details(app.axis, app.index, vh, vv) {
+            queue!(out, MoveTo(x, 0), SetAttribute(Attribute::Bold))?;
+            if let Some(rgb) = color {
+                queue!(out, SetForegroundColor(rgb_color(rgb)))?;
             }
             queue!(
                 out,
-                Print(&label),
+                Print(crop(&label, cols.saturating_sub(x) as usize)),
                 ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;
-            consumed += label.chars().count();
         }
     }
-    if let Some(atlas) = &app.atlas_name {
-        let text = if consumed > 0 {
-            format!("   |   {atlas}")
-        } else {
-            format!("Atlas: {atlas}")
-        };
-        if consumed < cols as usize {
-            queue!(
-                out,
-                SetForegroundColor(Color::DarkGrey),
-                Print(crop(&text, (cols as usize) - consumed)),
-                ResetColor
-            )?;
-        }
-    } else if consumed == 0 {
-        let header = format!(
-            "Slice {}/{}    stride {}",
-            app.index + 1,
-            vol.depth(app.axis),
-            app.stride
-        );
-        queue!(
-            out,
-            SetForegroundColor(Color::DarkGrey),
-            Print(crop(&header, cols as usize)),
-            ResetColor
-        )?;
-    }
-    let win = app.selected_window(layers);
-    let dat = selected_data_range(app, layers, base_range);
-    let palette = app.selected_palette(layers);
-    let status = if selected_visible(app, layers) {
+    let (lo, hi) = app.selected_window(layers);
+    let opacity = app.selected_opacity(layers);
+    let color = app.selected_palette(layers).accent(app.selected);
+    let marker = if selected_visible(app, layers) {
         ""
     } else {
-        " [hidden]"
+        " [off]"
     };
-    let layer_name = if app.show_layer_list {
+    let filename = if app.show_layer_list {
         String::new()
     } else {
-        format!("  {}", selected_name(app, layers))
+        let name = selected_name(app, layers);
+        let max_name = (cols.saturating_sub(x) as usize / 2).min(52).max(8);
+        let short = if name.chars().count() > max_name {
+            format!("{}…", crop(name, max_name.saturating_sub(1)))
+        } else {
+            name.to_owned()
+        };
+        format!(" {short}")
     };
     let summary = format!(
-        "{}{}{}  |  {}  |  min {}   max {}  |  data {}..{}",
+        "{}{}{}   min {}   max {}   α {:.0}%",
         app.selected + 1,
-        layer_name,
-        status,
-        palette.name(),
-        intensity(win.0),
-        intensity(win.1),
-        intensity(dat.0),
-        intensity(dat.1)
+        filename,
+        marker,
+        compact_number(lo),
+        compact_number(hi),
+        opacity * 100.0
     );
-    queue!(
-        out,
-        MoveTo(0, view.footer),
-        Clear(ClearType::CurrentLine),
-        SetForegroundColor(rgb_color(palette.accent(app.selected))),
-        SetAttribute(Attribute::Bold),
-        Print(crop(&summary, cols as usize)),
-        SetAttribute(Attribute::Reset),
-        ResetColor
-    )?;
-    // Optional compact list: every filename is shown at most once.
+    line(out, view.footer, &summary, cols, rgb_color(color), x)?;
+    // Optional compact layer list. No name is repeated outside the list header.
     for k in 0..view.list_count {
         let idx = view.list_start + k;
         let name = if idx == 0 {
@@ -308,20 +272,18 @@ fn draw_ui(
         } else {
             layers.overlays[idx - 1].palette
         };
-        let is_visible = idx == 0 || (app.show_overlays && layers.overlays[idx - 1].visible);
+        let visible = idx == 0 || (app.show_overlays && layers.overlays[idx - 1].visible);
         let mark = if idx == app.selected { ">" } else { " " };
-        let row = view.footer + 1 + k as u16;
         let txt = format!(
-            "{} {}  {}  {}{}",
+            "{} {}  {}{}",
             mark,
             idx + 1,
             name,
-            pal.name(),
-            if is_visible { "" } else { " [hidden]" }
+            if visible { "" } else { " [off]" }
         );
         line(
             out,
-            row,
+            view.footer + 1 + k as u16,
             &txt,
             cols,
             if idx == app.selected {
@@ -329,66 +291,258 @@ fn draw_ui(
             } else {
                 Color::DarkGrey
             },
+            x,
         )?;
     }
     let inspect_row = view.footer + 1 + view.list_count as u16;
-    let info = if let Some((h, v)) = app.probe {
-        let [x, y, z] = app.axis.xyz(app.index, h, v);
+    let inspect = if let Some((h, v)) = app.probe {
+        let [ix, iy, iz] = app.axis.xyz(app.index, h, v);
         let mut text = format!(
-            "[{x},{y},{z}]   1: {}",
+            "[{ix},{iy},{iz}]   1 {}",
             intensity(vol.sample(app.axis, app.index, h, v))
         );
-        for (i, layer) in layers.overlays.iter().enumerate() {
+        for (idx, layer) in layers.overlays.iter().enumerate() {
             text.push_str(&format!(
-                "   {}: {}",
-                i + 2,
+                "   {} {}",
+                idx + 2,
                 intensity(layer.vol.sample(app.axis, app.index, h, v))
             ));
-        }
-        if app.stride > 1 {
-            text.push_str(&format!("   stride {}", app.stride));
         }
         text
     } else {
         format!(
-            "Slice {}/{}   stride {}   |   hover to inspect voxels, or press i",
+            "{}/{}   stride {}   ·   hover to inspect",
             app.index + 1,
             vol.depth(app.axis),
             app.stride
         )
     };
-    line(out, inspect_row, &info, cols, Color::Grey)?;
-    let help_row = rows - 1;
+    line(out, inspect_row, &inspect, cols, Color::Grey, x)?;
+    let hint_row = rows - 1;
     if let Some(edit) = &app.edit {
-        let label = match edit.field {
+        let what = match edit.field {
             EditField::Both => "min,max",
             EditField::Minimum => "minimum",
             EditField::Maximum => "maximum",
+            EditField::LayerOpacity => "image opacity (0..1)",
+            EditField::AtlasOpacity => "atlas opacity (0..1)",
+            EditField::AddPath => "new overlay path",
         };
-        let error = edit.error.as_deref().unwrap_or("");
-        let prompt = format!(
-            "{label} > {}_   {error}    Enter apply / Esc cancel",
-            edit.text
-        );
+        let err = edit.error.as_deref().unwrap_or("");
+        let txt = format!("{what} > {}_  {err}    Enter apply · Esc cancel", edit.text);
         line(
             out,
-            help_row,
-            &prompt,
+            hint_row,
+            &txt,
             cols,
             if edit.error.is_some() {
                 Color::Red
             } else {
                 Color::Yellow
             },
+            x,
         )?;
+    } else if let Some(notice) = &app.notice {
+        line(out, hint_row, notice, cols, Color::Yellow, x)?;
     } else {
-        let help = if app.inspect_mode {
-            "INSPECT: arrows move probe  PgUp/PgDn slice  i exit  Tab image-only  a atlas"
-        } else {
-            "wheel/arrows slices  [/ ] stride  1-9 layer  e range  c color  a atlas  t list  Tab fill"
-        };
-        line(out, help_row, help, cols, Color::DarkGrey)?;
+        line(
+            out,
+            hint_row,
+            "↑↓/wheel slices   1–9 layer   e range   o opacity   n load   ? help",
+            cols,
+            Color::DarkGrey,
+            x,
+        )?;
     }
+    out.flush()?;
+    Ok(())
+}
+
+/// Small modal sheet; the graphics placement is temporarily hidden while open
+/// to ensure text remains readable even in multiplexers that draw Kitty images
+/// above terminal character cells.
+fn draw_popup(
+    out: &mut impl Write,
+    vol: &Volume,
+    layers: &Layers,
+    app: &App,
+    base_range: (f32, f32),
+) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    queue!(out, Clear(ClearType::All))?;
+    let mut lines: Vec<String> = Vec::new();
+    match app.popup {
+        Some(Popup::Help) => {
+            lines.extend(
+                [
+                    "NAVIGATION",
+                    "  ↑↓←→ / hjkl      Slices; wheel / trackpad also scroll",
+                    "  Shift ×2 · Ctrl ×3 · Alt ×4     [ / ]  adjust stride",
+                    "  PgUp / PgDn      ±25 slices    x y z   choose axis",
+                    "  r / R  rotate     f / v  flip     Tab  fill terminal",
+                    "  i      Keyboard probe (arrows move probe; PgUp/Dn slices)",
+                    "",
+                    "LAYERS",
+                    "  1–9    Select layer      ;       Next layer",
+                    "  n      Load .nii.gz     Space   Toggle selected overlay",
+                    "  e      Edit min,max     m / M   Edit just min / max",
+                    "  0      Reset range      c       Cycle color map",
+                    "  o      Image opacity    O       Atlas opacity",
+                    "  a      Atlas visible    t       Layer list",
+                    "  + / -  Contrast         , / .   Brightness",
+                    "",
+                    "? or /  help     I  info     q  quit     Esc  close",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        Some(Popup::Info) => {
+            lines.push(format!("Base  1  {}", app.path));
+            lines.push(format!(
+                "Grid       {} × {} × {} voxels",
+                vol.dims()[0],
+                vol.dims()[1],
+                vol.dims()[2]
+            ));
+            lines.push(format!(
+                "Spacing    {:.4} × {:.4} × {:.4}",
+                vol.spacing[0], vol.spacing[1], vol.spacing[2]
+            ));
+            lines.push(format!(
+                "Stored     {} (NIfTI code {}) · decoded f32",
+                vol.datatype_name(),
+                vol.datatype
+            ));
+            lines.push(format!(
+                "Data       {} .. {}",
+                compact_number(base_range.0),
+                compact_number(base_range.1)
+            ));
+            lines.push(format!(
+                "Window     {} .. {}",
+                compact_number(app.window.0),
+                compact_number(app.window.1)
+            ));
+            lines.push(format!(
+                "Axis       {} slice {}/{}  · rotation {}° · stride {}",
+                app.axis.label(),
+                app.index + 1,
+                vol.depth(app.axis),
+                app.rotation,
+                app.stride
+            ));
+            lines.push(format!("Opacity    {:.0}%", app.base_opacity * 100.0));
+            if let Some(atlas) = &layers.atlas {
+                lines.push(String::new());
+                lines.push(format!(
+                    "Atlas      {}",
+                    app.atlas_name.as_deref().unwrap_or("(loaded)")
+                ));
+                lines.push(format!(
+                    "Atlas      {:.0}% opacity · {} outline",
+                    atlas.opacity * 100.0,
+                    if atlas.wireframe {
+                        "wireframe"
+                    } else {
+                        "solid label"
+                    }
+                ));
+                lines.push(format!("LUT        {} region colors", atlas.regions.len()));
+            }
+            if !layers.overlays.is_empty() {
+                lines.push(String::new());
+                lines.push("Additional images".into());
+            }
+            for (idx, layer) in layers.overlays.iter().enumerate() {
+                lines.push(format!(
+                    "  {} {}  {}  data {}..{}",
+                    idx + 2,
+                    layer.name,
+                    layer.vol.datatype_name(),
+                    compact_number(layer.data_range.0),
+                    compact_number(layer.data_range.1)
+                ));
+            }
+            lines.push(String::new());
+            lines.push("Esc / I / ?  close".into());
+        }
+        None => return Ok(()),
+    }
+    let width = (cols as usize).saturating_sub(4).min(78).max(12);
+    let content_w = width.saturating_sub(4);
+    let max_lines = rows.saturating_sub(6) as usize;
+    let showing = lines.len().min(max_lines);
+    let block_h = showing + 4;
+    let left = cols.saturating_sub(width as u16) / 2;
+    let top = rows.saturating_sub(block_h as u16) / 2;
+    let bg = Color::Rgb {
+        r: 36,
+        g: 36,
+        b: 48,
+    };
+    let fg = Color::Grey;
+    let border_color = Color::DarkGrey;
+    let title = if app.popup == Some(Popup::Help) {
+        " Help · ? / "
+    } else {
+        " Image information · I "
+    };
+    let bar = "─".repeat(width.saturating_sub(2));
+    queue!(
+        out,
+        MoveTo(left, top),
+        SetForegroundColor(border_color),
+        Print(format!("╭{bar}╮")),
+        ResetColor
+    )?;
+    // Put title inside border without changing the panel width.
+    queue!(
+        out,
+        MoveTo(left + 2, top),
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold),
+        Print(title),
+        SetAttribute(Attribute::Reset),
+        ResetColor
+    )?;
+    for row in 0..showing + 2 {
+        let y = top + row as u16 + 1;
+        queue!(
+            out,
+            MoveTo(left, y),
+            SetForegroundColor(border_color),
+            Print("│"),
+            SetBackgroundColor(bg),
+            Print(" ".repeat(width.saturating_sub(2))),
+            ResetColor,
+            SetForegroundColor(border_color),
+            Print("│"),
+            ResetColor
+        )?;
+        if row < showing {
+            let text = crop(&lines[row], content_w);
+            queue!(
+                out,
+                MoveTo(left + 2, y),
+                SetBackgroundColor(bg),
+                SetForegroundColor(if lines[row] == "NAVIGATION" || lines[row] == "LAYERS" {
+                    Color::Yellow
+                } else {
+                    fg
+                }),
+                Print(text),
+                ResetColor
+            )?;
+        }
+    }
+    queue!(
+        out,
+        MoveTo(left, top + showing as u16 + 3),
+        SetForegroundColor(border_color),
+        Print(format!("╰{bar}╯")),
+        ResetColor
+    )?;
     out.flush()?;
     Ok(())
 }
@@ -402,6 +556,11 @@ fn draw(
     frames: &mut FrameState,
 ) -> Result<ViewLayout> {
     let (cols, rows) = terminal::size()?;
+    if app.popup.is_some() {
+        frames.clear(out)?;
+        draw_popup(out, vol, layers, app, base_range)?;
+        return Ok(layout(vol, app, layers, cols, rows));
+    }
     if cols < 16 || rows < 6 {
         frames.clear(out)?;
         queue!(
@@ -426,8 +585,8 @@ fn draw(
         });
     }
     let view = layout(vol, app, layers, cols, rows);
-    let rgb = render::composite(vol, app, layers, view.geom.width, view.geom.height);
-    let frame = kitty::encode_rgb(&rgb)?;
+    let rgba = render::composite(vol, app, layers, view.geom.width, view.geom.height);
+    let frame = kitty::encode_rgba(&rgba)?;
     queue!(out, MoveTo(view.x, view.y))?;
     let next = frames.allocate();
     kitty::replace(out, next, &frame, view.geom, frames.active_id)?;
@@ -494,10 +653,10 @@ fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, count: usize) -> Resu
     for i in 0..count {
         app.index = i * vol.depth(app.axis) / count;
         let t = Instant::now();
-        let rgb = render::composite(vol, app, layers, geom.width, geom.height);
+        let rgba = render::composite(vol, app, layers, geom.width, geom.height);
         rgb_time += t.elapsed();
         let t = Instant::now();
-        compressed += kitty::encode_rgb(&rgb)?.bytes;
+        compressed += kitty::encode_rgba(&rgba)?.bytes;
         encode_time += t.elapsed();
     }
     let elapsed = start.elapsed();
@@ -552,6 +711,8 @@ fn run() -> Result<()> {
         window,
         name,
     );
+    app.base_opacity = config.base_opacity;
+    app.default_window = vol.auto_window();
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     if let Some(count) = config.benchmark_frames {
         return benchmark(&vol, &layers, &mut app, count);
@@ -578,20 +739,45 @@ fn run() -> Result<()> {
         if event::poll(wait)? {
             for _ in 0..256 {
                 match event::read()? {
-                    Event::Key(key) => match app.key(&vol, &mut layers, key) {
-                        Action::Quit => {
-                            frames.clear(&mut out)?;
-                            out.flush()?;
-                            return Ok(());
+                    Event::Key(key) => {
+                        if app.notice.take().is_some() {
+                            pending_ui = true;
                         }
-                        Action::Redraw => pending_frame = true,
-                        Action::Ui => pending_ui = true,
-                        Action::Layout => {
-                            pending_layout = true;
-                            pending_frame = true;
+                        match app.key(&vol, &mut layers, key) {
+                            Action::Quit => {
+                                frames.clear(&mut out)?;
+                                out.flush()?;
+                                return Ok(());
+                            }
+                            Action::Redraw => pending_frame = true,
+                            Action::Ui => pending_ui = true,
+                            Action::Layout => {
+                                pending_layout = true;
+                                pending_frame = true;
+                            }
+                            Action::LoadOverlay(path) => {
+                                app.notice = Some(format!("Loading {} ...", path.display()));
+                                draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
+                                match layers.add_overlay(&path, &vol) {
+                                    Ok(idx) => {
+                                        app.selected = idx;
+                                        app.notice = Some(format!(
+                                            "Loaded layer {}: {}",
+                                            idx + 1,
+                                            layers.overlays[idx - 1].name
+                                        ));
+                                        pending_layout = true;
+                                        pending_frame = true;
+                                    }
+                                    Err(err) => {
+                                        app.notice = Some(format!("Could not load: {err:#}"));
+                                        pending_ui = true;
+                                    }
+                                }
+                            }
+                            Action::None => {}
                         }
-                        Action::None => {}
-                    },
+                    }
                     Event::Resize(_, _) => {
                         pending_layout = true;
                         pending_frame = true;
@@ -599,7 +785,7 @@ fn run() -> Result<()> {
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                            if app.edit.is_none() =>
+                            if app.edit.is_none() && app.popup.is_none() =>
                         {
                             let direction = if mouse.kind == MouseEventKind::ScrollUp {
                                 1
@@ -615,7 +801,7 @@ fn run() -> Result<()> {
                         MouseEventKind::Moved
                         | MouseEventKind::Drag(_)
                         | MouseEventKind::Down(_)
-                            if !app.inspect_mode && app.edit.is_none() =>
+                            if !app.inspect_mode && app.edit.is_none() && app.popup.is_none() =>
                         {
                             let next = mouse_voxel(&vol, &app, view, mouse, config.mouse_pixels);
                             if app.probe != next {

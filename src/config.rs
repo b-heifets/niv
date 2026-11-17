@@ -17,6 +17,8 @@ pub struct Config {
     pub axis: Axis,
     pub initial_slice: Option<usize>,
     pub step: usize,
+    pub base_opacity: f32,
+    pub atlas_opacity: f32,
     pub rotation: u16,
     pub window: Option<(f32, f32)>,
     pub overlays: Vec<OverlaySpec>,
@@ -32,71 +34,72 @@ pub struct Config {
     pub benchmark_frames: Option<usize>,
 }
 
-const HELP: &str = r#"niv — fast NIfTI slice viewer using Kitty graphics
+const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
+Usage: niv FILE.nii.gz [--overlay FILE] [--atlas FILE] [--lut FILE]
+Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
+Keys: arrows/wheel slices · 1–9 select · e range · o opacity · O atlas opacity · n load · ? help
+Use --help for full options and controls.
+"#;
+
+const HELP: &str = r#"niv — keyboard-driven NIfTI viewer using Kitty graphics
 
 USAGE
   niv FILE.nii[.gz] [OPTIONS]
 
-OPTIONS
-  -a, --axis x|y|z       Voxel index axis for slicing (NIV_AXIS or NII_AXIS; default z)
-      --slice N          Start at zero-based slice N (default: center)
-      --step N           Base slice stride (default: 1)
-  -r, --rotate DEGREES  Rotate view clockwise: 0,90,180,270 (NIV_ROTATE; default 0)
-  -w, --window LOW,HIGH  Grayscale window (default: sampled nonzero 1%-99.5%)
-      --overlay FILE     Add an intensity layer (repeatable, drawn in CLI order)
-      --overlay-window LOW,HIGH  Window for most recently added overlay
-      --overlay-color HEX  Tint for most recent overlay (default #ffb84d)
-      --overlay-opacity 0..1  Opacity for most recent overlay (default .8)
-      --atlas FILE       Solid ID label atlas; draw between-voxel contours
-      --atlas-wireframe FILE  Precomputed binary or ID wireframe volume
-      --lut FILE.csv     CCFv3 table with Region_ID,Region,Abbr,R,G,B
-      --atlas-color HEX Fallback outline color (#ffffff)
-      --atlas-width N    Outline thickness in pixels, 1..3 (default 1)
-      --atlas-labels FILE  Solid label volume for region inspection with wireframe
-      --mouse-pixels     Request SGR 1016 pixel-precision mouse events (opt-in)
-      --fps N            Maximum redraw FPS (default: 30; useful over Tailscale)
-      --no-enhanced-keys Disable Kitty enhanced keyboard mode (for problematic muxes)
-      --bench N          Render and encode N frames, report timings, then exit
-  -h, --help             Show help
-  -V, --version          Show version
+VIEW
+  -a, --axis x|y|z       Slice axis (default x; NIV_AXIS or NII_AXIS)
+  -r, --rotate DEGREES  Clockwise 0,90,180,270 (default 90; NIV_ROTATE)
+      --slice N          Starting slice (zero based; default center)
+      --step N           Starting slice stride (default 1)
+  -w, --window MIN,MAX  Initial display range (default finite voxel min,max)
+      --opacity 0..1    Base image opacity (default 1)
+      --fps N            Maximum redraw FPS (default 30)
+      --mouse-pixels     Request high-precision SGR 1016 mouse events
+      --no-enhanced-keys Disable Kitty enhanced keyboard mode
+      --bench N          Benchmark N frames without a terminal
 
-KEYS
-  Up/Right or k/l       Next slice (positive voxel index)
-  Down/Left or j/h      Previous slice
-  Shift+arrows 2x; Ctrl+arrows 3x; Alt+arrows 4x
-  Mouse wheel / two-finger trackpad scroll: change slices
-  [ and ]               Decrease/increase stride by 1 (1..256)
-  PgUp / PgDn           +/-25 slices; Home / End first/last
-  x / y / z             Pick slicing axis
-  r / R                 Rotate view clockwise / counterclockwise 90 degrees
-  f / v                 Flip horizontal / vertical view
-  + / -                 Narrow / widen grayscale window (contrast)
-  , / .                 Shift window down / up (brightness)
-  0                     Reset selected layer window
-  a                     Toggle atlas outlines
-  Tab                   Toggle image-only fullscreen
-  t                     Show/hide layer list
-  1..9                  Select intensity layer (1 = base)
-  e                     Type selected layer window as LOW,HIGH
-  m / M                 Edit selected layer minimum / maximum
-  c                     Cycle grayscale / warm / cool / saturated palette
-  Space                 Show/hide selected intensity overlay
-  i                     Toggle keyboard voxel inspector; move with arrows/hjkl
-  Mouse hover           Inspect voxel (if terminal/Rex forwards mouse motion)
-  o                     Toggle all additional intensity overlays
-  q / Esc / Ctrl+C      Quit
+LAYERS AND ATLAS
+      --overlay FILE              Additional intensity image, repeatable
+      --overlay-window MIN,MAX    Most recently supplied overlay range
+      --overlay-color RRGGBB      Most recent overlay fixed tint
+      --overlay-opacity 0..1      Most recent overlay opacity (default 0.8)
+      --atlas FILE                Solid ID-label atlas; default $ATLAS
+      --atlas-wireframe FILE      Precomputed ID/binary wireframe; overrides $ATLAS
+      --atlas-labels FILE         Companion solid atlas for wireframe inspection
+      --lut FILE.csv              LUT; default $ATLAS_LUT when atlas is present
+      --atlas-color RRGGBB        Fallback contour color (default white)
+      --atlas-opacity 0..1        Atlas opacity (default 1)
+      --atlas-width N             Contour width, 1–3 pixels (default 1)
+
+NAVIGATION
+  arrows/hjkl or mouse wheel  Move slices (in inspection mode, arrows move probe)
+  Shift ×2 · Ctrl ×3 · Alt/Option ×4; [ and ] change stride by one
+  PgUp / PgDn              Move ±25 slices; Home / End first / last
+  x / y / z                Slice axes; r / R rotate clockwise/counterclockwise
+  f / v                    Flip horizontal / vertical; Tab image-only mode
+  i                        Toggle keyboard voxel inspection
+
+LAYERS
+  1..9                     Select loaded layer; ; cycles selection
+  n                        Type path to load an aligned image
+  t                        Toggle layer list; Space show/hide selected overlay
+  e                        Edit selected layer display min,max
+  m / M                    Edit only min / max; 0 reset to data min,max
+  c                        Gray → warm → cool → categorical palette
+  o / O                    Type selected image / atlas opacity (0..1)
+  a                        Toggle atlas outlines
+  + / -                    Narrow / widen selected display range
+  , / .                    Shift selected display range down / up
+  ? or /                   Toggle help panel; I opens volume information
+  q                        Quit (Esc cancels dialogs)
 
 EXAMPLES
-  niv brain.nii.gz
-  NIV_AXIS=y niv /path/to/brain.nii.gz --fps 12
-  niv brain.nii.gz -a x --rotate 90 --window 0,3000 --step 2
-  niv brain.nii.gz --atlas atlas.nii.gz --lut CCFv3-2020_regional_summary.csv
-  niv brain.nii.gz --overlay zstat.nii.gz --overlay-window 2,6 --overlay-color ff5555
-  niv brain.nii.gz --atlas-wireframe atlas_W_IDs.nii.gz --lut CCFv3-2020_regional_summary.csv
-  niv brain.nii.gz --bench 50
+  niv mean_IF.nii.gz
+  ATLAS=/data/atlas.nii.gz ATLAS_LUT=/data/CCFv3-2020_regional_summary.csv niv mean_IF.nii.gz
+  niv mean_IF.nii.gz --atlas other.nii.gz --overlay zstat.nii.gz --overlay-window 2,6
 
-Axes are NIfTI ARRAY INDICES, not anatomical RAS/LPS axes. Physical aspect ratio
-uses pixdim, but the viewer does not apply the sform/qform affine yet.
+Atlas and intensity overlays require identical voxel grids; no affine reorientation
+or resampling is performed. Alpha transparency uses Kitty RGBA (f=32).
 "#;
 
 pub fn parse() -> Result<Option<Config>> {
@@ -104,13 +107,15 @@ pub fn parse() -> Result<Option<Config>> {
     let mut axis = Axis::parse(
         &env::var("NIV_AXIS")
             .or_else(|_| env::var("NII_AXIS"))
-            .unwrap_or_else(|_| "z".to_owned()),
+            .unwrap_or_else(|_| "x".to_owned()),
     )?;
-    let mut rotation = parse_rotation(&env::var("NIV_ROTATE").unwrap_or_else(|_| "0".to_owned()))?;
+    let mut rotation = parse_rotation(&env::var("NIV_ROTATE").unwrap_or_else(|_| "90".to_owned()))?;
     let mut path = None;
     let mut initial_slice = None;
     let mut step = 1;
     let mut window = None;
+    let mut base_opacity = 1.0f32;
+    let mut atlas_opacity = 1.0f32;
     let mut overlays: Vec<OverlaySpec> = Vec::new();
     let mut atlas_path = None;
     let mut atlas_wireframe = false;
@@ -123,7 +128,11 @@ pub fn parse() -> Result<Option<Config>> {
     let mut enhanced_keys = true;
     let mut benchmark_frames = None;
     while let Some(arg) = args.next() {
-        if arg == "-h" || arg == "--help" {
+        if arg == "-h" {
+            print!("{SHORT_HELP}");
+            return Ok(None);
+        }
+        if arg == "--help" {
             print!("{HELP}");
             return Ok(None);
         }
@@ -164,6 +173,8 @@ pub fn parse() -> Result<Option<Config>> {
                 | "--atlas-width"
                 | "--lut"
                 | "--atlas-labels"
+                | "--atlas-opacity"
+                | "--opacity"
         );
         if needs_value {
             let val = if let Some(v) = inline_value {
@@ -183,6 +194,8 @@ pub fn parse() -> Result<Option<Config>> {
                 "--step" => step = parse_range(&val, flag, 1, 256)?,
                 "-r" | "--rotate" => rotation = parse_rotation(&val)?,
                 "-w" | "--window" => window = Some(parse_window(&val)?),
+                "--opacity" => base_opacity = parse_opacity(&val)?,
+                "--atlas-opacity" => atlas_opacity = parse_opacity(&val)?,
                 "--overlay" => overlays.push(OverlaySpec {
                     path: PathBuf::from(val),
                     window: None,
@@ -228,6 +241,18 @@ pub fn parse() -> Result<Option<Config>> {
             bail!("Supply exactly one NIfTI file");
         }
     }
+    // Explicit --atlas/--atlas-wireframe takes precedence over environment defaults.
+    if atlas_path.is_none() {
+        atlas_path = env::var_os("ATLAS")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+    }
+    // A global LUT setting should not prevent running without an atlas.
+    if atlas_path.is_some() && lut_path.is_none() {
+        lut_path = env::var_os("ATLAS_LUT")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+    }
     if atlas_labels_path.is_some() && (!atlas_wireframe || atlas_path.is_none()) {
         bail!("--atlas-labels is only used with --atlas-wireframe");
     }
@@ -238,6 +263,8 @@ pub fn parse() -> Result<Option<Config>> {
         step,
         rotation,
         window,
+        base_opacity,
+        atlas_opacity,
         overlays,
         atlas_path,
         atlas_wireframe,

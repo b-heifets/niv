@@ -66,6 +66,7 @@ pub(crate) fn cell_pixels(cols: u16, rows: u16) -> (usize, usize) {
 
 /// Nearest neighbor. Rotations are *screen-space*, clockwise in 90-degree
 /// increments, not affine-based reorientation. Screen-space flips apply AFTER rotation.
+#[cfg(test)]
 pub fn grayscale(vol: &Volume, app: &App, width: usize, height: usize) -> Vec<u8> {
     let (source_w, source_h, _) = vol.plane(app.axis);
     let mut raster = vec![0u8; width * height * 3];
@@ -132,6 +133,7 @@ mod tests {
             data: Array3::from_shape_fn((2, 3, 1), |(x, y, _)| (10 * x + 20 * y) as f32),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         let mut app = App::new(Axis::Z, 0, 1, 0, (0., 255.), "test".into());
         let red = |rgb: Vec<u8>| rgb.chunks_exact(3).map(|p| p[0]).collect::<Vec<_>>();
@@ -150,8 +152,30 @@ mod tests {
     }
 }
 
-/// Composite all intensity volumes bottom-to-top, then the atlas on top.
-/// The atlas and overlays are required to be on precisely the same voxel grid.
+/// Straight-alpha source-over compositing, including a truly transparent base.
+/// Kitty f=32 preserves the terminal background wherever all layers are absent.
+#[inline]
+fn blend_pixel(dst: &mut [u8], color: [u8; 3], alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+    let previous = dst[3] as f32 / 255.0;
+    let combined = alpha + previous * (1.0 - alpha);
+    if combined <= 0.0 {
+        return;
+    }
+    for channel in 0..3 {
+        let value = (color[channel] as f32 * alpha
+            + dst[channel] as f32 * previous * (1.0 - alpha))
+            / combined;
+        dst[channel] = value.round().clamp(0.0, 255.0) as u8;
+    }
+    dst[3] = (combined * 255.0).round() as u8;
+}
+
+/// Bottom image, additional images, then the atlas topmost. All images must
+/// share the same voxel grid; threshold is strictly > display minimum.
 pub fn composite(
     vol: &Volume,
     app: &App,
@@ -159,16 +183,16 @@ pub fn composite(
     width: usize,
     height: usize,
 ) -> Vec<u8> {
-    let mut rgb = grayscale(vol, app, width, height);
+    let mut rgba = vec![0u8; width * height * 4];
     let (sw, sh, _) = vol.plane(app.axis);
     let swapped = app.rotation % 180 != 0;
-    let oriented_w = if swapped { sh } else { sw };
-    let oriented_h = if swapped { sw } else { sh };
+    let ow = if swapped { sh } else { sw };
+    let oh = if swapped { sw } else { sh };
     let horizontal: Vec<usize> = (0..width)
         .map(|x| {
-            let h = (x * oriented_w / width).min(oriented_w - 1);
+            let h = (x * ow / width).min(ow - 1);
             if app.flip_h {
-                oriented_w - 1 - h
+                ow - 1 - h
             } else {
                 h
             }
@@ -176,70 +200,74 @@ pub fn composite(
         .collect();
     let vertical: Vec<usize> = (0..height)
         .map(|y| {
-            let v = (y * oriented_h / height).min(oriented_h - 1);
+            let v = (y * oh / height).min(oh - 1);
             if app.flip_v {
-                oriented_h - 1 - v
+                oh - 1 - v
             } else {
                 v
             }
         })
         .collect();
-
+    // Cache NIfTI coordinates once per output pixel, not per layer.
+    let coords: Vec<(usize, usize)> = (0..height)
+        .flat_map(|y| {
+            let horizontal = &horizontal;
+            let vertical = &vertical;
+            (0..width)
+                .map(move |x| inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation))
+        })
+        .collect();
+    for (px, &(h, v)) in rgba.chunks_exact_mut(4).zip(coords.iter()) {
+        let value = vol.sample(app.axis, app.index, h, v);
+        if !value.is_finite() || value <= app.window.0 {
+            continue;
+        }
+        let color = app
+            .base_palette
+            .voxel_color(value, app.window.0, app.window.1, 0);
+        blend_pixel(px, color, app.base_opacity);
+    }
     if app.show_overlays {
-        for (layer_idx, overlay) in layers.overlays.iter().enumerate() {
-            if !overlay.visible {
+        for (idx, layer) in layers.overlays.iter().enumerate() {
+            if !layer.visible || layer.opacity <= 0.0 {
                 continue;
             }
-            let (lo, hi) = overlay.window;
-            for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
-                for (x, px) in row.chunks_exact_mut(3).enumerate() {
-                    let (h, v) = inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation);
-                    let value = overlay.vol.sample(app.axis, app.index, h, v);
-                    // Values <= lower display bound are truly transparent.
-                    if !value.is_finite() || value <= lo {
-                        continue;
-                    }
-                    let strength = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
-                    let alpha = overlay.opacity * strength;
-                    let color = overlay.palette.rgb(strength, layer_idx + 1);
-                    for c in 0..3 {
-                        px[c] =
-                            (px[c] as f32 * (1.0 - alpha) + color[c] as f32 * alpha).round() as u8;
-                    }
+            let (lo, hi) = layer.window;
+            for (px, &(h, v)) in rgba.chunks_exact_mut(4).zip(coords.iter()) {
+                let value = layer.vol.sample(app.axis, app.index, h, v);
+                if !value.is_finite() || value <= lo {
+                    continue;
                 }
+                let color = layer.palette.voxel_color(value, lo, hi, idx + 1);
+                blend_pixel(px, color, layer.opacity);
             }
         }
     }
-
     if app.show_atlas {
         if let Some(atlas) = &layers.atlas {
-            if atlas.wireframe {
-                // A precomputed wireframe already marks voxels. Its IDs are
-                // used directly for colors; 1 means binary-only wireframe.
-                for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
-                    for (x, px) in row.chunks_exact_mut(3).enumerate() {
-                        let (h, v) =
-                            inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation);
+            if atlas.opacity > 0.0 {
+                if atlas.wireframe {
+                    for (px, &(h, v)) in rgba.chunks_exact_mut(4).zip(coords.iter()) {
                         let id =
                             crate::layers::label_id(atlas.vol.sample(app.axis, app.index, h, v));
                         if id > 0 {
-                            px.copy_from_slice(&atlas.color(id));
+                            blend_pixel(px, atlas.color(id), atlas.opacity);
                         }
                     }
+                } else {
+                    draw_atlas_edges(&mut rgba, width, height, app, atlas, sw, sh);
                 }
-            } else {
-                draw_atlas_edges(&mut rgb, width, height, app, atlas, sw, sh);
             }
         }
     }
     if app.inspect_mode {
         if let Some((h, v)) = app.probe {
             if h < sw && v < sh {
-                draw_inspector_mark(&mut rgb, width, height, app, sw, sh, h, v);
+                draw_inspector_mark(&mut rgba, width, height, app, sw, sh, h, v);
             }
         }
     }
-    rgb
+    rgba
 }
 
 /// Inverse display mapping. The exact same mapping as the grayscale raster.
@@ -312,21 +340,21 @@ fn project(
 }
 
 fn paint(
-    rgb: &mut [u8],
+    rgba: &mut [u8],
     width: usize,
     height: usize,
     x: i32,
     y: i32,
     color: [u8; 3],
     thick: usize,
+    opacity: f32,
 ) {
-    // Even widths extend toward +x/+y, odd widths centered.
     let neg = ((thick - 1) / 2) as i32;
     for yy in y - neg..y - neg + thick as i32 {
         for xx in x - neg..x - neg + thick as i32 {
             if xx >= 0 && yy >= 0 && (xx as usize) < width && (yy as usize) < height {
-                let off = (yy as usize * width + xx as usize) * 3;
-                rgb[off..off + 3].copy_from_slice(&color);
+                let off = (yy as usize * width + xx as usize) * 4;
+                blend_pixel(&mut rgba[off..off + 4], color, opacity);
             }
         }
     }
@@ -343,16 +371,17 @@ fn draw_face(
     q: (usize, usize),
     color: [u8; 3],
     thick: usize,
+    opacity: f32,
 ) {
     let (x0, y0) = project(app, p.0, p.1, sw, sh, width, height);
     let (x1, y1) = project(app, q.0, q.1, sw, sh, width, height);
     if x0 == x1 {
         for y in y0.min(y1)..=y0.max(y1) {
-            paint(rgb, width, height, x0, y, color, thick);
+            paint(rgb, width, height, x0, y, color, thick, opacity);
         }
     } else {
         for x in x0.min(x1)..=x0.max(x1) {
-            paint(rgb, width, height, x, y0, color, thick);
+            paint(rgb, width, height, x, y0, color, thick, opacity);
         }
     }
 }
@@ -400,12 +429,12 @@ fn draw_inspector_mark(
     let x = x.round() as i32;
     let y = y.round() as i32;
     for d in -4..=4 {
-        paint(rgb, width, height, x + d, y, [0, 0, 0], 3);
-        paint(rgb, width, height, x, y + d, [0, 0, 0], 3);
+        paint(rgb, width, height, x + d, y, [0, 0, 0], 3, 1.0);
+        paint(rgb, width, height, x, y + d, [0, 0, 0], 3, 1.0);
     }
     for d in -3..=3 {
-        paint(rgb, width, height, x + d, y, [255, 255, 255], 1);
-        paint(rgb, width, height, x, y + d, [255, 255, 255], 1);
+        paint(rgb, width, height, x + d, y, [255, 255, 255], 1, 1.0);
+        paint(rgb, width, height, x, y + d, [255, 255, 255], 1, 1.0);
     }
 }
 
@@ -445,6 +474,7 @@ fn draw_atlas_edges(
                     (h, v + 1),
                     atlas.color(id),
                     atlas.width,
+                    atlas.opacity,
                 );
             }
         }
@@ -475,6 +505,7 @@ fn draw_atlas_edges(
                     (h + 1, v),
                     atlas.color(id),
                     atlas.width,
+                    atlas.opacity,
                 );
             }
         }
@@ -495,6 +526,7 @@ mod layer_tests {
             data: Array3::from_shape_vec((3, 1, 1), a).unwrap(),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         }
     }
     #[test]
@@ -519,19 +551,53 @@ mod layer_tests {
                 labels: None,
                 fallback: [0, 255, 0],
                 width: 1,
+                opacity: 1.0,
                 regions: HashMap::new(),
             }),
         };
         let mut app = App::new(Axis::Z, 0, 1, 0, (0., 255.), "test".into());
         let rgb = composite(&base, &app, &layers, 3, 1);
-        assert_eq!(&rgb[0..3], &[100, 100, 100]);
-        assert_eq!(&rgb[3..6], &[100, 100, 100]);
-        assert_eq!(&rgb[6..9], &[255, 0, 0]);
+        assert_eq!(&rgb[0..4], &[100, 100, 100, 255]);
+        assert_eq!(&rgb[4..8], &[100, 100, 100, 255]);
+        assert_eq!(&rgb[8..12], &[255, 0, 0, 255]);
         app.show_overlays = false;
         assert_eq!(
-            &composite(&base, &app, &layers, 3, 1)[6..9],
-            &[100, 100, 100]
+            &composite(&base, &app, &layers, 3, 1)[8..12],
+            &[100, 100, 100, 255]
         );
+    }
+    #[test]
+    fn base_and_overlay_below_threshold_leave_transparent_alpha() {
+        let base = volume(vec![0.0, 1.0, 2.0]);
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 2.), "test".into());
+        app.base_palette = crate::layers::Palette::Warm;
+        let pixels = composite(&base, &app, &Layers::default(), 3, 1);
+        assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
+        assert_eq!(&pixels[4..8], &[255, 128, 0, 255]);
+        app.base_opacity = 0.5;
+        let pixels = composite(&base, &app, &Layers::default(), 3, 1);
+        assert_eq!(pixels[7], 128);
+    }
+    #[test]
+    fn atlas_alpha_is_independent_and_topmost() {
+        let base = volume(vec![0.0, 0.0, 0.0]);
+        let labels = volume(vec![7.0, 0.0, 0.0]);
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: labels,
+                wireframe: true,
+                labels: None,
+                fallback: [120, 200, 250],
+                width: 1,
+                opacity: 0.5,
+                regions: HashMap::new(),
+            }),
+        };
+        let app = App::new(Axis::Z, 0, 1, 0, (0.0, 1.0), "base".into());
+        let pixels = composite(&base, &app, &layers, 3, 1);
+        assert_eq!(&pixels[..4], &[120, 200, 250, 128]);
+        assert_eq!(&pixels[4..8], &[0, 0, 0, 0]);
     }
     #[test]
     fn boundaries_project_to_faces_not_voxel_centers() {
@@ -545,6 +611,7 @@ mod layer_tests {
                 labels: None,
                 fallback: [255, 0, 255],
                 width: 1,
+                opacity: 1.0,
                 regions: HashMap::new(),
             }),
         };
@@ -552,10 +619,10 @@ mod layer_tests {
         let rgb = composite(&base, &app, &layers, 30, 10);
         // Internal boundary between source h=1 and h=2 -> x=20, not center x=15 or 25.
         assert_eq!(
-            &rgb[(5 * 30 + 20) * 3..(5 * 30 + 20) * 3 + 3],
+            &rgb[(5 * 30 + 20) * 4..(5 * 30 + 20) * 4 + 3],
             &[255, 0, 255]
         );
-        assert_eq!(&rgb[(5 * 30 + 15) * 3..(5 * 30 + 15) * 3 + 3], &[0, 0, 0]);
+        assert_eq!(&rgb[(5 * 30 + 15) * 4..(5 * 30 + 15) * 4 + 3], &[0, 0, 0]);
     }
 }
 
@@ -570,6 +637,7 @@ mod inspector_tests {
             data: Array3::zeros((4, 3, 2)),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "test".into());
         assert_eq!(voxel_at_raster(&vol, &app, 0, 0, 4, 3), Some((0, 2)));
@@ -588,6 +656,7 @@ mod inspector_tests {
             data: Array3::zeros((3, 3, 1)),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         let label = Volume {
             data: Array3::from_shape_fn(
@@ -596,6 +665,7 @@ mod inspector_tests {
             ),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         let layers = Layers {
             overlays: vec![],
@@ -605,13 +675,14 @@ mod inspector_tests {
                 labels: None,
                 fallback: [255, 0, 255],
                 width: 1,
+                opacity: 1.0,
                 regions: HashMap::new(),
             }),
         };
         let app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "test".into());
         let rgb = composite(&base, &app, &layers, 90, 90);
         // Center of one-voxel island remains unobstructed by contours.
-        assert_eq!(&rgb[(45 * 90 + 45) * 3..(45 * 90 + 45) * 3 + 3], &[0, 0, 0]);
+        assert_eq!(&rgb[(45 * 90 + 45) * 4..(45 * 90 + 45) * 4 + 3], &[0, 0, 0]);
         assert!(rgb.iter().any(|&v| v > 0));
     }
 }

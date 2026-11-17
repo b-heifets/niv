@@ -18,12 +18,13 @@ pub enum Palette {
     Solid([u8; 3]),
 }
 impl Palette {
+    #[allow(dead_code)]
     pub fn name(self) -> &'static str {
         match self {
             Self::Gray => "gray",
             Self::Warm => "warm",
             Self::Cool => "cool",
-            Self::Random => "saturated",
+            Self::Random => "categorical",
             Self::Solid(_) => "tint",
         }
     }
@@ -46,15 +47,17 @@ impl Palette {
             }
             Self::Warm => [255, cv(t), 0],
             Self::Cool => [0, cv(t), 255],
-            Self::Random => {
-                let color = saturated_hue(layer);
-                [
-                    cv(t * color[0] as f32 / 255.),
-                    cv(t * color[1] as f32 / 255.),
-                    cv(t * color[2] as f32 / 255.),
-                ]
-            }
+            Self::Random => categorical_color(layer as i32),
             Self::Solid(rgb) => rgb,
+        }
+    }
+    /// Continuous palettes use window-normalized brightness; categorical colors
+    /// depend ONLY on the integer voxel value, not on the layer number.
+    pub fn voxel_color(self, value: f32, lo: f32, hi: f32, layer: usize) -> [u8; 3] {
+        if self == Self::Random {
+            categorical_color(value.round() as i32)
+        } else {
+            self.rgb(((value - lo) / (hi - lo)).clamp(0., 1.), layer)
         }
     }
     pub fn accent(self, layer: usize) -> [u8; 3] {
@@ -65,21 +68,38 @@ impl Palette {
     }
 }
 
-fn saturated_hue(layer: usize) -> [u8; 3] {
-    // Golden-angle sequence: distinct, reproducible saturated hues per layer.
-    let hue = ((layer as f32 * 0.618_034 + 0.07).fract() * 6.).clamp(0., 6.);
-    let i = hue.floor() as usize;
-    let f = hue - i as f32;
-    let q = ((1. - f) * 255.).round() as u8;
-    let p = (f * 255.).round() as u8;
-    match i {
-        0 => [255, p, 0],
-        1 => [q, 255, 0],
-        2 => [0, 255, p],
-        3 => [0, q, 255],
-        4 => [p, 0, 255],
-        _ => [255, 0, q],
-    }
+/// Deterministic categorical LUT: neighboring integer IDs get well-separated hues.
+/// A second integer hash jitters saturation/value to distinguish many (up to 255+)
+/// categories without changing colors between slices or layers.
+fn categorical_color(id: i32) -> [u8; 3] {
+    let key = id as u32;
+    let mix = (key ^ 0x9e37_79b9)
+        .wrapping_mul(0x85eb_ca6b)
+        .rotate_left(13);
+    let hue = (id as f64 * 0.618_033_988_749_895 + 0.137).rem_euclid(1.0);
+    let saturation = 0.80 + (mix & 7) as f64 / 70.0;
+    let value = 0.85 + ((mix >> 4) & 7) as f64 / 50.0;
+    hsv_to_rgb(hue, saturation, value.min(1.0))
+}
+
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> [u8; 3] {
+    let hue = (h.rem_euclid(1.0) * 6.0).clamp(0.0, 5.999_999);
+    let c = v * s;
+    let x = c * (1.0 - (hue % 2.0 - 1.0).abs());
+    let (r, g, b) = match hue as u8 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    ]
 }
 
 pub fn short_name(path: &Path) -> String {
@@ -117,6 +137,7 @@ pub struct Atlas {
     pub labels: Option<Volume>,
     pub fallback: [u8; 3],
     pub width: usize,
+    pub opacity: f32,
     pub regions: HashMap<i32, RegionInfo>,
 }
 
@@ -146,13 +167,14 @@ impl Layers {
                     spec.path.display()
                 )
             })?;
-            let window = spec.window.unwrap_or_else(|| vol.auto_window());
+            let default_window = vol.auto_window();
+            let window = spec.window.unwrap_or(default_window);
             let name = short_name(&spec.path);
             let data_range = vol.data_range();
             overlays.push(IntensityOverlay {
                 vol,
                 window,
-                default_window: window,
+                default_window,
                 data_range,
                 palette: Palette::Solid(spec.color),
                 visible: true,
@@ -191,6 +213,7 @@ impl Layers {
                 labels,
                 fallback: config.atlas_color,
                 width: config.atlas_width,
+                opacity: config.atlas_opacity,
                 regions,
             })
         } else {
@@ -202,9 +225,31 @@ impl Layers {
         Ok(Self { overlays, atlas })
     }
 
+    /// Load another aligned image without changing any existing layer.
+    pub fn add_overlay(&mut self, path: &Path, reference: &Volume) -> Result<usize> {
+        let vol = Volume::load(path).with_context(|| format!("Loading {}", path.display()))?;
+        reference
+            .validate_grid(&vol)
+            .with_context(|| format!("{} is not voxel-aligned", path.display()))?;
+        let window = vol.auto_window();
+        let data_range = vol.data_range();
+        self.overlays.push(IntensityOverlay {
+            name: short_name(path),
+            vol,
+            window,
+            default_window: window,
+            data_range,
+            palette: Palette::Gray,
+            visible: true,
+            opacity: 0.8,
+        });
+        Ok(self.overlays.len()) // index 0 = base; index 1 = first overlay
+    }
+
     /// Full region text at a voxel, or None for unlabeled voxels. For a
     /// precomputed wireframe a separate solid atlas is required for reliable
     /// region lookup away from outline voxels.
+    #[cfg(test)]
     pub fn region_at(&self, axis: Axis, slice: usize, h: usize, v: usize) -> Option<String> {
         let atlas = self.atlas.as_ref()?;
         let labels = if atlas.wireframe {
@@ -337,6 +382,7 @@ mod tests {
             data: Array3::from_elem((2, 2, 1), value),
             spacing: [1.; 3],
             sform: None,
+            datatype: 16,
         };
         let mut regions = HashMap::new();
         regions.insert(
@@ -355,6 +401,7 @@ mod tests {
                 labels: Some(mk(51.)),
                 fallback: [255; 3],
                 width: 1,
+                opacity: 1.0,
                 regions,
             }),
         };
@@ -377,7 +424,14 @@ mod palette_tests {
         assert_eq!(Palette::Cool.rgb(0., 0), [0, 0, 255]);
         assert_eq!(Palette::Cool.rgb(1., 0), [0, 255, 255]);
         assert_eq!(Palette::Random.rgb(1., 1), Palette::Random.rgb(1., 1));
-        assert_ne!(Palette::Random.rgb(1., 1), Palette::Random.rgb(1., 2));
+        assert_ne!(
+            Palette::Random.voxel_color(1., 0., 100., 1),
+            Palette::Random.voxel_color(2., 0., 100., 1)
+        );
+        assert_eq!(
+            Palette::Random.voxel_color(7., 0., 100., 1),
+            Palette::Random.voxel_color(7., 3., 12., 4)
+        );
         assert_eq!(Palette::Warm.next(), Palette::Cool);
         assert_eq!(short_name(Path::new("/tmp/image.nii.gz")), "image");
     }
