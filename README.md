@@ -5,8 +5,9 @@ Rex, remote Rex/Tailscale), implemented in Rust. Volume data is loaded once;
 per-frame work is nearest-neighbor rasterization, compositing, and compressed
 Kitty graphics. No direct Rex or libghostty dependency.
 
-**v0.4 — experimental.** This source release has not been compiled or tested
-interactively in the build environment. Please run `cargo test` on your Mac.
+**v0.5 — experimental.** This source release has not been compiled or tested
+interactively in the build environment (no Rust toolchain or terminal graphics
+available here). Run `cargo test`, then test inside Ghostty/Rex on your Mac.
 
 ## Install / update
 
@@ -17,6 +18,77 @@ cargo test
 cargo install --path . --force
 niv --version  # 0.4.0
 ```
+
+## Mouse hover and voxel inspector (v0.5)
+
+Hover over the image to see the **raw (not windowed) voxel value of every image
+layer**, array-space X/Y/Z indices, and the atlas's region abbreviation, full
+name, and ID. The inspector uses the correct voxel across X/Y/Z, screen rotation,
+and flips. Mouse movement only updates text, without retransmitting the image.
+The terminal must forward mouse motion (SGR mouse tracking); iOS Rex touch
+input may not generate hover events.
+
+**Keyboard fallback** (also useful for precise inspection): press `i` to toggle
+inspection mode. A small crosshair appears; arrows or `hjkl` move the inspector
+one voxel in screen coordinates; Alt/Shift/Ctrl multiply movement by 2/5/10.
+Use PgUp/PgDn to move 25 slices while inspecting, and `i` again to return
+arrows/`hjkl` to slice scrolling. Mouse motion does not override the keyboard
+crosshair while inspection mode is active.
+
+Default mouse input is cell-based, so inspected position has terminal-cell
+resolution. On terminals supporting **SGR 1016 pixel mouse coordinates**, you
+can opt into finer precision:
+
+```sh
+niv data/sample.nii.gz --atlas data/demo_atlas.nii.gz \
+    --lut data/demo_lut.csv --mouse-pixels
+```
+
+Try `--mouse-pixels` locally in Ghostty first. Some multiplexers and iOS
+clients do not support forwarding pixel coordinates: if hovering stops working,
+remove that flag. Mouse hover is still terminal-dependent, and no attempt is
+made to guess which coordinate unit the mux actually forwarded.
+
+If you use a *precomputed* wireframe, the outline volume may be zero in the
+interior of a labeled region, so it cannot provide reliable region names.
+Pass a matching solid label atlas only for inspection:
+
+```sh
+niv mean_IF.nii.gz \
+  --atlas-wireframe atlas_CCFv3_2020_30um_W_IDs.nii.gz \
+  --atlas-labels atlas_CCFv3_2020_30um.nii.gz \
+  --lut CCFv3-2020_regional_summary.csv
+```
+
+The label volume is loaded once into RAM; its voxels are never painted over
+the grayscale image. The atlas LUT is required for abbreviations/names (without
+it you see only numeric IDs). All volumes must have matching array grids.
+
+## Smooth atlas outlines (v0.5)
+
+Solid label atlas outlines default to `--atlas-style smooth`. This mode
+extracts boundaries on voxel **faces**, paints 1px antialiased strokes, and
+rounds ordinary 90° contour corners by 0.22 source voxels using short
+quadratic curves. This is a fast *raster* approximation to vector curves,
+not a high-resolution spline fitted to atlas anatomy. Multi-region junctions
+are deliberately not rounded, and small labeled areas are retained.
+
+```sh
+niv mean_IF.nii.gz --atlas atlas_CCFv3_2020_30um.nii.gz \
+  --lut CCFv3-2020_regional_summary.csv --atlas-style smooth \
+  --max-pixels 800000
+```
+
+Press `g` to switch between **smooth** and **voxel** while running. Voxel mode
+uses the precise unsmoothed boundaries from v0.4 and should be preferred when
+preserving exact segmentation geometry is more important than aesthetics.
+For local Ghostty you can try a larger `--max-pixels` for finer anti-aliasing;
+for remote Rex, use a lower limit (e.g. `120000`) and `--fps 12`.
+
+Precomputed `_W` and `_W_IDs` wireframes remain voxel-mask rendering even if
+`--atlas-style smooth` is requested: a wireframe mask does not contain enough
+label topology to recover curved **between-voxel** contours. For smooth lines,
+load the solid label atlas with `--atlas`.
 
 ### Solid label atlas — recommended
 
@@ -116,6 +188,9 @@ python3 examples/make_layer_demo.py
 | `r` / `R` | Rotate display clockwise/counterclockwise by 90° |
 | `f` / `v` | Flip horizontally/vertically |
 | `b` | Show/hide topmost atlas outline |
+| `g` | Toggle smooth/voxel contour style (solid atlas only) |
+| Mouse hover | Show raw value of base/each overlay and atlas region |
+| `i` | Keyboard inspector on/off (arrows/hjkl move crosshair) |
 | `o` | Show/hide all additional intensity overlays |
 | `+` / `-` | Narrow / widen base grayscale window |
 | `,` / `.` / `0` | Shift base grayscale window / reset |
@@ -137,8 +212,8 @@ without a terminal and includes overlays in its timing.
 - No full-screen clearing on normal slice changes: fresh Kitty image placement
   is transmitted before the old frame is deleted (same behavior as v0.3).
 - The status displays the data and grayscale display range, layer counts, and
-  label/abbreviation at the **center voxel of the solid atlas's current plane**.
-  No movable crosshair or per-voxel hover inspector yet.
+  layer-by-layer intensity, and full region text at the hovered or keyboard-
+  inspected voxel.
 - The loader uses `ndarray::Array3<f32>` for each 3D NIfTI; a 440×267×380
   image occupies ~170 MiB **per volume** after decompression. Loading two
   additional intensities and an atlas uses roughly four times the base image
@@ -156,11 +231,11 @@ without a terminal and includes overlays in its timing.
 
 ## Code layout
 
-- `src/main.rs`: terminal state, event loop, status and benchmark
+- `src/main.rs`: terminal state, mouse input, low-overhead inspector footer, status and benchmark
 - `src/config.rs`: CLI and layer options
 - `src/volume.rs`: NIfTI loading and strict matching-grid checks
 - `src/layers.rs`: overlay and atlas structures; CSV LUT parsing
-- `src/render.rs`: nearest-neighbor mapping, alpha compositing, between-voxel contours
+- `src/render.rs`: nearest-neighbor mapping, alpha compositing, smoothed or exact voxel-face contours, cursor mapping
 - `src/kitty.rs`: zlib+base64 Kitty graphics protocol
 - `src/app.rs`: keyboard controls and toggles
 - `examples/make_layer_demo.py`: generate aligned demo volumes

@@ -27,6 +27,13 @@ impl Axis {
     pub fn label(self) -> &'static str {
         match self { Self::X => "X", Self::Y => "Y", Self::Z => "Z" }
     }
+    pub fn xyz(self, slice: usize, h: usize, v: usize) -> [usize; 3] {
+        match self {
+            Self::X => [slice, h, v],
+            Self::Y => [h, slice, v],
+            Self::Z => [h, v, slice],
+        }
+    }
     pub fn cycle(self) -> Self {
         match self { Self::X => Self::Y, Self::Y => Self::Z, Self::Z => Self::X }
     }

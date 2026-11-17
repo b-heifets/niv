@@ -1,4 +1,6 @@
 use crossterm::terminal;
+use std::collections::HashMap;
+use crate::config::AtlasStyle;
 
 use crate::{app::App, volume::Volume};
 
@@ -12,11 +14,11 @@ pub struct Geometry {
 
 /// Size the image to terminal cell boundaries so geometry changes do not
 /// unexpectedly cover the footer. Physical aspect ratio follows voxel spacing.
-pub fn geometry(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, max_pixels: usize) -> Geometry {
+pub fn geometry(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, max_pixels: usize, reserved_rows: usize) -> Geometry {
     let (_, _, mut aspect) = vol.plane(app.axis);
     if app.rotation % 180 != 0 { aspect = 1.0 / aspect; }
     let usable_cols = term_cols.saturating_sub(1).max(1) as usize;
-    let usable_rows = term_rows.saturating_sub(4).max(1) as usize;
+    let usable_rows = (term_rows as usize).saturating_sub(reserved_rows).max(1);
     let (cell_w, cell_h) = cell_pixels(term_cols, term_rows);
     let viewport_w = usable_cols * cell_w;
     let viewport_h = usable_rows * cell_h;
@@ -39,7 +41,7 @@ pub fn geometry(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, max_pix
     }
 }
 
-fn cell_pixels(cols: u16, rows: u16) -> (usize, usize) {
+pub(crate) fn cell_pixels(cols: u16, rows: u16) -> (usize, usize) {
     if let Ok(ws) = terminal::window_size() {
         if ws.width > 0 && ws.height > 0 && cols > 0 && rows > 0 {
             return (
@@ -173,11 +175,37 @@ pub fn composite(vol: &Volume, app: &App, layers: &crate::layers::Layers,
                     }
                 }
             } else {
-                draw_atlas_edges(&mut rgb, width, height, app, atlas, sw, sh);
+                match app.atlas_style {
+                    AtlasStyle::Smooth => draw_atlas_smooth(&mut rgb, width, height, app, atlas, sw, sh),
+                    AtlasStyle::Voxel => draw_atlas_edges(&mut rgb, width, height, app, atlas, sw, sh),
+                }
+            }
+        }
+    }
+    if app.inspect_mode {
+        if let Some((h,v)) = app.probe {
+            if h < sw && v < sh {
+                draw_inspector_mark(&mut rgb, width, height, app, sw, sh, h, v);
             }
         }
     }
     rgb
+}
+
+/// Inverse display mapping. The exact same mapping as the grayscale raster.
+/// Coordinates here refer to raster pixels (not terminal cells).
+pub fn voxel_at_raster(vol: &Volume, app: &App, x: usize, y: usize,
+    width: usize, height: usize) -> Option<(usize,usize)> {
+    if x >= width || y >= height || width == 0 || height == 0 { return None; }
+    let (sw,sh,_) = vol.plane(app.axis);
+    let swapped = app.rotation % 180 != 0;
+    let ow = if swapped { sh } else { sw };
+    let oh = if swapped { sw } else { sh };
+    let mut ox = (x*ow/width).min(ow-1);
+    let mut oy = (y*oh/height).min(oh-1);
+    if app.flip_h { ox=ow-1-ox; }
+    if app.flip_v { oy=oh-1-oy; }
+    Some(inverse_rotation(ox,oy,sw,sh,app.rotation))
 }
 
 #[inline]
@@ -238,6 +266,183 @@ fn draw_face(rgb: &mut [u8], width: usize, height: usize, app: &App,
     }
 }
 
+
+/// Subpixel projection of voxel FACE positions. Rounding is deferred to the
+/// antialiased renderer, unlike the exact voxel-edge renderer above.
+fn project_subpixel(app: &App, h: f32, v: f32, sw: usize, sh: usize,
+    width: usize, height: usize) -> (f32, f32) {
+    let sw=sw as f32;
+    let sh=sh as f32;
+    let (mut x,mut y,ow,oh) = match app.rotation {
+        0 => (h,sh-v,sw,sh),
+        90 => (v,h,sh,sw),
+        180 => (sw-h,v,sw,sh),
+        270 => (sh-v,sw-h,sh,sw),
+        _ => unreachable!(),
+    };
+    if app.flip_h { x=ow-x; }
+    if app.flip_v { y=oh-y; }
+    (x*width as f32/ow,y*height as f32/oh)
+}
+
+fn draw_inspector_mark(rgb: &mut [u8], width: usize, height: usize,
+    app: &App, sw: usize, sh: usize, h: usize, v: usize) {
+    let (x,y) = project_subpixel(app,h as f32+0.5,v as f32+0.5,sw,sh,width,height);
+    let x=x.round() as i32;
+    let y=y.round() as i32;
+    for d in -4..=4 {
+        paint(rgb,width,height,x+d,y,[0,0,0],3);
+        paint(rgb,width,height,x,y+d,[0,0,0],3);
+    }
+    for d in -3..=3 {
+        paint(rgb,width,height,x+d,y,[255,255,255],1);
+        paint(rgb,width,height,x,y+d,[255,255,255],1);
+    }
+}
+
+#[derive(Clone,Copy)]
+struct FaceEdge {
+    a: (usize,usize), b: (usize,usize), pair: (i32,i32), color: [u8;3],
+}
+
+fn atlas_faces(app: &App, atlas: &crate::layers::Atlas, sw: usize, sh: usize) -> Vec<FaceEdge> {
+    use crate::layers::label_id;
+    let mut edges = Vec::new();
+    // Horizontal-axis neighbors: face at h, for each v.
+    for v in 0..sh {
+        for h in 0..=sw {
+            let left = if h == 0 { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h-1,v)) };
+            let right = if h == sw { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h,v)) };
+            if left != right {
+                let id = left.max(right);
+                edges.push(FaceEdge { a:(h,v),b:(h,v+1),pair:(left.min(right),id),color:atlas.color(id) });
+            }
+        }
+    }
+    // Vertical-axis neighbors: face at v, for each h.
+    for v in 0..=sh {
+        for h in 0..sw {
+            let low = if v == 0 { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h,v-1)) };
+            let high = if v == sh { 0 } else { label_id(atlas.vol.sample(app.axis,app.index,h,v)) };
+            if low != high {
+                let id = low.max(high);
+                edges.push(FaceEdge { a:(h,v),b:(h+1,v),pair:(low.min(high),id),color:atlas.color(id) });
+            }
+        }
+    }
+    edges
+}
+
+/// Draw an antialiased line, blended over the already-composited intensities.
+/// Local rectangular coverage makes it significantly cheaper than rendering
+/// the whole atlas at 4x supersampling and downsampling every frame.
+fn aa_line(rgb: &mut [u8], width: usize, height: usize,
+    p: (f32,f32), q: (f32,f32), color: [u8;3], stroke: f32) {
+    let radius=stroke*0.5;
+    let x0=((p.0.min(q.0)-radius-1.).floor() as i32).max(0) as usize;
+    let x1=((p.0.max(q.0)+radius+1.).ceil() as i32).min(width as i32-1).max(-1);
+    let y0=((p.1.min(q.1)-radius-1.).floor() as i32).max(0) as usize;
+    let y1=((p.1.max(q.1)+radius+1.).ceil() as i32).min(height as i32-1).max(-1);
+    if x1 < x0 as i32 || y1 < y0 as i32 { return; }
+    let dx=q.0-p.0; let dy=q.1-p.1;
+    let len2=dx*dx+dy*dy;
+    for y in y0..=y1 as usize {
+        for x in x0..=x1 as usize {
+            let u=x as f32+0.5-p.0;
+            let v=y as f32+0.5-p.1;
+            let t=if len2>1e-6 { ((u*dx+v*dy)/len2).clamp(0.,1.) } else { 0. };
+            let ex=u-t*dx; let ey=v-t*dy;
+            let dist=(ex*ex+ey*ey).sqrt();
+            let alpha=(radius+0.5-dist).clamp(0.,1.);
+            if alpha==0. { continue; }
+            let px=(y*width+x)*3;
+            for c in 0..3 {
+                rgb[px+c] = (rgb[px+c] as f32*(1.-alpha)+color[c] as f32*alpha).round() as u8;
+            }
+        }
+    }
+}
+
+fn lerp(a: (f32,f32), b: (f32,f32), t: f32) -> (f32,f32) {
+    (a.0+(b.0-a.0)*t,a.1+(b.1-a.1)*t)
+}
+
+/// Draw quadratic Bezier with short antialiased linelets. Used at unambiguous
+/// bends only; multi-region junctions remain unmodified.
+fn aa_quad(rgb: &mut [u8], width: usize, height: usize,
+    a: (f32,f32), corner: (f32,f32), b: (f32,f32), color:[u8;3], stroke:f32) {
+    let length=((a.0-corner.0).hypot(a.1-corner.1)
+        +(b.0-corner.0).hypot(b.1-corner.1)).max(1.);
+    let n=(length/2.0).ceil().clamp(3.,32.) as usize;
+    let mut previous=a;
+    for j in 1..=n {
+        let t=j as f32/n as f32;
+        let u=1.-t;
+        let next=(u*u*a.0+2.*u*t*corner.0+t*t*b.0,
+                  u*u*a.1+2.*u*t*corner.1+t*t*b.1);
+        aa_line(rgb,width,height,previous,next,color,stroke);
+        previous=next;
+    }
+}
+
+/// Fast "rounded" anatomical boundaries: extract exact voxel-face edges, then
+/// antialias them and round only ordinary degree-two corners. The radius is
+/// 0.22 source voxel, so small one-voxel structures remain present. Color
+/// junctions are not smoothed across unrelated IDs.
+fn draw_atlas_smooth(rgb: &mut [u8], width: usize, height: usize,
+    app: &App, atlas: &crate::layers::Atlas, sw: usize, sh: usize) {
+    let edges=atlas_faces(app,atlas,sw,sh);
+    // Key: source-grid vertex + unordered pair of adjacent region IDs.
+    // This preserves color consistency when an outline turns a corner.
+    // Only smooth unbranched
+    // two-edge corners, keeping X/T junctions and color transitions exact.
+    let mut at_vertex: HashMap<(usize,usize,i32,i32),Vec<usize>>=HashMap::new();
+    for (i,e) in edges.iter().enumerate() {
+        let (left,right)=e.pair;
+        at_vertex.entry((e.a.0,e.a.1,left,right)).or_default().push(i);
+        at_vertex.entry((e.b.0,e.b.1,left,right)).or_default().push(i);
+    }
+    let rounded=|v:(usize,usize), edge_index:usize, edge:&FaceEdge| -> bool {
+        let Some(indices) = at_vertex.get(&(v.0,v.1,edge.pair.0,edge.pair.1)) else { return false; };
+        if indices.len()!=2 { return false; }
+        let other=&edges[if indices[0]==edge_index { indices[1] } else { indices[0] }];
+        // Only perpendicular segments create a corner; the same-color
+        // continuation remains straight.
+        (edge.a.0==edge.b.0) != (other.a.0==other.b.0)
+    };
+    const CUT: f32=0.22;
+    let stroke=atlas.width as f32;
+    for (i,e) in edges.iter().enumerate() {
+        let a=(e.a.0 as f32,e.a.1 as f32);
+        let b=(e.b.0 as f32,e.b.1 as f32);
+        let trim_a=if rounded(e.a,i,e) { CUT } else { 0. };
+        let trim_b=if rounded(e.b,i,e) { CUT } else { 0. };
+        let pa=lerp(a,b,trim_a);
+        let pb=lerp(b,a,trim_b);
+        let p=project_subpixel(app,pa.0,pa.1,sw,sh,width,height);
+        let q=project_subpixel(app,pb.0,pb.1,sw,sh,width,height);
+        aa_line(rgb,width,height,p,q,e.color,stroke);
+    }
+    // Connect trimmed segments via a quadratic curve at each corner.
+    // Each vertex is processed exactly once for a given color.
+    for ((x,y,_,_),indices) in &at_vertex {
+        if indices.len()!=2 { continue; }
+        let e1=&edges[indices[0]]; let e2=&edges[indices[1]];
+        if (e1.a.0==e1.b.0)==(e2.a.0==e2.b.0) { continue; }
+        let v=(*x as f32,*y as f32);
+        let far=|e:&FaceEdge| -> (f32,f32) {
+            if e.a==(*x,*y) { (e.b.0 as f32,e.b.1 as f32) }
+            else { (e.a.0 as f32,e.a.1 as f32) }
+        };
+        let p=lerp(v,far(e1),CUT);
+        let q=lerp(v,far(e2),CUT);
+        aa_quad(rgb,width,height,
+            project_subpixel(app,p.0,p.1,sw,sh,width,height),
+            project_subpixel(app,v.0,v.1,sw,sh,width,height),
+            project_subpixel(app,q.0,q.1,sw,sh,width,height),e1.color,stroke);
+    }
+}
+
 fn draw_atlas_edges(rgb: &mut [u8], width: usize, height: usize, app: &App,
     atlas: &crate::layers::Atlas, sw: usize, sh: usize) {
     use crate::layers::label_id;
@@ -280,8 +485,8 @@ mod layer_tests {
         let top = volume(vec![0., 2., 9.]);
         let atlas = volume(vec![0., 0., 0.]);
         let layers = Layers { overlays: vec![IntensityOverlay {
-            vol:top, window:(2., 9.), color:[255,0,0], opacity:1.0 }],
-            atlas: Some(Atlas { vol: atlas, wireframe:true, fallback:[0,255,0],width:1,regions:HashMap::new() }) };
+            vol:top, window:(2., 9.), color:[255,0,0], opacity:1.0, name:"top".into() }],
+            atlas: Some(Atlas { vol: atlas, wireframe:true, labels:None, fallback:[0,255,0],width:1,regions:HashMap::new() }) };
         let mut app = App::new(Axis::Z,0,1,0,(0.,255.),"test".into());
         let rgb = composite(&base,&app,&layers,3,1);
         assert_eq!(&rgb[0..3], &[100,100,100]);
@@ -295,12 +500,47 @@ mod layer_tests {
         let base=volume(vec![0.,0.,0.]);
         let label=volume(vec![3.,3.,4.]);
         let layers=Layers { overlays:vec![], atlas:Some(Atlas {
-            vol:label, wireframe:false,fallback:[255,0,255],width:1,regions:HashMap::new()
+            vol:label, wireframe:false,labels:None,fallback:[255,0,255],width:1,regions:HashMap::new()
         }) };
-        let app = App::new(Axis::Z,0,1,0,(0.,1.),"test".into());
+        let mut app = App::new(Axis::Z,0,1,0,(0.,1.),"test".into());
+        app.atlas_style = AtlasStyle::Voxel;
         let rgb = composite(&base,&app,&layers,30,10);
         // Internal boundary between source h=1 and h=2 -> x=20, not center x=15 or 25.
         assert_eq!(&rgb[(5*30+20)*3..(5*30+20)*3+3], &[255,0,255]);
         assert_eq!(&rgb[(5*30+15)*3..(5*30+15)*3+3], &[0,0,0]);
+    }
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::*;
+    use crate::volume::Axis;
+    use ndarray::Array3;
+    #[test]
+    fn inverse_mapping_respects_rotation_and_flips() {
+        let vol=Volume {data:Array3::zeros((4,3,2)),spacing:[1.;3],sform:None};
+        let mut app=App::new(Axis::Z,0,1,0,(0.,1.),"test".into());
+        assert_eq!(voxel_at_raster(&vol,&app,0,0,4,3),Some((0,2)));
+        assert_eq!(voxel_at_raster(&vol,&app,3,2,4,3),Some((3,0)));
+        app.rotation=90;
+        assert_eq!(voxel_at_raster(&vol,&app,0,0,3,4),Some((0,0)));
+        assert_eq!(voxel_at_raster(&vol,&app,2,3,3,4),Some((3,2)));
+        app.flip_h=true;
+        assert_eq!(voxel_at_raster(&vol,&app,0,0,3,4),Some((0,2)));
+    }
+    #[test]
+    fn smooth_contours_do_not_erase_internal_region() {
+        use crate::layers::{Atlas,Layers};
+        use std::collections::HashMap;
+        let base=Volume {data:Array3::zeros((3,3,1)),spacing:[1.;3],sform:None};
+        let label=Volume {data:Array3::from_shape_fn((3,3,1),|(x,y,_)|
+            if x==1 && y==1 {3.} else {4.}),spacing:[1.;3],sform:None};
+        let layers=Layers {overlays:vec![],atlas:Some(Atlas {vol:label,wireframe:false,labels:None,
+            fallback:[255,0,255],width:1,regions:HashMap::new()})};
+        let app=App::new(Axis::Z,0,1,0,(0.,1.),"test".into());
+        let rgb=composite(&base,&app,&layers,90,90);
+        // Center of one-voxel island remains unobstructed by contours.
+        assert_eq!(&rgb[(45*90+45)*3..(45*90+45)*3+3],&[0,0,0]);
+        assert!(rgb.iter().any(|&v|v>0));
     }
 }

@@ -24,11 +24,23 @@ pub struct Config {
     pub atlas_wireframe: bool,
     pub atlas_color: [u8; 3],
     pub atlas_width: usize,
+    pub atlas_style: AtlasStyle,
+    pub atlas_labels_path: Option<PathBuf>,
+    pub mouse_pixels: bool,
     pub lut_path: Option<PathBuf>,
     pub max_pixels: usize,
     pub max_fps: u32,
     pub enhanced_keys: bool,
     pub benchmark_frames: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtlasStyle { Smooth, Voxel }
+impl AtlasStyle {
+    fn parse(s: &str) -> Result<Self> {
+        match s { "smooth" => Ok(Self::Smooth), "voxel" => Ok(Self::Voxel),
+            _ => bail!("--atlas-style must be smooth or voxel") }
+    }
 }
 
 const HELP: &str = r#"niv — fast NIfTI slice viewer using Kitty graphics
@@ -51,6 +63,9 @@ OPTIONS
       --lut FILE.csv     CCFv3 table with Region_ID,Region,Abbr,R,G,B
       --atlas-color HEX Fallback outline color (#ffffff)
       --atlas-width N    Outline thickness in pixels, 1..3 (default 1)
+      --atlas-style MODE  smooth (AA curved corners, default) or voxel (exact)
+      --atlas-labels FILE  Solid label volume for region inspection with wireframe
+      --mouse-pixels     Request SGR 1016 pixel-precision mouse events (opt-in)
       --max-pixels N     Max raster pixels sent per frame (default: 350000)
       --fps N            Maximum redraw FPS (default: 30; useful over Tailscale)
       --no-enhanced-keys Disable Kitty enhanced keyboard mode (for problematic muxes)
@@ -71,6 +86,9 @@ KEYS
   , / .                 Shift window down / up (brightness)
   0                     Reset window
   b                     Toggle atlas outlines
+  g                     Toggle smooth/voxel atlas outlines (solid atlas)
+  i                     Toggle keyboard voxel inspector; move with arrows/hjkl
+  Mouse hover           Inspect voxel (if terminal/Rex forwards mouse motion)
   o                     Toggle additional intensity overlays
   q / Esc / Ctrl+C      Quit
 
@@ -107,6 +125,9 @@ pub fn parse() -> Result<Option<Config>> {
     let mut atlas_color = [255, 255, 255];
     let mut atlas_width = 1;
     let mut lut_path = None;
+    let mut atlas_labels_path = None;
+    let mut atlas_style = AtlasStyle::Smooth;
+    let mut mouse_pixels = false;
     let mut max_pixels = 350_000;
     let mut max_fps = 30;
     let mut enhanced_keys = true;
@@ -120,6 +141,10 @@ pub fn parse() -> Result<Option<Config>> {
             println!("niv {}", env!("CARGO_PKG_VERSION"));
             return Ok(None);
         }
+        if arg == "--mouse-pixels" {
+            mouse_pixels = true;
+            continue;
+        }
         if arg == "--no-enhanced-keys" {
             enhanced_keys = false;
             continue;
@@ -129,7 +154,7 @@ pub fn parse() -> Result<Option<Config>> {
         let needs_value = matches!(flag, "-a" | "--axis" | "--slice" | "--step" | "-w" |
             "--window" | "-r" | "--rotate" | "--max-pixels" | "--fps" | "--bench" | "--overlay" |
             "--overlay-window" | "--overlay-color" | "--overlay-opacity" |
-            "--atlas" | "--atlas-wireframe" | "--atlas-color" | "--atlas-width" | "--lut");
+            "--atlas" | "--atlas-wireframe" | "--atlas-color" | "--atlas-width" | "--lut" | "--atlas-style" | "--atlas-labels");
         if needs_value {
             let val = if let Some(v) = inline_value { v.to_owned() }
                 else { args.next().with_context(|| format!("{flag} needs a value"))? };
@@ -159,6 +184,8 @@ pub fn parse() -> Result<Option<Config>> {
                 "--atlas-color" => atlas_color = parse_color(&val)?,
                 "--atlas-width" => atlas_width = parse_range(&val, flag, 1, 3)?,
                 "--lut" => lut_path = Some(PathBuf::from(val)),
+                "--atlas-style" => atlas_style = AtlasStyle::parse(&val)?,
+                "--atlas-labels" => atlas_labels_path = Some(PathBuf::from(val)),
                 "--max-pixels" => max_pixels = parse_range(&val, flag, 1_000, 4_000_000)?,
                 "--fps" => max_fps = parse_range(&val, flag, 1, 120)? as u32,
                 "--bench" => benchmark_frames = Some(parse_range(&val, flag, 1, 10_000)?),
@@ -170,10 +197,14 @@ pub fn parse() -> Result<Option<Config>> {
             bail!("Supply exactly one NIfTI file");
         }
     }
+    if atlas_labels_path.is_some() && (!atlas_wireframe || atlas_path.is_none()) {
+        bail!("--atlas-labels is only used with --atlas-wireframe");
+    }
     Ok(Some(Config {
         path: path.context("Missing NIfTI file. See: niv --help")?,
         axis, initial_slice, step, rotation, window,
         overlays, atlas_path, atlas_wireframe, atlas_color, atlas_width, lut_path,
+        atlas_style, atlas_labels_path, mouse_pixels,
         max_pixels, max_fps,
         enhanced_keys, benchmark_frames,
     }))

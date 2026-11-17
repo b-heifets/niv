@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::volume::{Axis, Volume};
+use crate::{config::AtlasStyle, volume::{Axis, Volume}};
 
 pub struct App {
     pub axis: Axis,
@@ -15,6 +15,10 @@ pub struct App {
     pub flip_v: bool,
     pub show_atlas: bool,
     pub show_overlays: bool,
+    pub atlas_style: AtlasStyle,
+    pub inspect_mode: bool,
+    /// In-plane source voxel coordinates; None before any mouse movement.
+    pub probe: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +30,7 @@ impl App {
         Self {
             axis, index, stride, rotation, window, default_window: window, path,
             flip_h: false, flip_v: false, show_atlas: true, show_overlays: true,
+            atlas_style: AtlasStyle::Smooth, inspect_mode: false, probe: None,
         }
     }
 
@@ -37,6 +42,7 @@ impl App {
             self.index as f64 / (old_len - 1) as f64
         } else { 0.5 };
         self.axis = axis;
+        self.probe = None;
         self.index = (fraction * (new_len - 1) as f64).round() as usize;
     }
 
@@ -58,6 +64,38 @@ impl App {
         self.window = (lo + move_by, hi + move_by);
     }
 
+
+    /// Convert a source voxel center to displayed pixel-grid indices,
+    /// accounting for rotation and flips. Useful for keyboard inspection.
+    fn oriented(&self, vol: &Volume, h: usize, v: usize) -> (usize, usize, usize, usize) {
+        let (sw, sh, _) = vol.plane(self.axis);
+        let (mut x, mut y, w, height) = match self.rotation {
+            0 => (h, sh - 1 - v, sw, sh),
+            90 => (v, h, sh, sw),
+            180 => (sw - 1 - h, v, sw, sh),
+            270 => (sh - 1 - v, sw - 1 - h, sh, sw),
+            _ => unreachable!(),
+        };
+        if self.flip_h { x = w-1-x; }
+        if self.flip_v { y = height-1-y; }
+        (x,y,w,height)
+    }
+
+    fn move_probe(&mut self, vol: &Volume, dx: isize, dy: isize) {
+        let (sw, sh, _) = vol.plane(self.axis);
+        let (h,v) = self.probe.unwrap_or((sw/2, sh/2));
+        let (x,y,w,height) = self.oriented(vol,h,v);
+        let mut x = (x as isize + dx).clamp(0,w as isize-1) as usize;
+        let mut y = (y as isize + dy).clamp(0,height as isize-1) as usize;
+        if self.flip_h { x=w-1-x; }
+        if self.flip_v { y=height-1-y; }
+        self.probe=Some(match self.rotation {
+            0 => (x,sh-1-y), 90 => (y,x),
+            180 => (sw-1-x,y), 270 => (sw-1-y,sh-1-x),
+            _ => unreachable!(),
+        });
+    }
+
     pub fn key(&mut self, vol: &Volume, key: KeyEvent) -> Action {
         // Enhanced keyboard mode can report presses, repeats, and releases.
         if key.kind == KeyEventKind::Release { return Action::None; }
@@ -76,6 +114,16 @@ impl App {
             KeyCode::Char('f') => self.flip_h = !self.flip_h,
             KeyCode::Char('v') => self.flip_v = !self.flip_v,
             KeyCode::Char('b') => self.show_atlas = !self.show_atlas,
+            KeyCode::Char('g') => self.atlas_style = match self.atlas_style {
+                AtlasStyle::Smooth => AtlasStyle::Voxel, AtlasStyle::Voxel => AtlasStyle::Smooth,
+            },
+            KeyCode::Char('i') => {
+                self.inspect_mode = !self.inspect_mode;
+                if self.inspect_mode && self.probe.is_none() {
+                    let (w,h,_) = vol.plane(self.axis);
+                    self.probe = Some((w/2,h/2));
+                }
+            },
             KeyCode::Char('o') => self.show_overlays = !self.show_overlays,
             KeyCode::Char('0') => self.window = self.default_window,
             KeyCode::Char('+') | KeyCode::Char('=') => self.scale_window(0.8),
@@ -99,7 +147,17 @@ impl App {
                         || matches!(key.code, KeyCode::Char('H'|'J'|'K'|'L')) { 5 }
                     else if m.contains(KeyModifiers::ALT) { 2 }
                     else { 1 };
-                self.move_slices(vol, direction * (multiplier * self.stride) as isize);
+                if self.inspect_mode {
+                    let (dx,dy) = match key.code {
+                        KeyCode::Right | KeyCode::Char('l'|'L') => (1,0),
+                        KeyCode::Left | KeyCode::Char('h'|'H') => (-1,0),
+                        KeyCode::Up | KeyCode::Char('k'|'K') => (0,-1),
+                        _ => (0,1),
+                    };
+                    self.move_probe(vol, dx * multiplier as isize, dy * multiplier as isize);
+                } else {
+                    self.move_slices(vol, direction * (multiplier * self.stride) as isize);
+                }
             }
             _ => return Action::None,
         }
@@ -141,5 +199,24 @@ mod tests {
         assert!(app.index < vol.depth(Axis::Y));
         app.key(&vol, KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
         assert!(app.window.1 - app.window.0 < 100.);
+    }
+    #[test]
+    fn keyboard_inspector_preserves_slice_and_tracks_screen_directions() {
+        let vol=example();
+        let mut app=App::new(Axis::Z,10,1,0,(0.,1.),"test".into());
+        app.key(&vol,KeyEvent::new(KeyCode::Char('i'),KeyModifiers::NONE));
+        assert!(app.inspect_mode);
+        assert_eq!(app.probe,Some((10,15)));
+        app.key(&vol,KeyEvent::new(KeyCode::Right,KeyModifiers::NONE));
+        assert_eq!(app.probe,Some((11,15)));
+        assert_eq!(app.index,10);
+        app.key(&vol,KeyEvent::new(KeyCode::Up,KeyModifiers::NONE));
+        assert_eq!(app.probe,Some((11,16))); // screen up = higher source y at rot 0
+        app.key(&vol,KeyEvent::new(KeyCode::PageUp,KeyModifiers::NONE));
+        assert_eq!(app.index,35);
+        app.key(&vol,KeyEvent::new(KeyCode::Char('i'),KeyModifiers::NONE));
+        assert!(!app.inspect_mode);
+        app.key(&vol,KeyEvent::new(KeyCode::Right,KeyModifiers::NONE));
+        assert_eq!(app.index,36);
     }
 }

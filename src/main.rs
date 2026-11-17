@@ -17,7 +17,8 @@ use config::Config;
 use layers::Layers;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    event::{self, Event, MouseEvent, MouseEventKind, EnableMouseCapture,
+        DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags},
     execute, queue,
     style::Print,
@@ -25,9 +26,9 @@ use crossterm::{
 };
 use volume::Volume;
 
-struct TerminalGuard { enhanced_keys: bool }
+struct TerminalGuard { enhanced_keys: bool, mouse_pixels: bool }
 impl TerminalGuard {
-    fn enter(enhanced_keys: bool) -> Result<Self> {
+    fn enter(enhanced_keys: bool, mouse_pixels: bool) -> Result<Self> {
         terminal::enable_raw_mode()?;
         if let Err(err) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
             let _ = terminal::disable_raw_mode();
@@ -45,12 +46,22 @@ impl TerminalGuard {
                 return Err(err.into());
             }
         }
-        Ok(Self { enhanced_keys })
+        execute!(io::stdout(), EnableMouseCapture)?;
+        if mouse_pixels {
+            // Requires a terminal/mux that forwards SGR pixel mouse reports.
+            io::stdout().write_all(b"\x1b[?1016h")?;
+            io::stdout().flush()?;
+        }
+        Ok(Self { enhanced_keys, mouse_pixels })
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
+        if self.mouse_pixels {
+            let _ = stdout.write_all(b"\x1b[?1016l");
+        }
+        let _ = execute!(stdout, DisableMouseCapture);
         if self.enhanced_keys {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
@@ -88,63 +99,133 @@ impl FrameState {
     }
 }
 
+
+fn intensity(v: f32) -> String {
+    if !v.is_finite() { return v.to_string(); }
+    if v != 0. && (v.abs() < 0.0001 || v.abs() >= 1e7) {
+        format!("{v:.4e}")
+    } else { format!("{v:.4}") }
+}
+
+/// The footer is the only part repainted during mouse movement. We reserve
+/// one line per additional layer so none of its raw voxel values are hidden.
+fn footer_lines(vol: &Volume, app: &App, layers: &Layers, data_range: (f32,f32)) -> Vec<String> {
+    let mut lines=vec![format!(
+        "data {}..{} | display {}..{} | outlines:{}",
+        intensity(data_range.0), intensity(data_range.1),
+        intensity(app.window.0), intensity(app.window.1),
+        match app.atlas_style { config::AtlasStyle::Smooth => "smooth", config::AtlasStyle::Voxel => "voxel" },
+    )];
+    if let Some((h,v))=app.probe {
+        let [x,y,z]=app.axis.xyz(app.index,h,v);
+        let tag=if app.inspect_mode { "inspect" } else { "hover" };
+        lines.push(format!("{tag} [{x}, {y}, {z}] | base {}: {}",
+            app.path, intensity(vol.sample(app.axis,app.index,h,v))));
+        for (i,layer) in layers.overlays.iter().enumerate() {
+            lines.push(format!("layer {} {}{}: {} | window {}..{}",
+                i+1,layer.name,if app.show_overlays { "" } else { " (hidden)" },
+                intensity(layer.vol.sample(app.axis,app.index,h,v)),
+                intensity(layer.window.0),intensity(layer.window.1)));
+        }
+        if layers.atlas.is_some() {
+            let region=layers.region_at(app.axis,app.index,h,v).unwrap_or_else(||
+                "region lookup needs --atlas-labels with precomputed wireframe".to_string());
+            lines.push(format!("region: {region}"));
+        }
+    } else {
+        lines.push("hover over image to inspect voxels | press i for keyboard inspection".to_owned());
+        for (i,layer) in layers.overlays.iter().enumerate() {
+            lines.push(format!("layer {}: {} | display {}..{}",i+1,layer.name,
+                intensity(layer.window.0),intensity(layer.window.1)));
+        }
+        if layers.atlas.is_some() { lines.push("atlas: move mouse to inspect region".to_owned()); }
+    }
+    lines.push(if app.inspect_mode {
+        "INSPECT arrows/hjkl move crosshair | PgUp/PgDn slices | i exit | g outlines | q quit".to_owned()
+    } else {
+        "arrows/hjkl slices | i inspector | g outlines | b atlas | r/R rotate | x/y/z axis".to_owned()
+    });
+    lines
+}
+
+fn draw_footer(out: &mut impl Write, vol: &Volume, layers: &Layers,
+    app: &App, data_range: (f32,f32)) -> Result<()> {
+    let (cols,rows)=terminal::size()?;
+    let lines=footer_lines(vol,app,layers,data_range);
+    let start=rows.saturating_sub(lines.len() as u16);
+    for (i,line) in lines.into_iter().enumerate() {
+        if start+i as u16 >= rows { break; }
+        queue!(out, MoveTo(0,start+i as u16), Clear(ClearType::CurrentLine),
+            Print(crop(line,cols)))?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 fn draw(out: &mut impl Write, vol: &Volume, layers: &Layers, app: &App,
-    data_range: (f32, f32), max_pixels: usize, frames: &mut FrameState) -> Result<()> {
+    data_range: (f32, f32), max_pixels: usize, frames: &mut FrameState) -> Result<render::Geometry> {
     let (cols, rows) = terminal::size()?;
-    if cols < 20 || rows < 8 {
+    if cols < 20 || rows < (footer_lines(vol,app,layers,data_range).len()+5) as u16 {
         frames.clear(out)?;
         queue!(out, MoveTo(0, 0), Clear(ClearType::All),
-            Print("Resize terminal (min 20x8)"))?;
+            Print("Resize terminal to show all layer values"))?;
         out.flush()?;
-        return Ok(());
+        return Ok(render::Geometry {cols:0,rows:0,width:1,height:1});
     }
-    let geometry = render::geometry(vol, app, cols, rows, max_pixels);
+    let reserved=footer_lines(vol,app,layers,data_range).len()+2;
+    let geometry = render::geometry(vol, app, cols, rows, max_pixels,reserved);
     let rgb = render::composite(vol, app, layers, geometry.width, geometry.height);
     let frame = kitty::encode_rgb(&rgb)?;
 
-    // Only clear text lines. Clearing the whole screen on every keypress
-    // would erase the previous Kitty placement and expose a blank frame.
     let dims = vol.dims();
-    let stride = if app.stride > 1 {
-        format!(" | stride {}", app.stride)
-    } else { String::new() };
+    let stride = if app.stride > 1 { format!(" | stride {}", app.stride) }
+        else { String::new() };
     let header = format!("{} | {}x{}x{} | axis {} | slice {}/{} | rot {}{}",
         app.path, dims[0], dims[1], dims[2], app.axis.label(),
         app.index, vol.depth(app.axis) - 1, app.rotation, stride);
     queue!(out, MoveTo(0, 0), Clear(ClearType::CurrentLine),
         Print(crop(header, cols)), MoveTo(0, 1))?;
 
-    // Transmit and place NEW pixels while OLD pixels remain visible.
-    // Delete old image only after the complete new placement command.
     let next = frames.allocate();
     kitty::replace(out, next, &frame, geometry, frames.active_id)?;
     frames.active_id = Some(next);
+    draw_footer(out,vol,layers,app,data_range)?;
+    Ok(geometry)
+}
 
-    let mut status = format!("data: {:.3}..{:.3} | display: {:.3}..{:.3}",
-        data_range.0, data_range.1, app.window.0, app.window.1);
-    if let Some(atlas) = &layers.atlas {
-        status.push_str(if app.show_atlas { " | atlas:on" } else { " | atlas:off" });
-        if app.show_atlas {
-            if let Some(region) = layers.center_region(app.axis, app.index) {
-                status.push_str(&format!(" | center: {region}"));
-            }
-        }
-        if atlas.wireframe { status.push_str(" [wireframe]"); }
-    }
-    if !layers.overlays.is_empty() {
-        status.push_str(&format!(" | overlays:{}{}", layers.overlays.len(),
-            if app.show_overlays { "" } else { " (off)" }));
-    }
-    let help = "arrows/hjkl slice | Alt 2x Shift 5x Ctrl 10x | xyz axis | r/R rotate | b atlas | o overlays | +/- contrast";
-    queue!(out,
-        MoveTo(0, rows - 2), Clear(ClearType::CurrentLine), Print(crop(status, cols)),
-        MoveTo(0, rows - 1), Clear(ClearType::CurrentLine), Print(crop(help.into(), cols)))?;
-    out.flush()?;
-    Ok(())
+/// Translate a cell-based or optional pixel-based SGR mouse position to
+/// the exact source voxel, matching Kitty's c/r placement + letterboxing.
+/// The image begins at column 0, terminal row 1 (after the header).
+fn mouse_voxel(vol: &Volume, app: &App, geom: render::Geometry,
+    mouse: MouseEvent, pixel_mouse: bool) -> Option<(usize,usize)> {
+    let (cols,rows)=terminal::size().ok()?;
+    let (cw,ch)=render::cell_pixels(cols,rows);
+    let (rx,ry)=mouse_raster(geom,mouse,pixel_mouse,cw,ch)?;
+    render::voxel_at_raster(vol,app,rx,ry,geom.width,geom.height)
+}
+
+fn mouse_raster(geom: render::Geometry,mouse: MouseEvent,pixel_mouse: bool,
+    cw: usize,ch: usize) -> Option<(usize,usize)> {
+    if geom.cols==0 || geom.rows==0 || cw==0 || ch==0 { return None; }
+    let (mx,my)=if pixel_mouse {
+        (mouse.column as f64, mouse.row as f64-ch as f64)
+    } else {
+        ((mouse.column as f64+0.5)*cw as f64,
+         (mouse.row as f64-0.5)*ch as f64)
+    };
+    let box_w=geom.cols as f64*cw as f64;
+    let box_h=geom.rows as f64*ch as f64;
+    let scale=(box_w/geom.width as f64).min(box_h/geom.height as f64);
+    let image_w=geom.width as f64*scale;
+    let image_h=geom.height as f64*scale;
+    let x=mx-(box_w-image_w)*0.5;
+    let y=my-(box_h-image_h)*0.5;
+    if x<0. || y<0. || x>=image_w || y>=image_h { return None; }
+    Some(((x/scale).floor() as usize,(y/scale).floor() as usize))
 }
 
 fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, config: &Config, count: usize) -> Result<()> {
-    let geometry = render::geometry(vol, app, 110, 36, config.max_pixels);
+    let geometry = render::geometry(vol, app, 110, 36, config.max_pixels, 5);
     let start = Instant::now();
     let mut rgb_time = Duration::ZERO;
     let mut encode_time = Duration::ZERO;
@@ -187,6 +268,7 @@ fn run() -> Result<()> {
     let name = config.path.file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| config.path.display().to_string());
     let mut app = App::new(config.axis, index, config.step, config.rotation, window, name);
+    app.atlas_style=config.atlas_style;
     if let Some(count) = config.benchmark_frames {
         println!("load: {load_secs:.2}s");
         return benchmark(&vol, &layers, &mut app, &config, count);
@@ -195,16 +277,17 @@ fn run() -> Result<()> {
         bail!("niv needs a real terminal for interactive graphics. Use --bench N for a noninteractive test.");
     }
 
-    let _guard = TerminalGuard::enter(config.enhanced_keys)?;
+    let _guard = TerminalGuard::enter(config.enhanced_keys,config.mouse_pixels)?;
     let mut out = io::stdout().lock();
     let mut frames = FrameState::new();
     queue!(out, Clear(ClearType::All))?; // Once, on entering alt-screen.
-    draw(&mut out, &vol, &layers, &app, data_range, config.max_pixels, &mut frames)?;
+    let mut geometry=draw(&mut out, &vol, &layers, &app, data_range, config.max_pixels, &mut frames)?;
     let frame_interval = Duration::from_secs_f64(1.0 / config.max_fps as f64);
     let mut last_draw = Instant::now();
     let mut pending = false;
+    let mut pending_footer=false;
     loop {
-        let wait = if pending {
+        let wait = if pending || pending_footer {
             frame_interval.saturating_sub(last_draw.elapsed())
         } else { Duration::from_millis(150) };
         if event::poll(wait)? {
@@ -220,16 +303,34 @@ fn run() -> Result<()> {
                         Action::Redraw => pending = true,
                         Action::None => {}
                     },
-                    Event::Resize(_, _) => { pending = true; last_draw = Instant::now() - frame_interval; }
+                    Event::Resize(_, _) => {
+                        pending = true;
+                        last_draw = Instant::now() - frame_interval;
+                    }
+                    Event::Mouse(mouse) => {
+                        if !app.inspect_mode && matches!(mouse.kind,
+                            MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Down(_)) {
+                            let next=mouse_voxel(&vol,&app,geometry,mouse,config.mouse_pixels);
+                            if app.probe!=next {
+                                app.probe=next;
+                                pending_footer=true;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? { break; }
             }
         }
-        if pending && last_draw.elapsed() >= frame_interval {
-            draw(&mut out, &vol, &layers, &app, data_range, config.max_pixels, &mut frames)?;
+        if (pending || pending_footer) && last_draw.elapsed() >= frame_interval {
+            if pending {
+                geometry=draw(&mut out, &vol, &layers, &app, data_range, config.max_pixels, &mut frames)?;
+            } else {
+                draw_footer(&mut out, &vol, &layers, &app, data_range)?;
+            }
             last_draw = Instant::now();
             pending = false;
+            pending_footer=false;
         }
     }
 }
@@ -238,5 +339,23 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("niv: {err:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    fn mouse(column:u16,row:u16) -> MouseEvent {
+        MouseEvent {kind:MouseEventKind::Moved,column,row,modifiers:KeyModifiers::NONE}
+    }
+    #[test]
+    fn mouse_cells_and_pixels_hit_matching_raster_coordinates() {
+        let geom=render::Geometry {cols:10,rows:5,width:80,height:80};
+        // 8x16 px cells; picture begins at row 1.
+        assert_eq!(mouse_raster(geom,mouse(2,1),false,8,16),Some((20,8)));
+        assert_eq!(mouse_raster(geom,mouse(20,24),true,8,16),Some((20,8)));
+        assert_eq!(mouse_raster(geom,mouse(10,1),false,8,16),None);
+        assert_eq!(mouse_raster(geom,mouse(2,0),false,8,16),None);
     }
 }

@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use crate::{config::Config, volume::{Axis, Volume}};
 
 pub struct IntensityOverlay {
+    pub name: String,
     pub vol: Volume,
     pub window: (f32, f32),
     pub color: [u8; 3],
@@ -23,6 +24,7 @@ pub struct RegionInfo {
 pub struct Atlas {
     pub vol: Volume,
     pub wireframe: bool,
+    pub labels: Option<Volume>,
     pub fallback: [u8; 3],
     pub width: usize,
     pub regions: HashMap<i32, RegionInfo>,
@@ -42,16 +44,25 @@ impl Layers {
             reference.validate_grid(&vol)
                 .with_context(|| format!("Intensity overlay {} is not voxel-aligned", spec.path.display()))?;
             let window = spec.window.unwrap_or_else(|| vol.auto_window());
-            overlays.push(IntensityOverlay { vol, window, color: spec.color, opacity: spec.opacity });
+            let name = spec.path.file_name().map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| spec.path.display().to_string());
+            overlays.push(IntensityOverlay { vol, window, color: spec.color, opacity: spec.opacity, name });
         }
         let atlas = if let Some(path) = &config.atlas_path {
             let vol = Volume::load(path).with_context(|| format!("Loading atlas {}", path.display()))?;
             reference.validate_grid(&vol)
                 .with_context(|| format!("Atlas {} is not voxel-aligned", path.display()))?;
+            let labels = if let Some(label_path) = &config.atlas_labels_path {
+                let solid = Volume::load(label_path)
+                    .with_context(|| format!("Loading solid atlas labels {}", label_path.display()))?;
+                reference.validate_grid(&solid)
+                    .with_context(|| format!("Atlas labels {} are not voxel-aligned", label_path.display()))?;
+                Some(solid)
+            } else { None };
             let regions = if let Some(csv_path) = &config.lut_path {
                 read_lut(csv_path)?
             } else { HashMap::new() };
-            Some(Atlas { vol, wireframe: config.atlas_wireframe,
+            Some(Atlas { vol, wireframe: config.atlas_wireframe, labels,
                 fallback: config.atlas_color, width: config.atlas_width, regions })
         } else {
             if config.lut_path.is_some() { bail!("--lut requires --atlas or --atlas-wireframe"); }
@@ -60,16 +71,19 @@ impl Layers {
         Ok(Self { overlays, atlas })
     }
 
-    pub fn center_region(&self, axis: Axis, slice: usize) -> Option<String> {
+    /// Full region text at a voxel, or None for unlabeled voxels. For a
+    /// precomputed wireframe a separate solid atlas is required for reliable
+    /// region lookup away from outline voxels.
+    pub fn region_at(&self, axis: Axis, slice: usize, h: usize, v: usize) -> Option<String> {
         let atlas = self.atlas.as_ref()?;
-        if atlas.wireframe { return None; }
-        let (w, h, _) = atlas.vol.plane(axis);
-        let id = label_id(atlas.vol.sample(axis, slice, w/2, h/2));
-        if id == 0 { return None; }
+        let labels = if atlas.wireframe { atlas.labels.as_ref()? } else { &atlas.vol };
+        let id = label_id(labels.sample(axis, slice, h, v));
+        if id == 0 { return Some("outside atlas".to_string()); }
         if let Some(reg) = atlas.regions.get(&id) {
-            Some(format!("{} ({}) #{}", reg.abbr, reg.name, id))
-        } else { Some(format!("region #{}", id)) }
+            Some(format!("{} — {} (ID {})", reg.abbr, reg.name, id))
+        } else { Some(format!("region ID {} (not in LUT)", id)) }
     }
+
 }
 
 /// Read the UNRAVEL CCFv3-2020 CSV, including a possible UTF-8 BOM.
@@ -127,5 +141,18 @@ mod tests {
         assert_eq!(got[&51].name, "Nucleus, accumbens");
         assert_eq!(got[&51].color, [128,205,248]);
         std::fs::remove_file(&p).unwrap();
+    }
+    #[test]
+    fn atlas_region_inspection_uses_solid_labels() {
+        use ndarray::Array3;
+        let mk=|value:f32| Volume {data:Array3::from_elem((2,2,1),value),
+            spacing:[1.;3],sform:None};
+        let mut regions=HashMap::new();
+        regions.insert(51, RegionInfo {color:[128,205,248],
+            name:"Nucleus accumbens".into(),abbr:"ACB".into()});
+        let layers=Layers {overlays:vec![],atlas:Some(Atlas {vol:mk(1.),
+            wireframe:true, labels:Some(mk(51.)),fallback:[255;3],width:1,regions})};
+        assert_eq!(layers.region_at(Axis::Z,0,1,1).as_deref(),
+            Some("ACB — Nucleus accumbens (ID 51)"));
     }
 }
