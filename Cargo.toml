@@ -1,0 +1,22 @@
+[package]
+name = "niv"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Fast keyboard-driven grayscale NIfTI viewer for Kitty graphics terminals"
+license = "MIT"
+readme = "README.md"
+keywords = ["nifti", "terminal", "neuroimaging", "kitty", "tui"]
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+crossterm = "0.29"
+flate2 = "1.1"
+ndarray = "0.17"
+nifti = { version = "0.18", default-features = false, features = ["ndarray_volumes"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

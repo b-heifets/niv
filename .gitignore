@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+
+# NIfTI volumes (exclude large research datasets)
+*.nii
+*.nii.gz
+
+# Keep the sample volume for testing
+!data/sample.nii.gz
+
+# macOS
+.DS_Store
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+*.pyc
+__pycache__/
