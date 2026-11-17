@@ -44,6 +44,7 @@ impl TerminalGuard {
                 PushKeyboardEnhancementFlags(
                     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                 )
             ) {
                 let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
@@ -119,21 +120,24 @@ struct ViewLayout {
     list_count: usize,
 }
 fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> ViewLayout {
+    let extra = usize::from(app.edit.is_some() || app.notice.is_some());
     let list_count = if app.fullscreen || !app.show_layer_list {
         0
     } else {
         (layers.overlays.len() + 1)
             .min(6)
-            .min((rows as usize).saturating_sub(7))
+            .min((rows as usize).saturating_sub(8 + extra))
     };
     let list_start = (app.selected + 1)
         .saturating_sub(list_count)
         .min(layers.overlays.len() + 1 - list_count);
-    let head = if app.fullscreen { 0u16 } else { 1 };
+    // Region and probe always sit ABOVE the image. Only the selected layer,
+    // optional list, and active editor/status message sit below it.
+    let head = if app.fullscreen { 0u16 } else { 2 };
     let footer_rows = if app.fullscreen {
         0u16
     } else {
-        3 + list_count as u16
+        1 + list_count as u16 + extra as u16
     };
     let reserved = (head + footer_rows) as usize;
     let geom = render::geometry(vol, app, cols, rows, reserved);
@@ -153,6 +157,23 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
 fn crop(s: &str, cols: usize) -> String {
     s.chars().take(cols).collect()
 }
+fn middle_ellipsis(s: &str, limit: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= limit {
+        return s.to_owned();
+    }
+    if limit < 5 {
+        return crop(s, limit);
+    }
+    let head = (limit - 1) / 2;
+    let tail = limit - 1 - head;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
 fn intensity(v: f32) -> String {
     if !v.is_finite() {
         return v.to_string();
@@ -212,6 +233,7 @@ fn draw_ui(
     }
     let (cols, rows) = terminal::size()?;
     let x = view.x;
+    // Row 1: the region itself and a tiny help indicator at the right edge.
     queue!(out, MoveTo(0, 0), Clear(ClearType::CurrentLine))?;
     if layers.atlas.is_some() {
         let (w, h, _) = vol.plane(app.axis);
@@ -223,43 +245,61 @@ fn draw_ui(
             }
             queue!(
                 out,
-                Print(crop(&label, cols.saturating_sub(x) as usize)),
+                Print(middle_ellipsis(&label, cols.saturating_sub(x + 3) as usize)),
                 ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;
         }
     }
+    if cols > 1 {
+        queue!(
+            out,
+            MoveTo(cols - 2, 0),
+            SetForegroundColor(Color::DarkGrey),
+            Print("?"),
+            ResetColor
+        )?;
+    }
+    // Row 2: permanent readout of actual voxel values, even without hover.
+    let (w, h, _) = vol.plane(app.axis);
+    let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
+    let [ix, iy, iz] = app.axis.xyz(app.index, vh, vv);
+    let mut inspect = format!(
+        "[{ix},{iy},{iz}]  |  1: {}",
+        intensity(vol.sample(app.axis, app.index, vh, vv))
+    );
+    for (idx, layer) in layers.overlays.iter().enumerate() {
+        inspect.push_str(&format!(
+            "  |  {}: {}",
+            idx + 2,
+            intensity(layer.vol.sample(app.axis, app.index, vh, vv))
+        ));
+    }
+    line(out, 1, &inspect, cols, Color::Grey, x)?;
+
+    // Layer window appears BELOW the image to separate it from voxel/atlas text.
     let (lo, hi) = app.selected_window(layers);
     let opacity = app.selected_opacity(layers);
-    let color = app.selected_palette(layers).accent(app.selected);
+    let accent = app.selected_palette(layers).accent(app.selected);
     let marker = if selected_visible(app, layers) {
         ""
     } else {
         " [off]"
     };
-    let filename = if app.show_layer_list {
-        String::new()
-    } else {
-        let name = selected_name(app, layers);
-        let max_name = (cols.saturating_sub(x) as usize / 2).min(52).max(8);
-        let short = if name.chars().count() > max_name {
-            format!("{}…", crop(name, max_name.saturating_sub(1)))
-        } else {
-            name.to_owned()
-        };
-        format!(" {short}")
-    };
-    let summary = format!(
-        "{}{}{}   min {}   max {}   α {:.0}%",
-        app.selected + 1,
-        filename,
-        marker,
+    let settings = format!(
+        "  |  min: {}  |  max: {}  |  α: {:.0}%{}",
         compact_number(lo),
         compact_number(hi),
-        opacity * 100.0
+        opacity * 100.0,
+        marker
     );
-    line(out, view.footer, &summary, cols, rgb_color(color), x)?;
-    // Optional compact layer list. No name is repeated outside the list header.
+    let prefix = format!("{}: ", app.selected + 1);
+    let name_space =
+        (cols as usize).saturating_sub(x as usize + prefix.len() + settings.chars().count() + 1);
+    let name = middle_ellipsis(selected_name(app, layers), name_space);
+    let summary = format!("{prefix}{name}{settings}");
+    line(out, view.footer, &summary, cols, rgb_color(accent), x)?;
+
     for k in 0..view.list_count {
         let idx = view.list_start + k;
         let name = if idx == 0 {
@@ -274,11 +314,12 @@ fn draw_ui(
         };
         let visible = idx == 0 || (app.show_overlays && layers.overlays[idx - 1].visible);
         let mark = if idx == app.selected { ">" } else { " " };
+        let prefix = format!("{} {}: ", mark, idx + 1);
+        let max_name = (cols as usize).saturating_sub(x as usize + prefix.len() + 7);
         let txt = format!(
-            "{} {}  {}{}",
-            mark,
-            idx + 1,
-            name,
+            "{}{}{}",
+            prefix,
+            middle_ellipsis(name, max_name),
             if visible { "" } else { " [off]" }
         );
         line(
@@ -294,65 +335,35 @@ fn draw_ui(
             x,
         )?;
     }
-    let inspect_row = view.footer + 1 + view.list_count as u16;
-    let inspect = if let Some((h, v)) = app.probe {
-        let [ix, iy, iz] = app.axis.xyz(app.index, h, v);
-        let mut text = format!(
-            "[{ix},{iy},{iz}]   1 {}",
-            intensity(vol.sample(app.axis, app.index, h, v))
-        );
-        for (idx, layer) in layers.overlays.iter().enumerate() {
-            text.push_str(&format!(
-                "   {} {}",
-                idx + 2,
-                intensity(layer.vol.sample(app.axis, app.index, h, v))
-            ));
+    // No persistent bottom help row. Only transient prompts/errors/loading.
+    if app.edit.is_some() || app.notice.is_some() {
+        let bottom = rows - 1;
+        if let Some(edit) = &app.edit {
+            let what = match edit.field {
+                EditField::Both => "min,max",
+                EditField::Minimum => "minimum",
+                EditField::Maximum => "maximum",
+                EditField::LayerOpacity => "image opacity (0..1)",
+                EditField::AtlasOpacity => "atlas opacity (0..1)",
+                EditField::AddPath => "new overlay path",
+            };
+            let err = edit.error.as_deref().unwrap_or("");
+            let txt = format!("{what} > {}_  {err}    Enter apply · Esc cancel", edit.text);
+            line(
+                out,
+                bottom,
+                &txt,
+                cols,
+                if edit.error.is_some() {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                },
+                x,
+            )?;
+        } else if let Some(notice) = &app.notice {
+            line(out, bottom, notice, cols, Color::Yellow, x)?;
         }
-        text
-    } else {
-        format!(
-            "{}/{}   stride {}   ·   hover to inspect",
-            app.index + 1,
-            vol.depth(app.axis),
-            app.stride
-        )
-    };
-    line(out, inspect_row, &inspect, cols, Color::Grey, x)?;
-    let hint_row = rows - 1;
-    if let Some(edit) = &app.edit {
-        let what = match edit.field {
-            EditField::Both => "min,max",
-            EditField::Minimum => "minimum",
-            EditField::Maximum => "maximum",
-            EditField::LayerOpacity => "image opacity (0..1)",
-            EditField::AtlasOpacity => "atlas opacity (0..1)",
-            EditField::AddPath => "new overlay path",
-        };
-        let err = edit.error.as_deref().unwrap_or("");
-        let txt = format!("{what} > {}_  {err}    Enter apply · Esc cancel", edit.text);
-        line(
-            out,
-            hint_row,
-            &txt,
-            cols,
-            if edit.error.is_some() {
-                Color::Red
-            } else {
-                Color::Yellow
-            },
-            x,
-        )?;
-    } else if let Some(notice) = &app.notice {
-        line(out, hint_row, notice, cols, Color::Yellow, x)?;
-    } else {
-        line(
-            out,
-            hint_row,
-            "↑↓/wheel slices   1–9 layer   e range   o opacity   n load   ? help",
-            cols,
-            Color::DarkGrey,
-            x,
-        )?;
     }
     out.flush()?;
     Ok(())
@@ -377,9 +388,9 @@ fn draw_popup(
                 [
                     "NAVIGATION",
                     "  ↑↓←→ / hjkl      Slices; wheel / trackpad also scroll",
-                    "  Shift ×2 · Ctrl ×3 · Alt ×4     [ / ]  adjust stride",
+                    "  Cmd ×2 · Shift ×3 · Ctrl ×4 · Alt ×2 fallback",
                     "  PgUp / PgDn      ±25 slices    x y z   choose axis",
-                    "  r / R  rotate     f / v  flip     Tab  fill terminal",
+                    "  [ / ] stride   r / R rotate   f / v flip   Tab fill",
                     "  i      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
                     "LAYERS",
@@ -388,7 +399,8 @@ fn draw_popup(
                     "  e      Edit min,max     m / M   Edit just min / max",
                     "  0      Reset range      c       Cycle color map",
                     "  o      Image opacity    O       Atlas opacity",
-                    "  a      Atlas visible    t       Layer list",
+                    "  a      Atlas visible    b       Black / transparent",
+                    "  t      Layer list      ?       Help",
                     "  + / -  Contrast         , / .   Brightness",
                     "",
                     "? or /  help     I  info     q  quit     Esc  close",
@@ -433,6 +445,19 @@ fn draw_popup(
                 app.stride
             ));
             lines.push(format!("Opacity    {:.0}%", app.base_opacity * 100.0));
+            lines.push(format!(
+                "Background {} (Kitty {})",
+                if app.transparent_background {
+                    "transparent"
+                } else {
+                    "black"
+                },
+                if app.transparent_background {
+                    "RGBA"
+                } else {
+                    "RGB"
+                }
+            ));
             if let Some(atlas) = &layers.atlas {
                 lines.push(String::new());
                 lines.push(format!(
@@ -585,8 +610,15 @@ fn draw(
         });
     }
     let view = layout(vol, app, layers, cols, rows);
-    let rgba = render::composite(vol, app, layers, view.geom.width, view.geom.height);
-    let frame = kitty::encode_rgba(&rgba)?;
+    let pixels = render::composite_format(
+        vol,
+        app,
+        layers,
+        view.geom.width,
+        view.geom.height,
+        app.transparent_background,
+    );
+    let frame = kitty::encode_pixels(&pixels, app.transparent_background)?;
     queue!(out, MoveTo(view.x, view.y))?;
     let next = frames.allocate();
     kitty::replace(out, next, &frame, view.geom, frames.active_id)?;
@@ -653,10 +685,17 @@ fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, count: usize) -> Resu
     for i in 0..count {
         app.index = i * vol.depth(app.axis) / count;
         let t = Instant::now();
-        let rgba = render::composite(vol, app, layers, geom.width, geom.height);
+        let pixels = render::composite_format(
+            vol,
+            app,
+            layers,
+            geom.width,
+            geom.height,
+            app.transparent_background,
+        );
         rgb_time += t.elapsed();
         let t = Instant::now();
-        compressed += kitty::encode_rgba(&rgba)?.bytes;
+        compressed += kitty::encode_pixels(&pixels, app.transparent_background)?.bytes;
         encode_time += t.elapsed();
     }
     let elapsed = start.elapsed();
@@ -712,6 +751,7 @@ fn run() -> Result<()> {
         name,
     );
     app.base_opacity = config.base_opacity;
+    app.transparent_background = config.transparent_background;
     app.default_window = vol.auto_window();
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     if let Some(count) = config.benchmark_frames {
@@ -730,27 +770,67 @@ fn run() -> Result<()> {
     let mut pending_frame = false;
     let mut pending_ui = false;
     let mut pending_layout = false;
+    // The candidate region is updated immediately on hover; graphics are only
+    // redrawn if the candidate differs from the active highlight after a delay.
+    let mut hover_candidate: Option<i32> = None;
+    let mut hover_deadline: Option<Instant> = None;
+    let hover_delay = Duration::from_millis(config.hover_delay_ms);
     loop {
-        let wait = if pending_frame || pending_ui || pending_layout {
+        let mut wait = if pending_frame || pending_ui || pending_layout {
             frame_interval.saturating_sub(last_draw.elapsed())
         } else {
             Duration::from_millis(150)
         };
+        if let Some(deadline) = hover_deadline {
+            wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+        }
         if event::poll(wait)? {
             for _ in 0..256 {
                 match event::read()? {
                     Event::Key(key) => {
                         if app.notice.take().is_some() {
-                            pending_ui = true;
+                            pending_layout = true;
+                            pending_frame = true;
                         }
-                        match app.key(&vol, &mut layers, key) {
+                        let action = app.key(&vol, &mut layers, key);
+                        if matches!(action, Action::Redraw | Action::Layout) {
+                            // Slice/axis change: update the region associated with
+                            // the cursor; don't retain an outline from another slice.
+                            if app.inspect_mode || app.probe.is_none() || !app.show_atlas {
+                                app.highlighted_region = None;
+                                hover_candidate = None;
+                                hover_deadline = None;
+                            } else if config.hover_delay_ms != 0 {
+                                let target = app.probe.and_then(|(h, v)| {
+                                    layers.atlas_id_at(app.axis, app.index, h, v)
+                                });
+                                if target != hover_candidate {
+                                    hover_candidate = target;
+                                    hover_deadline = Some(Instant::now() + hover_delay);
+                                }
+                            }
+                        }
+                        match action {
                             Action::Quit => {
                                 frames.clear(&mut out)?;
                                 out.flush()?;
                                 return Ok(());
                             }
                             Action::Redraw => pending_frame = true,
-                            Action::Ui => pending_ui = true,
+                            Action::Ui => {
+                                let (cols, rows) = terminal::size()?;
+                                let updated = layout(&vol, &app, &layers, cols, rows);
+                                if updated.footer != view.footer
+                                    || updated.y != view.y
+                                    || updated.geom.width != view.geom.width
+                                    || updated.geom.height != view.geom.height
+                                {
+                                    pending_layout = true;
+                                    pending_frame = true;
+                                } else {
+                                    pending_ui = true;
+                                }
+                            }
                             Action::Layout => {
                                 pending_layout = true;
                                 pending_frame = true;
@@ -808,6 +888,18 @@ fn run() -> Result<()> {
                                 app.probe = next;
                                 pending_ui = true;
                             }
+                            if config.hover_delay_ms != 0
+                                && app.show_atlas
+                                && layers.atlas.is_some()
+                            {
+                                let target = next.and_then(|(h, v)| {
+                                    layers.atlas_id_at(app.axis, app.index, h, v)
+                                });
+                                if target != hover_candidate {
+                                    hover_candidate = target;
+                                    hover_deadline = Some(Instant::now() + hover_delay);
+                                }
+                            }
                         }
                         _ => {}
                     },
@@ -816,6 +908,13 @@ fn run() -> Result<()> {
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
+            }
+        }
+        if hover_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            hover_deadline = None;
+            if app.highlighted_region != hover_candidate {
+                app.highlighted_region = hover_candidate;
+                pending_frame = true;
             }
         }
         if (pending_frame || pending_ui || pending_layout) && last_draw.elapsed() >= frame_interval

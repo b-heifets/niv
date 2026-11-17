@@ -11,10 +11,12 @@ const CHUNK: usize = 4096;
 pub struct Encoded {
     payload: String,
     pub bytes: usize,
+    pub format: u8,
 }
 
-pub fn encode_rgba(rgb: &[u8]) -> Result<Encoded> {
-    // Kitty RGBA32 + zlib preserves truly transparent pixels across layers.
+pub fn encode_pixels(rgb: &[u8], transparent_background: bool) -> Result<Encoded> {
+    // Kitty f=24 is faster/lighter for an opaque RGB canvas; f=32 retains
+    // terminal transparency. Multi-layer alpha blending happens before encoding.
     let mut writer = ZlibEncoder::new(Vec::new(), Compression::fast());
     writer.write_all(rgb)?;
     let compressed = writer.finish()?;
@@ -22,6 +24,7 @@ pub fn encode_rgba(rgb: &[u8]) -> Result<Encoded> {
     Ok(Encoded {
         payload: STANDARD.encode(compressed),
         bytes,
+        format: if transparent_background { 32 } else { 24 },
     })
 }
 
@@ -38,8 +41,8 @@ pub fn send<W: Write>(
         let more = u8::from(chunks.peek().is_some());
         write!(
             out,
-            "\x1b_Ga=T,f=32,t=d,o=z,s={},v={},i={image_id},c={},r={},C=1,q=1,m={more};",
-            geom.width, geom.height, geom.cols, geom.rows
+            "\x1b_Ga=T,f={},t=d,o=z,s={},v={},i={image_id},c={},r={},C=1,q=1,m={more};",
+            frame.format, geom.width, geom.height, geom.cols, geom.rows
         )?;
         out.write_all(first)?;
         out.write_all(b"\x1b\\")?;
@@ -82,7 +85,7 @@ mod tests {
     use super::*;
     #[test]
     fn replacement_places_new_before_deleting_old() {
-        let frame = encode_rgba(&[0u8; 4]).unwrap();
+        let frame = encode_pixels(&[0u8; 3], false).unwrap();
         let geom = Geometry {
             cols: 1,
             rows: 1,
@@ -97,12 +100,28 @@ mod tests {
         assert!(new_at < old_at);
     }
     #[test]
+    fn rgb_and_rgba_have_distinct_format_headers() {
+        for (alpha, bytes, format) in [(false, 3, "f=24"), (true, 4, "f=32")] {
+            let frame = encode_pixels(&vec![0u8; bytes], alpha).unwrap();
+            let geom = Geometry {
+                cols: 1,
+                rows: 1,
+                width: 1,
+                height: 1,
+            };
+            let mut output = Vec::new();
+            send(&mut output, 100, &frame, geom).unwrap();
+            let txt = String::from_utf8(output).unwrap();
+            assert!(txt.contains(format));
+        }
+    }
+    #[test]
     fn encodes_valid_chunked_kitty_sequence() {
         // Incompressible enough to require many 4096-byte chunks.
         let pixels: Vec<u8> = (0..300u64 * 400 * 4)
             .map(|i| ((i.wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 12) & 255) as u8)
             .collect();
-        let frame = encode_rgba(&pixels).unwrap();
+        let frame = encode_pixels(&pixels, true).unwrap();
         let geom = Geometry {
             cols: 20,
             rows: 10,

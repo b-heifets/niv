@@ -268,6 +268,23 @@ impl Layers {
         }
     }
 
+    /// Region label at the cursor, even when a precomputed outline needs a
+    /// separate solid label volume. Unlabeled background is None.
+    pub fn atlas_id_at(&self, axis: Axis, slice: usize, h: usize, v: usize) -> Option<i32> {
+        let atlas = self.atlas.as_ref()?;
+        let labels = if atlas.wireframe {
+            atlas.labels.as_ref()?
+        } else {
+            &atlas.vol
+        };
+        let id = label_id(labels.sample(axis, slice, h, v));
+        if id > 0 {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     pub fn region_details(
         &self,
         axis: Axis,

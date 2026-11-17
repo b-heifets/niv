@@ -152,38 +152,52 @@ mod tests {
     }
 }
 
-/// Straight-alpha source-over compositing, including a truly transparent base.
-/// Kitty f=32 preserves the terminal background wherever all layers are absent.
+/// Composite layers in RAM. RGB: blend against black, then send Kitty f=24.
+/// RGBA: preserve accumulated alpha for true terminal-background transparency.
+/// The display-minimum threshold excludes voxels in BOTH formats.
 #[inline]
 fn blend_pixel(dst: &mut [u8], color: [u8; 3], alpha: f32) {
     let alpha = alpha.clamp(0.0, 1.0);
     if alpha <= 0.0 {
         return;
     }
-    let previous = dst[3] as f32 / 255.0;
-    let combined = alpha + previous * (1.0 - alpha);
-    if combined <= 0.0 {
-        return;
+    if dst.len() == 3 {
+        // Opaque black canvas: source-over blending with no alpha channel.
+        for channel in 0..3 {
+            dst[channel] = (color[channel] as f32 * alpha + dst[channel] as f32 * (1.0 - alpha))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    } else {
+        // Straight (unassociated) alpha: no premultiplication in Kitty payload.
+        let previous = dst[3] as f32 / 255.0;
+        let combined = alpha + previous * (1.0 - alpha);
+        if combined <= 0.0 {
+            return;
+        }
+        for channel in 0..3 {
+            dst[channel] = ((color[channel] as f32 * alpha
+                + dst[channel] as f32 * previous * (1.0 - alpha))
+                / combined)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+        dst[3] = (combined * 255.0).round() as u8;
     }
-    for channel in 0..3 {
-        let value = (color[channel] as f32 * alpha
-            + dst[channel] as f32 * previous * (1.0 - alpha))
-            / combined;
-        dst[channel] = value.round().clamp(0.0, 255.0) as u8;
-    }
-    dst[3] = (combined * 255.0).round() as u8;
 }
 
-/// Bottom image, additional images, then the atlas topmost. All images must
-/// share the same voxel grid; threshold is strictly > display minimum.
-pub fn composite(
+/// Bottom image, overlays in load order, and atlas last. All layers use the
+/// same registration grid; no image is resized independently of the others.
+pub fn composite_format(
     vol: &Volume,
     app: &App,
     layers: &crate::layers::Layers,
     width: usize,
     height: usize,
+    transparent_background: bool,
 ) -> Vec<u8> {
-    let mut rgba = vec![0u8; width * height * 4];
+    let channels = if transparent_background { 4 } else { 3 };
+    let mut raster = vec![0u8; width * height * channels];
     let (sw, sh, _) = vol.plane(app.axis);
     let swapped = app.rotation % 180 != 0;
     let ow = if swapped { sh } else { sw };
@@ -208,7 +222,6 @@ pub fn composite(
             }
         })
         .collect();
-    // Cache NIfTI coordinates once per output pixel, not per layer.
     let coords: Vec<(usize, usize)> = (0..height)
         .flat_map(|y| {
             let horizontal = &horizontal;
@@ -217,7 +230,7 @@ pub fn composite(
                 .map(move |x| inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation))
         })
         .collect();
-    for (px, &(h, v)) in rgba.chunks_exact_mut(4).zip(coords.iter()) {
+    for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
         let value = vol.sample(app.axis, app.index, h, v);
         if !value.is_finite() || value <= app.window.0 {
             continue;
@@ -233,7 +246,7 @@ pub fn composite(
                 continue;
             }
             let (lo, hi) = layer.window;
-            for (px, &(h, v)) in rgba.chunks_exact_mut(4).zip(coords.iter()) {
+            for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
                 let value = layer.vol.sample(app.axis, app.index, h, v);
                 if !value.is_finite() || value <= lo {
                     continue;
@@ -247,15 +260,58 @@ pub fn composite(
         if let Some(atlas) = &layers.atlas {
             if atlas.opacity > 0.0 {
                 if atlas.wireframe {
-                    for (px, &(h, v)) in rgba.chunks_exact_mut(4).zip(coords.iter()) {
+                    for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
                         let id =
                             crate::layers::label_id(atlas.vol.sample(app.axis, app.index, h, v));
                         if id > 0 {
                             blend_pixel(px, atlas.color(id), atlas.opacity);
                         }
                     }
+                    // A precomputed binary outline has no region IDs at filled
+                    // voxels. When companion labels exist, enlarge only those
+                    // visible wireframe pixels belonging to the hovered region.
+                    if let Some(selected) = app.highlighted_region {
+                        if selected > 0 && atlas.labels.is_some() {
+                            let mut marks = Vec::new();
+                            for (idx, &(h, v)) in coords.iter().enumerate() {
+                                let id = crate::layers::label_id(
+                                    atlas.vol.sample(app.axis, app.index, h, v),
+                                );
+                                if id == 0 {
+                                    continue;
+                                }
+                                let label = atlas
+                                    .labels
+                                    .as_ref()
+                                    .map(|labels| {
+                                        crate::layers::label_id(
+                                            labels.sample(app.axis, app.index, h, v),
+                                        )
+                                    })
+                                    .unwrap_or(id);
+                                if label == selected {
+                                    marks.push(idx);
+                                }
+                            }
+                            for idx in marks {
+                                let x = (idx % width) as i32;
+                                let y = (idx / width) as i32;
+                                paint(
+                                    &mut raster,
+                                    width,
+                                    height,
+                                    channels,
+                                    x,
+                                    y,
+                                    atlas.color(selected),
+                                    3,
+                                    atlas.opacity,
+                                );
+                            }
+                        }
+                    }
                 } else {
-                    draw_atlas_edges(&mut rgba, width, height, app, atlas, sw, sh);
+                    draw_atlas_edges(&mut raster, width, height, channels, app, atlas, sw, sh);
                 }
             }
         }
@@ -263,11 +319,23 @@ pub fn composite(
     if app.inspect_mode {
         if let Some((h, v)) = app.probe {
             if h < sw && v < sh {
-                draw_inspector_mark(&mut rgba, width, height, app, sw, sh, h, v);
+                draw_inspector_mark(&mut raster, width, height, channels, app, sw, sh, h, v);
             }
         }
     }
-    rgba
+    raster
+}
+
+/// Retained for tests and compatibility; the interactive path selects RGB/RGBA.
+#[cfg(test)]
+pub fn composite(
+    vol: &Volume,
+    app: &App,
+    layers: &crate::layers::Layers,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    composite_format(vol, app, layers, width, height, true)
 }
 
 /// Inverse display mapping. The exact same mapping as the grayscale raster.
@@ -343,6 +411,7 @@ fn paint(
     rgba: &mut [u8],
     width: usize,
     height: usize,
+    channels: usize,
     x: i32,
     y: i32,
     color: [u8; 3],
@@ -353,8 +422,8 @@ fn paint(
     for yy in y - neg..y - neg + thick as i32 {
         for xx in x - neg..x - neg + thick as i32 {
             if xx >= 0 && yy >= 0 && (xx as usize) < width && (yy as usize) < height {
-                let off = (yy as usize * width + xx as usize) * 4;
-                blend_pixel(&mut rgba[off..off + 4], color, opacity);
+                let off = (yy as usize * width + xx as usize) * channels;
+                blend_pixel(&mut rgba[off..off + channels], color, opacity);
             }
         }
     }
@@ -364,6 +433,7 @@ fn draw_face(
     rgb: &mut [u8],
     width: usize,
     height: usize,
+    channels: usize,
     app: &App,
     sw: usize,
     sh: usize,
@@ -377,11 +447,11 @@ fn draw_face(
     let (x1, y1) = project(app, q.0, q.1, sw, sh, width, height);
     if x0 == x1 {
         for y in y0.min(y1)..=y0.max(y1) {
-            paint(rgb, width, height, x0, y, color, thick, opacity);
+            paint(rgb, width, height, channels, x0, y, color, thick, opacity);
         }
     } else {
         for x in x0.min(x1)..=x0.max(x1) {
-            paint(rgb, width, height, x, y0, color, thick, opacity);
+            paint(rgb, width, height, channels, x, y0, color, thick, opacity);
         }
     }
 }
@@ -419,6 +489,7 @@ fn draw_inspector_mark(
     rgb: &mut [u8],
     width: usize,
     height: usize,
+    channels: usize,
     app: &App,
     sw: usize,
     sh: usize,
@@ -429,12 +500,32 @@ fn draw_inspector_mark(
     let x = x.round() as i32;
     let y = y.round() as i32;
     for d in -4..=4 {
-        paint(rgb, width, height, x + d, y, [0, 0, 0], 3, 1.0);
-        paint(rgb, width, height, x, y + d, [0, 0, 0], 3, 1.0);
+        paint(rgb, width, height, channels, x + d, y, [0, 0, 0], 3, 1.0);
+        paint(rgb, width, height, channels, x, y + d, [0, 0, 0], 3, 1.0);
     }
     for d in -3..=3 {
-        paint(rgb, width, height, x + d, y, [255, 255, 255], 1, 1.0);
-        paint(rgb, width, height, x, y + d, [255, 255, 255], 1, 1.0);
+        paint(
+            rgb,
+            width,
+            height,
+            channels,
+            x + d,
+            y,
+            [255, 255, 255],
+            1,
+            1.0,
+        );
+        paint(
+            rgb,
+            width,
+            height,
+            channels,
+            x,
+            y + d,
+            [255, 255, 255],
+            1,
+            1.0,
+        );
     }
 }
 
@@ -442,6 +533,7 @@ fn draw_atlas_edges(
     rgb: &mut [u8],
     width: usize,
     height: usize,
+    channels: usize,
     app: &App,
     atlas: &crate::layers::Atlas,
     sw: usize,
@@ -462,18 +554,32 @@ fn draw_atlas_edges(
                 label_id(atlas.vol.sample(app.axis, app.index, h, v))
             };
             if left != right && (left != 0 || right != 0) {
-                let id = if right != 0 { right } else { left };
+                let highlighted = app
+                    .highlighted_region
+                    .is_some_and(|id| id == left || id == right);
+                let id = if highlighted {
+                    app.highlighted_region.unwrap_or(right)
+                } else if right != 0 {
+                    right
+                } else {
+                    left
+                };
                 draw_face(
                     rgb,
                     width,
                     height,
+                    channels,
                     app,
                     sw,
                     sh,
                     (h, v),
                     (h, v + 1),
                     atlas.color(id),
-                    atlas.width,
+                    if highlighted {
+                        atlas.width.max(3)
+                    } else {
+                        atlas.width
+                    },
                     atlas.opacity,
                 );
             }
@@ -493,18 +599,32 @@ fn draw_atlas_edges(
                 label_id(atlas.vol.sample(app.axis, app.index, h, v))
             };
             if low != high && (low != 0 || high != 0) {
-                let id = if high != 0 { high } else { low };
+                let highlighted = app
+                    .highlighted_region
+                    .is_some_and(|id| id == low || id == high);
+                let id = if highlighted {
+                    app.highlighted_region.unwrap_or(high)
+                } else if high != 0 {
+                    high
+                } else {
+                    low
+                };
                 draw_face(
                     rgb,
                     width,
                     height,
+                    channels,
                     app,
                     sw,
                     sh,
                     (h, v),
                     (h + 1, v),
                     atlas.color(id),
-                    atlas.width,
+                    if highlighted {
+                        atlas.width.max(3)
+                    } else {
+                        atlas.width
+                    },
                     atlas.opacity,
                 );
             }
@@ -567,6 +687,33 @@ mod layer_tests {
         );
     }
     #[test]
+    fn rgb_mode_blends_overlays_but_uses_opaque_black_for_empty_voxels() {
+        let base = volume(vec![0., 10., 10.]);
+        let top = volume(vec![0., 0., 5.]);
+        let layers = Layers {
+            overlays: vec![IntensityOverlay {
+                vol: top,
+                window: (0., 10.),
+                default_window: (0., 10.),
+                data_range: (0., 5.),
+                palette: crate::layers::Palette::Solid([255, 0, 0]),
+                visible: true,
+                opacity: 0.5,
+                name: "top".into(),
+            }],
+            atlas: None,
+        };
+        let app = App::new(Axis::Z, 0, 1, 0, (0., 10.), "base".into());
+        let rgb = composite_format(&base, &app, &layers, 3, 1, false);
+        assert_eq!(rgb.len(), 9);
+        assert_eq!(&rgb[..3], &[0, 0, 0]);
+        assert_eq!(&rgb[3..6], &[255, 255, 255]);
+        assert_eq!(&rgb[6..9], &[255, 128, 128]);
+        let rgba = composite_format(&base, &app, &layers, 3, 1, true);
+        assert_eq!(&rgba[..4], &[0, 0, 0, 0]);
+        assert_eq!(&rgba[8..12], &[255, 128, 128, 255]);
+    }
+    #[test]
     fn base_and_overlay_below_threshold_leave_transparent_alpha() {
         let base = volume(vec![0.0, 1.0, 2.0]);
         let mut app = App::new(Axis::Z, 0, 1, 0, (0., 2.), "test".into());
@@ -598,6 +745,36 @@ mod layer_tests {
         let pixels = composite(&base, &app, &layers, 3, 1);
         assert_eq!(&pixels[..4], &[120, 200, 250, 128]);
         assert_eq!(&pixels[4..8], &[0, 0, 0, 0]);
+    }
+    #[test]
+    fn hovered_region_gets_thicker_edges_without_changing_other_pixels() {
+        let base = volume(vec![0., 0., 0.]);
+        let atlas = volume(vec![3., 3., 4.]);
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: atlas,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 0, 255],
+                width: 1,
+                opacity: 1.0,
+                regions: HashMap::new(),
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        let normal = composite_format(&base, &app, &layers, 30, 10, false);
+        app.highlighted_region = Some(3);
+        let highlighted = composite_format(&base, &app, &layers, 30, 10, false);
+        // The edge x=20 between labels 3 and 4 grows to x=19 when selected.
+        assert_eq!(
+            &normal[(5 * 30 + 19) * 3..(5 * 30 + 19) * 3 + 3],
+            &[0, 0, 0]
+        );
+        assert_eq!(
+            &highlighted[(5 * 30 + 19) * 3..(5 * 30 + 19) * 3 + 3],
+            &[255, 0, 255]
+        );
     }
     #[test]
     fn boundaries_project_to_faces_not_voxel_centers() {

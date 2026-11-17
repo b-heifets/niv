@@ -18,6 +18,8 @@ pub struct Config {
     pub initial_slice: Option<usize>,
     pub step: usize,
     pub base_opacity: f32,
+    pub transparent_background: bool,
+    pub hover_delay_ms: u64,
     pub atlas_opacity: f32,
     pub rotation: u16,
     pub window: Option<(f32, f32)>,
@@ -37,7 +39,7 @@ pub struct Config {
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE.nii.gz [--overlay FILE] [--atlas FILE] [--lut FILE]
 Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
-Keys: arrows/wheel slices · 1–9 select · e range · o opacity · O atlas opacity · n load · ? help
+Keys: arrows/wheel slices · b RGB/RGBA · 1–9 select · e range · o opacity · n load · ? help
 Use --help for full options and controls.
 "#;
 
@@ -53,6 +55,10 @@ VIEW
       --step N           Starting slice stride (default 1)
   -w, --window MIN,MAX  Initial display range (default finite voxel min,max)
       --opacity 0..1    Base image opacity (default 1)
+      --background black|transparent  Kitty pixel format (default black/RGB;
+                       NIV_BACKGROUND may set the default; b toggles in TUI)
+      --hover-delay-ms N  Idle milliseconds before highlighting a hovered atlas
+                       region (default 150; NIV_HOVER_DELAY_MS; 0 disables highlight)
       --fps N            Maximum redraw FPS (default 30)
       --mouse-pixels     Request high-precision SGR 1016 mouse events
       --no-enhanced-keys Disable Kitty enhanced keyboard mode
@@ -73,7 +79,8 @@ LAYERS AND ATLAS
 
 NAVIGATION
   arrows/hjkl or mouse wheel  Move slices (in inspection mode, arrows move probe)
-  Shift ×2 · Ctrl ×3 · Alt/Option ×4; [ and ] change stride by one
+  Cmd ×2 (if forwarded) · Shift ×3 · Ctrl ×4 · Alt/Option ×2 fallback
+  [ and ] change stride by one
   PgUp / PgDn              Move ±25 slices; Home / End first / last
   x / y / z                Slice axes; r / R rotate clockwise/counterclockwise
   f / v                    Flip horizontal / vertical; Tab image-only mode
@@ -87,7 +94,7 @@ LAYERS
   m / M                    Edit only min / max; 0 reset to data min,max
   c                        Gray → warm → cool → categorical palette
   o / O                    Type selected image / atlas opacity (0..1)
-  a                        Toggle atlas outlines
+  a                        Toggle atlas outlines; b toggle black/transparent background
   + / -                    Narrow / widen selected display range
   , / .                    Shift selected display range down / up
   ? or /                   Toggle help panel; I opens volume information
@@ -99,7 +106,8 @@ EXAMPLES
   niv mean_IF.nii.gz --atlas other.nii.gz --overlay zstat.nii.gz --overlay-window 2,6
 
 Atlas and intensity overlays require identical voxel grids; no affine reorientation
-or resampling is performed. Alpha transparency uses Kitty RGBA (f=32).
+or resampling is performed. Image-layer threshold transparency and opacity
+work in both modes; transparent terminal background requires Kitty RGBA (f=32).
 "#;
 
 pub fn parse() -> Result<Option<Config>> {
@@ -115,6 +123,13 @@ pub fn parse() -> Result<Option<Config>> {
     let mut step = 1;
     let mut window = None;
     let mut base_opacity = 1.0f32;
+    let mut transparent_background =
+        parse_background(&env::var("NIV_BACKGROUND").unwrap_or_else(|_| "black".to_owned()))?;
+    let mut hover_delay_ms = env::var("NIV_HOVER_DELAY_MS")
+        .ok()
+        .map(|v| parse_delay(&v))
+        .transpose()?
+        .unwrap_or(150);
     let mut atlas_opacity = 1.0f32;
     let mut overlays: Vec<OverlaySpec> = Vec::new();
     let mut atlas_path = None;
@@ -175,6 +190,8 @@ pub fn parse() -> Result<Option<Config>> {
                 | "--atlas-labels"
                 | "--atlas-opacity"
                 | "--opacity"
+                | "--background"
+                | "--hover-delay-ms"
         );
         if needs_value {
             let val = if let Some(v) = inline_value {
@@ -195,6 +212,8 @@ pub fn parse() -> Result<Option<Config>> {
                 "-r" | "--rotate" => rotation = parse_rotation(&val)?,
                 "-w" | "--window" => window = Some(parse_window(&val)?),
                 "--opacity" => base_opacity = parse_opacity(&val)?,
+                "--background" => transparent_background = parse_background(&val)?,
+                "--hover-delay-ms" => hover_delay_ms = parse_delay(&val)?,
                 "--atlas-opacity" => atlas_opacity = parse_opacity(&val)?,
                 "--overlay" => overlays.push(OverlaySpec {
                     path: PathBuf::from(val),
@@ -265,6 +284,8 @@ pub fn parse() -> Result<Option<Config>> {
         window,
         base_opacity,
         atlas_opacity,
+        transparent_background,
+        hover_delay_ms,
         overlays,
         atlas_path,
         atlas_wireframe,
@@ -277,6 +298,24 @@ pub fn parse() -> Result<Option<Config>> {
         enhanced_keys,
         benchmark_frames,
     }))
+}
+
+fn parse_background(s: &str) -> Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "black" | "rgb" => Ok(false),
+        "transparent" | "rgba" => Ok(true),
+        _ => bail!("Background must be black or transparent"),
+    }
+}
+
+fn parse_delay(s: &str) -> Result<u64> {
+    let n: u64 = s
+        .parse()
+        .context("Hover delay must be an integer (0..2000 ms)")?;
+    if n > 2000 {
+        bail!("Hover delay must be between 0 and 2000 ms");
+    }
+    Ok(n)
 }
 
 fn parse_opacity(s: &str) -> Result<f32> {
@@ -346,6 +385,16 @@ mod tests {
         assert!(parse_color("white").is_err());
         assert_eq!(parse_opacity(".5").unwrap(), 0.5);
         assert!(parse_opacity("1.5").is_err());
+    }
+    #[test]
+    fn background_and_delay() {
+        assert!(!parse_background("black").unwrap());
+        assert!(parse_background("RGBA").unwrap());
+        assert!(parse_background("transParent").unwrap());
+        assert!(parse_background("other").is_err());
+        assert_eq!(parse_delay("150").unwrap(), 150);
+        assert_eq!(parse_delay("0").unwrap(), 0);
+        assert!(parse_delay("2001").is_err());
     }
     #[test]
     fn test_rotation() {

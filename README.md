@@ -1,109 +1,101 @@
-# niv
+# niv v0.8
 
-Fast keyboard-driven 3D NIfTI slice viewer for Kitty graphics terminals, including Ghostty and Rex. This v0.7 source release adds true RGBA transparency, independent image and atlas opacity, runtime overlays, and help/info panels.
+Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
-**Build status:** source and test-data structure were checked, but this release has not yet been compiled or interactively tested in a Kitty terminal here. Run the commands below on macOS.
-
-## Build
+## Install / upgrade
 
 ```bash
 cd ~/Documents/_GitHub/niv
-cargo fmt --check
+# Extract v0.8 source-only update into this directory, or apply the patch if it fits your checkout.
+cargo fmt
 cargo test
 cargo install --path . --force
+niv --version       # v0.8.0
 ```
 
-For a transmission-free render benchmark:
+The full project ZIP contains `niv-rust/` as its top-level directory. The source-only ZIP contains `src/`, `Cargo.toml`, and `README.md` directly, ready to extract into your repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
+
+## Viewer
 
 ```bash
-niv data/sample.nii.gz --bench 50
+niv brain.nii.gz                           # defaults to --axis x --rotate 90
+niv brain.nii.gz --overlay activation.nii.gz
+niv brain.nii.gz --background transparent # start in RGBA mode
+niv brain.nii.gz --hover-delay-ms 250       # delay before thicker hovered-region contour
 ```
 
-## Quick start
+The screen has a colored region name at the upper left, a small `?` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers, while `I` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity/path editors temporarily appear at the bottom.
 
-```bash
-niv image.nii.gz                                # default: --axis x --rotate 90
-niv image.nii.gz --atlas other_atlas.nii.gz
-niv image.nii.gz --overlay activation.nii.gz
-```
+### Keys
 
-Set defaults in `~/.zshrc` (paths are examples; change them to match your computer):
+| Key | Function |
+| --- | --- |
+| `↑↓←→`, `hjkl`, mouse wheel | Scroll volume slices |
+| Command + direction | ×2 where Rex/terminal forwards Command |
+| Shift + direction | ×3 |
+| Control + direction | ×4 |
+| Option/Alt + direction | ×2 fallback for Command |
+| `[` / `]` | Decrease/increase base stride by one |
+| `b` | Toggle **black/RGB** ↔ **transparent/RGBA** background |
+| `a` | Toggle atlas outlines |
+| `?` or `/` | Popup keyboard help |
+| `I` | Metadata and full layer names |
+| `n` | Load another registered image below the atlas |
+| `1`–`9`; `;` | Select layer; cycle beyond nine layers |
+| `e`, `m`, `M` | Edit selected-layer range / only min / only max |
+| `0` | Reset range to actual finite min/max |
+| `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
+| `c` | Cycle gray → warm → cool → categorical integer-ID palette |
+| `t` | Show/hide layer list |
+| Space | Toggle selected overlay visibility |
+| `i` | Keyboard inspection crosshair (arrows move probe) |
+| `x`,`y`,`z` | Change array slicing axis |
+| `r`,`R` | Rotate clockwise / counterclockwise |
+| `f`,`v` | Flip horizontally / vertically |
+| Tab | Hide/show viewer text, fill terminal |
+| `q` | Quit (Esc dismisses popup/editor) |
+
+**Important:** Command/Super may be reserved by Ghostty, Rex, or the OS and not arrive as a terminal key modifier. Option/Alt has the same ×2 mapping as a fallback. Shift/Ctrl/Option support likewise depends on which input sequences your Rex client forwards.
+
+### How backgrounds, thresholds and opacity work
+
+**Black / RGB (default)**: Each NIfTI layer is composited into an opaque black RGB canvas **in memory**. Values at/below a layer's display minimum are skipped, so that they reveal lower layers. Partial image/atlas opacity blends with lower layers (or black). Final empty voxels are black. The terminal receives Kitty `f=24` compressed RGB bytes (3 channels/pixel).
+
+**Transparent / RGBA (`b`)**: Layers are composited in memory using straight alpha, with empty voxels remaining transparent. The terminal receives Kitty `f=32` (4 channels/pixel), allowing the Ghostty background to appear through empty pixels. Per-layer opacity and threshold behavior are the same in both modes. True final-terminal transparency requires RGBA, but **multiple-layer transparency does not**.
+
+`NIV_BACKGROUND=black|transparent` or `--background black|transparent` sets the startup mode. Black is the faster default. Performance can differ due to compression ratios and terminal/Rex transmission; it is **not guaranteed** to be exactly 25% faster.
+
+### Hovered-region highlight
+
+With a **solid** atlas, entering a labeled region starts a short delay. If the pointer remains in that region past the delay, its contours are drawn thicker (3px) while other regions retain their usual outline thickness. Hover events *before* the delay only update the text line; they do not re-transmit the image. Moving between voxels of the same region does not restart the timer.
+
+Use `NIV_HOVER_DELAY_MS=150` (default) or `--hover-delay-ms 150` to tune, 0–2000 ms; `0` disables the highlight. The thicker outline needs one full redraw when the region changes. For precomputed wireframe outlines, thickening requires companion solid labels (`--atlas-labels`); without them, the outline is unchanged. A keyboard probe remains available with `i` if iOS Rex does not forward mouse-move events.
+
+### Environment variables
 
 ```zsh
 export ATLAS="$HOME/Documents/__Heifets_lab_data/_UNRAVEL/atlases/CCFv3-2020/30um/atlas_CCFv3_2020_30um.nii.gz"
 export ATLAS_LUT="$HOME/Documents/_GitHub/UNRAVEL/unravel/core/csvs/CCFv3-2020_regional_summary.csv"
+export NIV_BACKGROUND=black
+export NIV_HOVER_DELAY_MS=150
 ```
 
-`--atlas` or `--atlas-wireframe` overrides `$ATLAS`; `--lut` overrides `$ATLAS_LUT`. The atlas must have the same voxel grid as the base image. If this isn't the case, resample externally; `niv` does **not** resample or anatomically reorient images yet.
+CLI `--atlas` / `--atlas-wireframe` and `--lut` override the environment. `--axis x --rotate 90` are defaults. Image and atlas NIfTI files must share identical dimensions, voxel spacing, and sform (when present); no resampling/reorientation is performed.
 
-The help commands are deliberately different: `niv -h` prints a short guide, while `niv --help` prints comprehensive options and keybindings.
-
-## Default display
-
-The viewer shows one bold, CCF-LUT-colored region line above the image (no `Atlas:` prefix). The region under the mouse/crosshair is shown, or the middle voxel if no probe is active. Below the image is the selected intensity layer, its editable min/max display range, and its opacity; the next line shows voxel coordinates and each layer's original intensities (7 decimal places). Only a dim `? help` hint remains at the bottom.
-
-The image and status text are horizontally aligned. Press `Tab` for image-only mode. Press `?` or `/` for a centered help sheet, or `I` for metadata (dimensions, voxel spacing, NIfTI datatype, exact data range, layer metadata, atlas state). The sheet temporarily hides the graphics placement to remain readable in terminal multiplexers; `Esc` restores the image.
-
-### Common keys
-
-| Key | Action |
-| --- | --- |
-| arrows, `hjkl`, wheel/two-finger trackpad | Scroll slices |
-| Shift / Ctrl / Alt + direction | ×2 / ×3 / ×4 |
-| `[` / `]` | Decrease / increase stride by 1 |
-| `1`–`9` | Select image layer (1 = base) |
-| `;` | Cycle selected layer, including layers beyond 9 |
-| `e` | Enter selected image display `min,max` |
-| `m` / `M` | Enter display minimum / maximum |
-| `0` | Reset range to full finite data min/max |
-| `o` | Enter selected image opacity from 0 to 1 |
-| `O` | Enter atlas opacity from 0 to 1 |
-| `a` | Toggle atlas |
-| `n` | Enter another NIfTI image path; load below atlas |
-| `Space` | Toggle selected overlay |
-| `c` | Cycle gray → warm → cool → categorical palette |
-| `t` | Toggle layer list |
-| `Tab` | Image-only / normal view |
-| `?` or `/` | Open/close help |
-| `I` | Open/close volume information |
-| `i` | Keyboard voxel inspector |
-| `q` | Quit |
-
-The help sheet includes additional keys (`r/R`, `x/y/z`, `f/v`, contrast and brightness). While an editor is open, `Enter` confirms and `Esc` cancels. For `n`, enter a plain file path (relative to current directory, absolute, or starting `~/`); shell auto-completion isn't implemented.
-
-## Image and atlas rendering
-
-- The base volume and every overlay are decoded once, retained as `f32` in RAM, and sampled nearest-neighbor.
-- The **default display range is the exact finite data min/max**, including zero and negative values. For constant-valued images the window is widened by 0.5 on either side to remain valid.
-- Voxels with intensity **at or below the selected display minimum are fully transparent** for the base and for all overlays, regardless of palette. This is real Kitty RGBA (`f=32`), not painting a solid background. Above minimum, image opacity is constant; colors are clipped at maximum.
-- Layer order is base → overlays in loading order → atlas. Atlas wireframe is always on top. `o` edits the selected image opacity, `O` the atlas opacity.
-- The **categorical** color scale maps each *rounded integer intensity* deterministically to its own saturated hue. It is designed for cluster IDs/label maps, **not** smooth scalar data; distinct integers produce stable hues across slices and layers.
-- Gray scales from black to white; warm from red to yellow; cool from blue to cyan. `c` cycles these followed by categorical. A custom `--overlay-color RRGGBB` begins in fixed-tint mode.
-- Atlas colors and region text come from the UNRAVEL CCFv3-2020 LUT (`Region_ID,Region,Abbr,R,G,B`). Solid atlas contours are generated from neighboring labels at voxel faces. `--atlas-wireframe` supports precomputed masks, and `--atlas-labels` allows accurate region lookup in that case.
-- Hovering updates only the text inspector. If iOS Rex cannot forward hover, press `i` and move the probe with arrow keys. Mouse wheel/trackpad scrolling requires wheel events to be forwarded by the terminal and Rex.
-- Raw `f32` intensities are shown with seven decimal places; this is display formatting, **not** a guarantee of seven-digit precision in source data that were stored at lower precision or converted from float64.
-
-## CLI examples
+### Benchmark RGB vs RGBA
 
 ```bash
-# Atlas and LUT from environment (defaults x axis, 90° rotation)
-niv mean_IF.nii.gz
-
-# Atlas from CLI, plus colored overlays
-niv mean_IF.nii.gz \
-  --overlay positive.nii.gz --overlay-window 2,6 --overlay-color ff3333 \
-  --overlay negative.nii.gz --overlay-window 2,6 --overlay-color 2288ff \
-  --atlas labels.nii.gz --lut CCFv3-2020_regional_summary.csv
-
-# Initial transparency from command line
-niv mean_IF.nii.gz --opacity .75 --atlas-opacity .6
-
-# UI-free benchmark
-niv mean_IF.nii.gz --bench 100
+niv data/sample.nii.gz --background black --bench 100
+niv data/sample.nii.gz --background transparent --bench 100
 ```
 
-The included `data/sample.nii.gz`, `data/demo_atlas.nii.gz`, `data/demo_activation.nii.gz`, and `data/demo_lut.csv` are aligned synthetic test inputs. The full CCFv3 LUT is **not bundled**.
+`--bench` reports **rasterization plus zlib encoding without terminal transmission**. Compare with actual scrolling through local and remote Rex to find whether CPU rendering, encoded bytes, or terminal transfer is the bottleneck. The application is currently CPU-rendered; it does **not** use multi-threading or a GPU. For the current CPU/Kitty pipeline, avoiding alpha bytes and unnecessary redraws is a low-complexity optimization worth testing before a GPU rewrite.
 
-## Limitations
+## Limits
 
-This is a terminal prototype, not an affine-aware anatomical viewer. NIfTI data are converted to `f32`, so `float64` inputs lose some precision. Both terminal/Rex Kitty RGBA support and interactive mouse/trackpad behavior must be tested on your specific clients. Image loading through `n` is synchronous (there may be a pause for a large `.nii.gz`). The centered help/info sheet temporarily hides the image rather than compositing text above it, to avoid Kitty z-order incompatibilities in multiplexers. The non-vector voxel boundary appearance is unchanged.
+- `float64` NIfTI data are converted to `f32` (hover shows seven *decimal places*, not guaranteed seven significant digits of source precision).
+- True transparent pixels require Kitty RGBA support in the terminal/Rex client. Image opacity works in RGB mode too, but with black as the final background.
+- The mouse hover outline is a rasterized 3-pixel contour, not a vector curve. Region contour topology remains voxel-accurate.
+- Runtime `n` image loading and `.nii.gz` decompression are synchronous; loading large files can briefly block the UI.
+- Hover events, Command modifier events and pixel-mouse tracking are client-dependent.
+- `cargo test` and interactive visual testing should be run locally; this source distribution was assembled where Rust's toolchain was unavailable.

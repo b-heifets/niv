@@ -36,6 +36,8 @@ pub struct App {
     pub default_window: (f32, f32),
     pub base_palette: Palette,
     pub base_opacity: f32,
+    pub transparent_background: bool,
+    pub highlighted_region: Option<i32>,
     pub path: String,
     pub atlas_name: Option<String>,
     pub selected: usize, // 0 = base; subsequent indices = overlay layers
@@ -80,6 +82,8 @@ impl App {
             default_window: window,
             base_palette: Palette::Gray,
             base_opacity: 1.0,
+            transparent_background: false,
+            highlighted_region: None,
             path,
             atlas_name: None,
             selected: 0,
@@ -176,11 +180,11 @@ impl App {
     }
 
     pub fn multiplier(m: KeyModifiers, uppercase: bool) -> usize {
-        if m.contains(KeyModifiers::ALT) {
+        if m.contains(KeyModifiers::CONTROL) {
             4
-        } else if m.contains(KeyModifiers::CONTROL) {
-            3
         } else if m.contains(KeyModifiers::SHIFT) || uppercase {
+            3
+        } else if m.intersects(KeyModifiers::SUPER | KeyModifiers::ALT) {
             2
         } else {
             1
@@ -433,6 +437,10 @@ impl App {
                 self.show_atlas = !self.show_atlas;
                 Action::Redraw
             }
+            KeyCode::Char('b') => {
+                self.transparent_background = !self.transparent_background;
+                Action::Redraw
+            }
             KeyCode::Char('x') => {
                 self.set_axis(vol, Axis::X);
                 Action::Redraw
@@ -613,7 +621,7 @@ mod tests {
             KeyCode::Char('H'),
             KeyModifiers::SHIFT,
         );
-        assert_eq!(app.index, 49); // shift -2
+        assert_eq!(app.index, 48); // shift -3
         key(
             &mut app,
             &vol,
@@ -621,7 +629,7 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::CONTROL,
         );
-        assert_eq!(app.index, 52); // control +3
+        assert_eq!(app.index, 52); // control +4
         key(
             &mut app,
             &vol,
@@ -629,7 +637,15 @@ mod tests {
             KeyCode::Left,
             KeyModifiers::ALT,
         );
-        assert_eq!(app.index, 48); // alt -4
+        assert_eq!(app.index, 50); // alt -2
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Right,
+            KeyModifiers::SUPER,
+        );
+        assert_eq!(app.index, 52); // Command +2 when forwarded
         key(
             &mut app,
             &vol,
@@ -662,6 +678,14 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert!(!app.show_atlas);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        );
+        assert!(app.transparent_background);
         key(
             &mut app,
             &vol,
