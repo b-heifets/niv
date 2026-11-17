@@ -28,12 +28,15 @@ pub struct Config {
     pub atlas_wireframe: bool,
     pub atlas_color: [u8; 3],
     pub atlas_width: usize,
+    pub atlas_aa: bool,
     pub atlas_labels_path: Option<PathBuf>,
     pub mouse_pixels: bool,
     pub lut_path: Option<PathBuf>,
     pub max_fps: u32,
     pub enhanced_keys: bool,
     pub benchmark_frames: Option<usize>,
+    pub pixel_budget: usize,
+    pub profile: bool,
 }
 
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
@@ -58,8 +61,12 @@ VIEW
       --background black|transparent  Kitty pixel format (default black/RGB;
                        NIV_BACKGROUND may set the default; b toggles in TUI)
       --hover-delay-ms N  Idle milliseconds before highlighting a hovered atlas
-                       region (default 150; NIV_HOVER_DELAY_MS; 0 disables highlight)
-      --fps N            Maximum redraw FPS (default 30)
+                       region (default 20ms; NIV_HOVER_DELAY_MS; 0 disables highlight)
+      --fps N            Maximum redraw FPS (default 30; NIV_FPS)
+      --pixel-budget N   Max output raster pixels (default 1000000; 0 = native)
+                       NIV_PIXEL_BUDGET sets the default. Does not affect
+                       the full voxel data loaded or the displayed image area.
+      --profile          Report raster/encode/output timings on exit
       --mouse-pixels     Request high-precision SGR 1016 mouse events
       --no-enhanced-keys Disable Kitty enhanced keyboard mode
       --bench N          Benchmark N frames without a terminal
@@ -76,6 +83,8 @@ LAYERS AND ATLAS
       --atlas-color RRGGBB        Fallback contour color (default white)
       --atlas-opacity 0..1        Atlas opacity (default 1)
       --atlas-width N             Contour width, 1–3 pixels (default 1)
+      --atlas-aa                  Optional subpixel antialiasing of solid-atlas outlines
+                                  (NIV_ATLAS_AA=1; toggle with g; slower than exact)
 
 NAVIGATION
   arrows/hjkl or mouse wheel  Move slices (in inspection mode, arrows move probe)
@@ -88,13 +97,14 @@ NAVIGATION
 
 LAYERS
   1..9                     Select loaded layer; ; cycles selection
-  n                        Type path to load an aligned image
+  n                        Type image path; Tab completes/cycles NIfTI files
   t                        Toggle layer list; Space show/hide selected overlay
   e                        Edit selected layer display min,max
   m / M                    Edit only min / max; 0 reset to data min,max
   c                        Gray → warm → cool → categorical palette
   o / O                    Type selected image / atlas opacity (0..1)
-  a                        Toggle atlas outlines; b toggle black/transparent background
+  a                        Toggle atlas outlines; g antialias solid atlas (optional)
+  b                        Toggle black/transparent background
   + / -                    Narrow / widen selected display range
   , / .                    Shift selected display range down / up
   ? or /                   Toggle help panel; I opens volume information
@@ -129,17 +139,31 @@ pub fn parse() -> Result<Option<Config>> {
         .ok()
         .map(|v| parse_delay(&v))
         .transpose()?
-        .unwrap_or(150);
+        .unwrap_or(20);
     let mut atlas_opacity = 1.0f32;
     let mut overlays: Vec<OverlaySpec> = Vec::new();
     let mut atlas_path = None;
     let mut atlas_wireframe = false;
     let mut atlas_color = [255, 255, 255];
     let mut atlas_width = 1;
+    let mut atlas_aa = matches!(
+        env::var("NIV_ATLAS_AA").ok().as_deref(),
+        Some("1" | "true" | "yes")
+    );
     let mut lut_path = None;
     let mut atlas_labels_path = None;
     let mut mouse_pixels = false;
-    let mut max_fps = 30;
+    let mut max_fps = env::var("NIV_FPS")
+        .ok()
+        .map(|s| parse_range(&s, "NIV_FPS", 1, 120))
+        .transpose()?
+        .unwrap_or(30) as u32;
+    let mut pixel_budget = env::var("NIV_PIXEL_BUDGET")
+        .ok()
+        .map(|s| parse_pixel_budget(&s))
+        .transpose()?
+        .unwrap_or(1_000_000);
+    let mut profile = false;
     let mut enhanced_keys = true;
     let mut benchmark_frames = None;
     while let Some(arg) = args.next() {
@@ -154,6 +178,14 @@ pub fn parse() -> Result<Option<Config>> {
         if arg == "-V" || arg == "--version" {
             println!("niv {}", env!("CARGO_PKG_VERSION"));
             return Ok(None);
+        }
+        if arg == "--profile" {
+            profile = true;
+            continue;
+        }
+        if arg == "--atlas-aa" {
+            atlas_aa = true;
+            continue;
         }
         if arg == "--mouse-pixels" {
             mouse_pixels = true;
@@ -192,6 +224,7 @@ pub fn parse() -> Result<Option<Config>> {
                 | "--opacity"
                 | "--background"
                 | "--hover-delay-ms"
+                | "--pixel-budget"
         );
         if needs_value {
             let val = if let Some(v) = inline_value {
@@ -251,6 +284,7 @@ pub fn parse() -> Result<Option<Config>> {
                 "--lut" => lut_path = Some(PathBuf::from(val)),
                 "--atlas-labels" => atlas_labels_path = Some(PathBuf::from(val)),
                 "--fps" => max_fps = parse_range(&val, flag, 1, 120)? as u32,
+                "--pixel-budget" => pixel_budget = parse_pixel_budget(&val)?,
                 "--bench" => benchmark_frames = Some(parse_range(&val, flag, 1, 10_000)?),
                 _ => unreachable!(),
             }
@@ -291,13 +325,26 @@ pub fn parse() -> Result<Option<Config>> {
         atlas_wireframe,
         atlas_color,
         atlas_width,
+        atlas_aa,
         lut_path,
         atlas_labels_path,
         mouse_pixels,
         max_fps,
         enhanced_keys,
         benchmark_frames,
+        pixel_budget,
+        profile,
     }))
+}
+
+fn parse_pixel_budget(s: &str) -> Result<usize> {
+    let n = s
+        .parse::<usize>()
+        .context("Pixel budget must be an integer (0..10000000)")?;
+    if n > 10_000_000 {
+        bail!("Pixel budget must be between 0 and 10000000");
+    }
+    Ok(n)
 }
 
 fn parse_background(s: &str) -> Result<bool> {
@@ -385,6 +432,12 @@ mod tests {
         assert!(parse_color("white").is_err());
         assert_eq!(parse_opacity(".5").unwrap(), 0.5);
         assert!(parse_opacity("1.5").is_err());
+    }
+    #[test]
+    fn pixel_budget_limits() {
+        assert_eq!(parse_pixel_budget("400000").unwrap(), 400000);
+        assert_eq!(parse_pixel_budget("0").unwrap(), 0);
+        assert!(parse_pixel_budget("10000001").is_err());
     }
     #[test]
     fn background_and_delay() {

@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod kitty;
 mod layers;
+mod path_complete;
 mod render;
 mod volume;
 
@@ -82,6 +83,27 @@ impl Drop for TerminalGuard {
         }
         let _ = execute!(out, Show, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+#[derive(Default)]
+struct FrameStats {
+    frames: usize,
+    raster: Duration,
+    encode: Duration,
+    output: Duration,
+    compressed_bytes: usize,
+}
+impl FrameStats {
+    fn report(&self) -> String {
+        if self.frames == 0 {
+            return "No frames rendered".into();
+        }
+        let n = self.frames as f64;
+        format!("niv profile: {} frames | raster {:.2} ms | encode {:.2} ms | terminal write {:.2} ms | compressed {:.1} KiB/frame\nNote: terminal write excludes asynchronous Rex/Ghostty rendering and network delivery.",
+            self.frames,self.raster.as_secs_f64()*1000.0/n,
+            self.encode.as_secs_f64()*1000.0/n,self.output.as_secs_f64()*1000.0/n,
+            self.compressed_bytes as f64/n/1024.0)
     }
 }
 
@@ -245,18 +267,22 @@ fn draw_ui(
             }
             queue!(
                 out,
-                Print(middle_ellipsis(&label, cols.saturating_sub(x + 3) as usize)),
+                Print(middle_ellipsis(
+                    &label,
+                    cols.saturating_sub(x + 19) as usize
+                )),
                 ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;
         }
     }
-    if cols > 1 {
+    let hint = "Press ? for help";
+    if cols as usize >= hint.len() + 2 {
         queue!(
             out,
-            MoveTo(cols - 2, 0),
+            MoveTo(cols - hint.len() as u16 - 1, 0),
             SetForegroundColor(Color::DarkGrey),
-            Print("?"),
+            Print(hint),
             ResetColor
         )?;
     }
@@ -348,7 +374,16 @@ fn draw_ui(
                 EditField::AddPath => "new overlay path",
             };
             let err = edit.error.as_deref().unwrap_or("");
-            let txt = format!("{what} > {}_  {err}    Enter apply · Esc cancel", edit.text);
+            let hint = edit
+                .completion
+                .as_ref()
+                .map(|m| m.status())
+                .unwrap_or_default();
+            let cols_available = cols.saturating_sub(x) as usize;
+            let hint = middle_ellipsis(&hint, (cols_available / 3).max(12));
+            let overhead = what.chars().count() + err.chars().count() + hint.chars().count() + 24;
+            let shown = middle_ellipsis(&edit.text, cols_available.saturating_sub(overhead).max(8));
+            let txt = format!("{what} > {shown}_  {err}  {hint}    Enter apply · Esc cancel");
             line(
                 out,
                 bottom,
@@ -395,11 +430,13 @@ fn draw_popup(
                     "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
-                    "  n      Load .nii.gz     Space   Toggle selected overlay",
+                    "  n      Load .nii.gz (Tab complete, Shift-Tab back)",
+                    "  Space  Toggle selected overlay",
                     "  e      Edit min,max     m / M   Edit just min / max",
                     "  0      Reset range      c       Cycle color map",
                     "  o      Image opacity    O       Atlas opacity",
-                    "  a      Atlas visible    b       Black / transparent",
+                    "  a      Atlas visible    g       Smooth edge AA (optional)",
+                    "  b      Black / transparent",
                     "  t      Layer list      ?       Help",
                     "  + / -  Contrast         , / .   Brightness",
                     "",
@@ -465,12 +502,17 @@ fn draw_popup(
                     app.atlas_name.as_deref().unwrap_or("(loaded)")
                 ));
                 lines.push(format!(
-                    "Atlas      {:.0}% opacity · {} outline",
+                    "Atlas      {:.0}% opacity · {} outline · antialias {}",
                     atlas.opacity * 100.0,
                     if atlas.wireframe {
                         "wireframe"
                     } else {
                         "solid label"
+                    },
+                    if app.atlas_aa && !atlas.wireframe {
+                        "on"
+                    } else {
+                        "off"
                     }
                 ));
                 lines.push(format!("LUT        {} region colors", atlas.regions.len()));
@@ -579,6 +621,8 @@ fn draw(
     app: &App,
     base_range: (f32, f32),
     frames: &mut FrameState,
+    cache: &mut Option<render::SamplingMap>,
+    stats: &mut FrameStats,
 ) -> Result<ViewLayout> {
     let (cols, rows) = terminal::size()?;
     if app.popup.is_some() {
@@ -610,21 +654,41 @@ fn draw(
         });
     }
     let view = layout(vol, app, layers, cols, rows);
-    let pixels = render::composite_format(
+    let t = Instant::now();
+    if cache
+        .as_ref()
+        .is_none_or(|map| !map.matches(vol, app, view.geom.width, view.geom.height))
+    {
+        *cache = Some(render::SamplingMap::new(
+            vol,
+            app,
+            view.geom.width,
+            view.geom.height,
+        ));
+    }
+    let pixels = render::composite_with_map(
         vol,
         app,
         layers,
-        view.geom.width,
-        view.geom.height,
+        cache.as_ref().unwrap(),
         app.transparent_background,
     );
+    let raster_time = t.elapsed();
+    let t = Instant::now();
     let frame = kitty::encode_pixels(&pixels, app.transparent_background)?;
+    let encode_time = t.elapsed();
+    let t = Instant::now();
     queue!(out, MoveTo(view.x, view.y))?;
     let next = frames.allocate();
     kitty::replace(out, next, &frame, view.geom, frames.active_id)?;
     frames.active_id = Some(next);
     draw_ui(out, vol, layers, app, base_range, view)?;
     out.flush()?;
+    stats.frames += 1;
+    stats.raster += raster_time;
+    stats.encode += encode_time;
+    stats.output += t.elapsed();
+    stats.compressed_bytes += frame.bytes;
     Ok(view)
 }
 
@@ -676,23 +740,25 @@ fn mouse_raster(
     Some(((x / scale).floor() as usize, (y / scale).floor() as usize))
 }
 
+fn window_from_range((lo, hi): (f32, f32)) -> (f32, f32) {
+    if lo < hi {
+        (lo, hi)
+    } else {
+        (lo - 0.5, hi + 0.5)
+    }
+}
+
 fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, count: usize) -> Result<()> {
     let geom = render::geometry(vol, app, 110, 36, 4);
     let start = Instant::now();
+    let map = render::SamplingMap::new(vol, app, geom.width, geom.height);
     let mut rgb_time = Duration::ZERO;
     let mut encode_time = Duration::ZERO;
     let mut compressed = 0;
     for i in 0..count {
         app.index = i * vol.depth(app.axis) / count;
         let t = Instant::now();
-        let pixels = render::composite_format(
-            vol,
-            app,
-            layers,
-            geom.width,
-            geom.height,
-            app.transparent_background,
-        );
+        let pixels = render::composite_with_map(vol, app, layers, &map, app.transparent_background);
         rgb_time += t.elapsed();
         let t = Instant::now();
         compressed += kitty::encode_pixels(&pixels, app.transparent_background)?.bytes;
@@ -725,6 +791,55 @@ fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, count: usize) -> Resu
     Ok(())
 }
 
+/// Drop *already queued* autorepeats of the key whose slice has just
+/// advanced. Without this, an expensive frame can leave dozens of repeats in
+/// Crossterm's queue, causing scrolling to continue long after key release.
+/// Preserve the first different input so a direction change or Quit is never
+/// swallowed. Applies to keyboard navigation only; wheel events retain their
+/// native number of steps, and probe movement remains precise.
+fn is_slice_key(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyEventKind};
+    key.kind != KeyEventKind::Release
+        && matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('h' | 'j' | 'k' | 'l' | 'H' | 'J' | 'K' | 'L')
+        )
+}
+fn same_navigation_key(a: &crossterm::event::KeyEvent, b: &crossterm::event::KeyEvent) -> bool {
+    is_slice_key(a) && a.code == b.code && a.modifiers == b.modifiers
+}
+fn drop_stale_key_repeats(
+    key: crossterm::event::KeyEvent,
+    next_event: &mut Option<Event>,
+) -> Result<usize> {
+    use crossterm::event::KeyEventKind;
+    let mut dropped = 0usize;
+    // Read only events that are already waiting; never block for new repeats.
+    for _ in 0..4096 {
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
+        let evt = event::read()?;
+        match evt {
+            Event::Key(repeated) if same_navigation_key(&key, &repeated) => {
+                if repeated.kind == KeyEventKind::Release {
+                    break;
+                }
+                dropped += 1;
+            }
+            other => {
+                *next_event = Some(other);
+                break;
+            }
+        }
+    }
+    Ok(dropped)
+}
+
 fn run() -> Result<()> {
     let Some(config) = config::parse()? else {
         return Ok(());
@@ -738,8 +853,10 @@ fn run() -> Result<()> {
             vol.depth(config.axis) - 1
         );
     }
-    let window = config.window.unwrap_or_else(|| vol.auto_window());
     let base_range = vol.data_range();
+    let window = config
+        .window
+        .unwrap_or_else(|| window_from_range(base_range));
     let mut layers = Layers::load(&config, &vol)?;
     let name = layers::short_name(&config.path);
     let mut app = App::new(
@@ -750,9 +867,11 @@ fn run() -> Result<()> {
         window,
         name,
     );
+    app.pixel_budget = config.pixel_budget;
+    app.atlas_aa = config.atlas_aa;
     app.base_opacity = config.base_opacity;
     app.transparent_background = config.transparent_background;
-    app.default_window = vol.auto_window();
+    app.default_window = window_from_range(base_range);
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     if let Some(count) = config.benchmark_frames {
         return benchmark(&vol, &layers, &mut app, count);
@@ -763,13 +882,25 @@ fn run() -> Result<()> {
     let _guard = TerminalGuard::enter(config.enhanced_keys, config.mouse_pixels)?;
     let mut out = io::stdout().lock();
     let mut frames = FrameState::new();
+    let mut cache: Option<render::SamplingMap> = None;
+    let mut stats = FrameStats::default();
     queue!(out, Clear(ClearType::All))?;
-    let mut view = draw(&mut out, &vol, &layers, &app, base_range, &mut frames)?;
+    let mut view = draw(
+        &mut out,
+        &vol,
+        &layers,
+        &app,
+        base_range,
+        &mut frames,
+        &mut cache,
+        &mut stats,
+    )?;
     let frame_interval = Duration::from_secs_f64(1.0 / config.max_fps as f64);
     let mut last_draw = Instant::now();
     let mut pending_frame = false;
     let mut pending_ui = false;
     let mut pending_layout = false;
+    let mut deferred_event: Option<Event> = None;
     // The candidate region is updated immediately on hover; graphics are only
     // redrawn if the candidate differs from the active highlight after a delay.
     let mut hover_candidate: Option<i32> = None;
@@ -784,15 +915,31 @@ fn run() -> Result<()> {
         if let Some(deadline) = hover_deadline {
             wait = wait.min(deadline.saturating_duration_since(Instant::now()));
         }
-        if event::poll(wait)? {
+        // Present the pending slice before accepting another navigation key.
+        // Drop queued repeats of the *same* key (see helper above) so they
+        // cannot continue moving slices long after the user releases it.
+        if pending_frame || pending_layout {
+            let remaining = frame_interval.saturating_sub(last_draw.elapsed());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
+        } else if deferred_event.is_some() || event::poll(wait)? {
             for _ in 0..256 {
-                match event::read()? {
+                let mut navigated = false;
+                let evt = if let Some(saved) = deferred_event.take() {
+                    saved
+                } else {
+                    event::read()?
+                };
+                match evt {
                     Event::Key(key) => {
                         if app.notice.take().is_some() {
                             pending_layout = true;
                             pending_frame = true;
                         }
-                        let action = app.key(&vol, &mut layers, key);
+                        let before_index = app.index;
+                        let action = app.key(&vol, &mut layers, key.clone());
+                        navigated = before_index != app.index;
                         if matches!(action, Action::Redraw | Action::Layout) {
                             // Slice/axis change: update the region associated with
                             // the cursor; don't retain an outline from another slice.
@@ -814,6 +961,11 @@ fn run() -> Result<()> {
                             Action::Quit => {
                                 frames.clear(&mut out)?;
                                 out.flush()?;
+                                drop(out);
+                                drop(_guard);
+                                if config.profile {
+                                    println!("{}", stats.report());
+                                }
                                 return Ok(());
                             }
                             Action::Redraw => pending_frame = true,
@@ -857,6 +1009,9 @@ fn run() -> Result<()> {
                             }
                             Action::None => {}
                         }
+                        if navigated && !app.inspect_mode && is_slice_key(&key) {
+                            drop_stale_key_repeats(key, &mut deferred_event)?;
+                        }
                     }
                     Event::Resize(_, _) => {
                         pending_layout = true;
@@ -876,6 +1031,7 @@ fn run() -> Result<()> {
                             if app.move_slices(&vol, direction * (app.stride * multiplier) as isize)
                             {
                                 pending_frame = true;
+                                navigated = true;
                             }
                         }
                         MouseEventKind::Moved
@@ -905,7 +1061,7 @@ fn run() -> Result<()> {
                     },
                     _ => {}
                 }
-                if !event::poll(Duration::ZERO)? {
+                if navigated || (deferred_event.is_none() && !event::poll(Duration::ZERO)?) {
                     break;
                 }
             }
@@ -919,12 +1075,24 @@ fn run() -> Result<()> {
         }
         if (pending_frame || pending_ui || pending_layout) && last_draw.elapsed() >= frame_interval
         {
+            // Account for raster+transfer time when pacing frames: the next
+            // frame interval starts at draw BEGIN, not after slow I/O finishes.
+            let draw_started = Instant::now();
             if pending_layout {
                 frames.clear(&mut out)?;
                 queue!(out, Clear(ClearType::All))?;
             }
             if pending_frame {
-                view = draw(&mut out, &vol, &layers, &app, base_range, &mut frames)?;
+                view = draw(
+                    &mut out,
+                    &vol,
+                    &layers,
+                    &app,
+                    base_range,
+                    &mut frames,
+                    &mut cache,
+                    &mut stats,
+                )?;
             } else if pending_ui {
                 let (cols, rows) = terminal::size()?;
                 view = layout(&vol, &app, &layers, cols, rows);
@@ -933,7 +1101,7 @@ fn run() -> Result<()> {
             pending_frame = false;
             pending_ui = false;
             pending_layout = false;
-            last_draw = Instant::now();
+            last_draw = draw_started;
         }
     }
 }
@@ -956,6 +1124,35 @@ mod mouse_tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+    #[test]
+    fn identifies_only_slice_navigation_as_repeatable() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(is_slice_key(&KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE
+        )));
+        assert!(is_slice_key(&KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_slice_key(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_slice_key(&KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::SHIFT
+        )));
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let down_repeat = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let modified = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        let quit = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(same_navigation_key(&down, &down_repeat));
+        assert!(!same_navigation_key(&down, &up));
+        assert!(!same_navigation_key(&down, &modified));
+        assert!(!same_navigation_key(&down, &quit));
     }
     #[test]
     fn mouse_uses_placement_offsets() {

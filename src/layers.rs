@@ -167,10 +167,14 @@ impl Layers {
                     spec.path.display()
                 )
             })?;
-            let default_window = vol.auto_window();
+            let data_range = vol.data_range();
+            let default_window = if data_range.0 < data_range.1 {
+                data_range
+            } else {
+                (data_range.0 - 0.5, data_range.1 + 0.5)
+            };
             let window = spec.window.unwrap_or(default_window);
             let name = short_name(&spec.path);
-            let data_range = vol.data_range();
             overlays.push(IntensityOverlay {
                 vol,
                 window,
@@ -231,8 +235,12 @@ impl Layers {
         reference
             .validate_grid(&vol)
             .with_context(|| format!("{} is not voxel-aligned", path.display()))?;
-        let window = vol.auto_window();
         let data_range = vol.data_range();
+        let window = if data_range.0 < data_range.1 {
+            data_range
+        } else {
+            (data_range.0 - 0.5, data_range.1 + 0.5)
+        };
         self.overlays.push(IntensityOverlay {
             name: short_name(path),
             vol,

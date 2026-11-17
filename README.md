@@ -1,4 +1,4 @@
-# niv v0.8
+# niv v0.11
 
 Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
@@ -6,11 +6,11 @@ Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics term
 
 ```bash
 cd ~/Documents/_GitHub/niv
-# Extract v0.8 source-only update into this directory, or apply the patch if it fits your checkout.
+# Extract v0.11 source-only update into this directory, or apply the patch if it fits your checkout.
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # v0.8.0
+niv --version       # v0.11.0
 ```
 
 The full project ZIP contains `niv-rust/` as its top-level directory. The source-only ZIP contains `src/`, `Cargo.toml`, and `README.md` directly, ready to extract into your repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
@@ -22,9 +22,11 @@ niv brain.nii.gz                           # defaults to --axis x --rotate 90
 niv brain.nii.gz --overlay activation.nii.gz
 niv brain.nii.gz --background transparent # start in RGBA mode
 niv brain.nii.gz --hover-delay-ms 250       # delay before thicker hovered-region contour
+niv brain.nii.gz --atlas-aa                 # optional smoother atlas edges
+niv brain.nii.gz --fps 20 --profile        # if Rex still queues images after key release
 ```
 
-The screen has a colored region name at the upper left, a small `?` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers, while `I` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity/path editors temporarily appear at the bottom.
+The screen has a colored region name at the upper left, `Press ? for help` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers, while `I` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity/path editors temporarily appear at the bottom.
 
 ### Keys
 
@@ -38,9 +40,10 @@ The screen has a colored region name at the upper left, a small `?` at upper rig
 | `[` / `]` | Decrease/increase base stride by one |
 | `b` | Toggle **black/RGB** ↔ **transparent/RGBA** background |
 | `a` | Toggle atlas outlines |
+| `g` | Toggle optional antialiasing for **solid-label atlas** contours (off by default) |
 | `?` or `/` | Popup keyboard help |
 | `I` | Metadata and full layer names |
-| `n` | Load another registered image below the atlas |
+| `n` | Load another registered image; Tab completes/extends, Tab again cycles, Shift+Tab reverses |
 | `1`–`9`; `;` | Select layer; cycle beyond nine layers |
 | `e`, `m`, `M` | Edit selected-layer range / only min / only max |
 | `0` | Reset range to actual finite min/max |
@@ -67,9 +70,9 @@ The screen has a colored region name at the upper left, a small `?` at upper rig
 
 ### Hovered-region highlight
 
-With a **solid** atlas, entering a labeled region starts a short delay. If the pointer remains in that region past the delay, its contours are drawn thicker (3px) while other regions retain their usual outline thickness. Hover events *before* the delay only update the text line; they do not re-transmit the image. Moving between voxels of the same region does not restart the timer.
+The feature is enabled by default with a 20ms delay. When enabled, with a **solid** atlas, entering a labeled region starts a short delay. If the pointer remains in that region past the delay, its contours are drawn thicker (3px) while other regions retain their usual outline thickness. When enabled, hover events *before* the delay only update the text line; they do not re-transmit the image. Moving between voxels of the same region does not restart the timer.
 
-Use `NIV_HOVER_DELAY_MS=150` (default) or `--hover-delay-ms 150` to tune, 0–2000 ms; `0` disables the highlight. The thicker outline needs one full redraw when the region changes. For precomputed wireframe outlines, thickening requires companion solid labels (`--atlas-labels`); without them, the outline is unchanged. A keyboard probe remains available with `i` if iOS Rex does not forward mouse-move events.
+Use `NIV_HOVER_DELAY_MS=20` (default) or `--hover-delay-ms 150` to tune, 0–2000 ms; `0` disables the highlight. The thicker outline needs one full redraw when the region changes. Its antialiasing now follows `g`, and the atlas strokes are composited once per pixel to prevent bright intersections. For precomputed wireframe outlines, thickening requires companion solid labels (`--atlas-labels`); without them, the outline is unchanged. A keyboard probe remains available with `i` if iOS Rex does not forward mouse-move events.
 
 ### Environment variables
 
@@ -77,10 +80,27 @@ Use `NIV_HOVER_DELAY_MS=150` (default) or `--hover-delay-ms 150` to tune, 0–20
 export ATLAS="$HOME/Documents/__Heifets_lab_data/_UNRAVEL/atlases/CCFv3-2020/30um/atlas_CCFv3_2020_30um.nii.gz"
 export ATLAS_LUT="$HOME/Documents/_GitHub/UNRAVEL/unravel/core/csvs/CCFv3-2020_regional_summary.csv"
 export NIV_BACKGROUND=black
-export NIV_HOVER_DELAY_MS=150
+export NIV_HOVER_DELAY_MS=20
+export NIV_PIXEL_BUDGET=1000000
+export NIV_FPS=30
+export NIV_ATLAS_AA=0
 ```
 
 CLI `--atlas` / `--atlas-wireframe` and `--lut` override the environment. `--axis x --rotate 90` are defaults. Image and atlas NIfTI files must share identical dimensions, voxel spacing, and sform (when present); no resampling/reorientation is performed.
+
+### Performance and profiling
+
+The default pixel budget is **1,000,000 output pixels** (the display placement retains its full terminal footprint). Lower it for high-latency Rex/Tailscale connections, or set `--pixel-budget 0` for native terminal resolution. `NIV_PIXEL_BUDGET` sets the default. The CPU renderer caches the screen-to-voxel sampling map between slice changes. Atlas strokes use a one-pass coverage buffer: line corners and intersections are no longer brightened by repeated alpha blending. For antialiasing, the centerline remains between the same voxel faces and only a soft fringe changes coverage; it does not smooth the actual stair-step label geometry. Repeated navigation keys already buffered before a redraw are discarded after one navigation increment; different keys and Quit are preserved, while a matching key-release simply ends the repeat burst. A pending image is presented before another navigation event is handled. This reduces delayed scrolling after key release, although Rex/Ghostty may still queue images asynchronously. The default redraw cap is **30 FPS** (`NIV_FPS` or `--fps`), rather than 60 FPS, to reduce terminal image backlog. Hover-region highlighting is enabled with a short 20ms delay; set `NIV_HOVER_DELAY_MS=0` to disable it and avoid those extra redraws.
+
+Use `--profile` with interactive viewing. After quitting, it reports average **rasterization**, **zlib/base64 encoding**, and **terminal write/flush** durations plus compressed payload bytes. This does not measure asynchronous terminal decode or network rendering latency.
+
+```bash
+niv brain.nii.gz --profile --pixel-budget 1000000
+niv brain.nii.gz --profile --pixel-budget 0
+niv brain.nii.gz --bench 100
+```
+
+Kitty can transmit 8-bit terminal palette indices, but those colors are tied to the terminal palette and are unsuitable for the atlas LUT and arbitrary layer colors. Paletted PNG is another future transport to benchmark, but entails encoding/decoding costs and would not be universally faster.
 
 ### Benchmark RGB vs RGBA
 
@@ -95,7 +115,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 - `float64` NIfTI data are converted to `f32` (hover shows seven *decimal places*, not guaranteed seven significant digits of source precision).
 - True transparent pixels require Kitty RGBA support in the terminal/Rex client. Image opacity works in RGB mode too, but with black as the final background.
-- The mouse hover outline is a rasterized 3-pixel contour, not a vector curve. Region contour topology remains voxel-accurate.
+- The optional `--atlas-aa` (or `g` / `NIV_ATLAS_AA=1`) uses improved centered fractional-coverage subpixel line edges for contours generated from the **solid** atlas, which can soften jagged appearance at low pixel budgets. It is off by default because it adds raster work. It is **not** vector tracing or spline smoothing, and it does not change atlas labels or underlying voxel geometry. For precomputed wireframes, `g` can soften the dilated **hovered-region** outline when companion solid labels are loaded, but does not smooth the original mask. Hover selection draws a thicker 3-pixel contour when enabled.
 - Runtime `n` image loading and `.nii.gz` decompression are synchronous; loading large files can briefly block the UI.
 - Hover events, Command modifier events and pixel-mouse tracking are client-dependent.
 - `cargo test` and interactive visual testing should be run locally; this source distribution was assembled where Rust's toolchain was unavailable.

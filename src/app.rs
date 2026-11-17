@@ -1,3 +1,4 @@
+use crate::path_complete::{self, PathMatches};
 use crate::{
     layers::{Layers, Palette},
     volume::{Axis, Volume},
@@ -19,6 +20,7 @@ pub struct WindowEdit {
     pub field: EditField,
     pub text: String,
     pub error: Option<String>,
+    pub completion: Option<PathMatches>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub struct App {
     pub base_palette: Palette,
     pub base_opacity: f32,
     pub transparent_background: bool,
+    pub pixel_budget: usize,
+    pub atlas_aa: bool,
     pub highlighted_region: Option<i32>,
     pub path: String,
     pub atlas_name: Option<String>,
@@ -83,6 +87,8 @@ impl App {
             base_palette: Palette::Gray,
             base_opacity: 1.0,
             transparent_background: false,
+            pixel_budget: 1_000_000,
+            atlas_aa: false,
             highlighted_region: None,
             path,
             atlas_name: None,
@@ -238,7 +244,7 @@ impl App {
         }
     }
 
-    fn edit_key(&mut self, layers: &mut Layers, key: KeyCode) -> Action {
+    fn edit_key(&mut self, layers: &mut Layers, key: KeyCode, modifiers: KeyModifiers) -> Action {
         let Some(editor) = self.edit.as_mut() else {
             return Action::None;
         };
@@ -257,14 +263,7 @@ impl App {
                         return Action::Ui;
                     }
                     self.edit = None;
-                    let path = if let Some(rest) = text.strip_prefix("~/") {
-                        std::env::var_os("HOME")
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| PathBuf::from("~"))
-                            .join(rest)
-                    } else {
-                        PathBuf::from(text)
-                    };
+                    let path = path_complete::resolve(&text);
                     return Action::LoadOverlay(path);
                 }
                 if field == EditField::LayerOpacity || field == EditField::AtlasOpacity {
@@ -306,9 +305,19 @@ impl App {
                     }
                 }
             }
+            KeyCode::Tab | KeyCode::BackTab if editor.field == EditField::AddPath => {
+                path_complete::advance(
+                    &mut editor.text,
+                    &mut editor.completion,
+                    key == KeyCode::BackTab || modifiers.contains(KeyModifiers::SHIFT),
+                );
+                editor.error = None;
+                Action::Ui
+            }
             KeyCode::Backspace => {
                 editor.text.pop();
                 editor.error = None;
+                editor.completion = None;
                 Action::Ui
             }
             KeyCode::Char(c)
@@ -319,6 +328,7 @@ impl App {
             {
                 editor.text.push(c);
                 editor.error = None;
+                editor.completion = None;
                 Action::Ui
             }
             _ => Action::None,
@@ -331,7 +341,7 @@ impl App {
         }
         let m = key.modifiers;
         if self.edit.is_some() {
-            return self.edit_key(layers, key.code);
+            return self.edit_key(layers, key.code, m);
         }
         if let Some(popup) = self.popup {
             return match key.code {
@@ -366,11 +376,13 @@ impl App {
                     field: EditField::AddPath,
                     text: String::new(),
                     error: None,
+                    completion: None,
                 });
                 Action::Ui
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
-                let field = if key.code == KeyCode::Char('O') {
+                // Kitty enhanced keys can report uppercase O as lowercase 'o' + SHIFT.
+                let field = if key.code == KeyCode::Char('O') || m.contains(KeyModifiers::SHIFT) {
                     EditField::AtlasOpacity
                 } else {
                     EditField::LayerOpacity
@@ -383,6 +395,7 @@ impl App {
                     field,
                     text: String::new(),
                     error: None,
+                    completion: None,
                 });
                 Action::Ui
             }
@@ -408,15 +421,19 @@ impl App {
                 }
             }
             KeyCode::Char('e') | KeyCode::Char('m') | KeyCode::Char('M') => {
+                // Crossterm enhanced-key reporting may send Shift+m as
+                // Char('m') + SHIFT instead of Char('M').
                 let field = match key.code {
-                    KeyCode::Char('m') => EditField::Minimum,
                     KeyCode::Char('M') => EditField::Maximum,
+                    KeyCode::Char('m') if m.contains(KeyModifiers::SHIFT) => EditField::Maximum,
+                    KeyCode::Char('m') => EditField::Minimum,
                     _ => EditField::Both,
                 };
                 self.edit = Some(WindowEdit {
                     field,
                     text: String::new(),
                     error: None,
+                    completion: None,
                 });
                 Action::Ui
             }
@@ -435,6 +452,10 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.show_atlas = !self.show_atlas;
+                Action::Redraw
+            }
+            KeyCode::Char('g') => {
+                self.atlas_aa = !self.atlas_aa;
                 Action::Redraw
             }
             KeyCode::Char('b') => {
@@ -886,6 +907,121 @@ mod tests {
             ),
             Action::LoadOverlay(_)
         ));
+    }
+    #[test]
+    fn shifted_m_edits_maximum_even_with_lowercase_keycode() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 10, 1, 0, (0., 100.), "test".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('m'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::Maximum);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('0'),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.window, (0., 50.));
+    }
+    #[test]
+    fn shifted_o_edits_atlas_opacity_including_zero() {
+        use crate::layers::Atlas;
+        use ndarray::Array3;
+        use std::collections::HashMap;
+        let vol = example();
+        let labels = Volume {
+            data: Array3::zeros((3, 4, 5)),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: labels,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 255, 255],
+                width: 1,
+                opacity: 1.0,
+                regions: HashMap::new(),
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 100.), "base".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('o'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::AtlasOpacity);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('0'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ),
+            Action::Redraw
+        );
+        assert_eq!(layers.atlas.as_ref().unwrap().opacity, 0.0);
+        assert_eq!(app.base_opacity, 1.0);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('O'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::AtlasOpacity);
+    }
+    #[test]
+    fn aa_toggle_is_off_by_default() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 100.), "base".into());
+        assert!(!app.atlas_aa);
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('g'),
+                KeyModifiers::NONE
+            ),
+            Action::Redraw
+        );
+        assert!(app.atlas_aa);
     }
     #[test]
     fn editor_validation() {

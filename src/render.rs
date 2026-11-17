@@ -47,8 +47,20 @@ pub fn geometry(
     Geometry {
         cols,
         rows,
-        width: view_w.max(1),
-        height: view_h.max(1),
+        width: if app.pixel_budget > 0 && view_w.saturating_mul(view_h) > app.pixel_budget {
+            ((view_w as f64 * (app.pixel_budget as f64 / (view_w * view_h) as f64).sqrt()).round()
+                as usize)
+                .max(1)
+        } else {
+            view_w.max(1)
+        },
+        height: if app.pixel_budget > 0 && view_w.saturating_mul(view_h) > app.pixel_budget {
+            ((view_h as f64 * (app.pixel_budget as f64 / (view_w * view_h) as f64).sqrt()).round()
+                as usize)
+                .max(1)
+        } else {
+            view_h.max(1)
+        },
     }
 }
 
@@ -126,6 +138,31 @@ mod tests {
     use ndarray::Array3;
 
     #[test]
+    fn cached_sampling_matches_uncached_after_slice_change() {
+        use crate::layers::Layers;
+        let vol = Volume {
+            data: Array3::from_shape_fn((4, 5, 6), |(x, y, z)| (x * 20 + y * 4 + z) as f32),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut app = App::new(Axis::X, 1, 1, 90, (0., 120.), "test".into());
+        let map = SamplingMap::new(&vol, &app, 40, 50);
+        assert!(map.matches(&vol, &app, 40, 50));
+        assert_eq!(
+            composite_with_map(&vol, &app, &Layers::default(), &map, false),
+            composite_format(&vol, &app, &Layers::default(), 40, 50, false)
+        );
+        app.index = 2;
+        assert!(map.matches(&vol, &app, 40, 50));
+        assert_eq!(
+            composite_with_map(&vol, &app, &Layers::default(), &map, false),
+            composite_format(&vol, &app, &Layers::default(), 40, 50, false)
+        );
+        app.rotation = 180;
+        assert!(!map.matches(&vol, &app, 40, 50));
+    }
+    #[test]
     fn flips_and_rotations() {
         // Data contains displayed rows [40,50], [20,30], [0,10] (top to bottom).
         // We compare grayscale red channel at each output pixel.
@@ -162,6 +199,11 @@ fn blend_pixel(dst: &mut [u8], color: [u8; 3], alpha: f32) {
         return;
     }
     if dst.len() == 3 {
+        // The common case (fully opaque grayscale or atlas) needs no float math.
+        if alpha >= 1.0 {
+            dst.copy_from_slice(&color);
+            return;
+        }
         // Opaque black canvas: source-over blending with no alpha channel.
         for channel in 0..3 {
             dst[channel] = (color[channel] as f32 * alpha + dst[channel] as f32 * (1.0 - alpha))
@@ -188,6 +230,80 @@ fn blend_pixel(dst: &mut [u8], color: [u8; 3], alpha: f32) {
 
 /// Bottom image, overlays in load order, and atlas last. All layers use the
 /// same registration grid; no image is resized independently of the others.
+/// Precomputed screen-to-voxel mapping, kept across slice changes.
+/// The expensive per-pixel coordinate transform is only rebuilt if geometry,
+/// axis, rotation or flips change.
+pub struct SamplingMap {
+    pub width: usize,
+    pub height: usize,
+    axis: crate::volume::Axis,
+    rotation: u16,
+    flip_h: bool,
+    flip_v: bool,
+    sw: usize,
+    sh: usize,
+    coords: Vec<(usize, usize)>,
+}
+impl SamplingMap {
+    pub fn matches(&self, vol: &Volume, app: &App, width: usize, height: usize) -> bool {
+        let (sw, sh, _) = vol.plane(app.axis);
+        self.width == width
+            && self.height == height
+            && self.axis == app.axis
+            && self.rotation == app.rotation
+            && self.flip_h == app.flip_h
+            && self.flip_v == app.flip_v
+            && self.sw == sw
+            && self.sh == sh
+    }
+    pub fn new(vol: &Volume, app: &App, width: usize, height: usize) -> Self {
+        let (sw, sh, _) = vol.plane(app.axis);
+        let swapped = app.rotation % 180 != 0;
+        let ow = if swapped { sh } else { sw };
+        let oh = if swapped { sw } else { sh };
+        let horizontal: Vec<usize> = (0..width)
+            .map(|x| {
+                let h = (x * ow / width).min(ow - 1);
+                if app.flip_h {
+                    ow - 1 - h
+                } else {
+                    h
+                }
+            })
+            .collect();
+        let vertical: Vec<usize> = (0..height)
+            .map(|y| {
+                let v = (y * oh / height).min(oh - 1);
+                if app.flip_v {
+                    oh - 1 - v
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let coords: Vec<(usize, usize)> = (0..height)
+            .flat_map(|y| {
+                let horizontal = &horizontal;
+                let vertical = &vertical;
+                (0..width).map(move |x| {
+                    inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation)
+                })
+            })
+            .collect();
+        Self {
+            width,
+            height,
+            axis: app.axis,
+            rotation: app.rotation,
+            flip_h: app.flip_h,
+            flip_v: app.flip_v,
+            sw,
+            sh,
+            coords,
+        }
+    }
+}
+
 pub fn composite_format(
     vol: &Volume,
     app: &App,
@@ -196,40 +312,24 @@ pub fn composite_format(
     height: usize,
     transparent_background: bool,
 ) -> Vec<u8> {
+    let map = SamplingMap::new(vol, app, width, height);
+    composite_with_map(vol, app, layers, &map, transparent_background)
+}
+
+pub fn composite_with_map(
+    vol: &Volume,
+    app: &App,
+    layers: &crate::layers::Layers,
+    map: &SamplingMap,
+    transparent_background: bool,
+) -> Vec<u8> {
+    let width = map.width;
+    let height = map.height;
+    let sw = map.sw;
+    let sh = map.sh;
+    let coords = &map.coords;
     let channels = if transparent_background { 4 } else { 3 };
     let mut raster = vec![0u8; width * height * channels];
-    let (sw, sh, _) = vol.plane(app.axis);
-    let swapped = app.rotation % 180 != 0;
-    let ow = if swapped { sh } else { sw };
-    let oh = if swapped { sw } else { sh };
-    let horizontal: Vec<usize> = (0..width)
-        .map(|x| {
-            let h = (x * ow / width).min(ow - 1);
-            if app.flip_h {
-                ow - 1 - h
-            } else {
-                h
-            }
-        })
-        .collect();
-    let vertical: Vec<usize> = (0..height)
-        .map(|y| {
-            let v = (y * oh / height).min(oh - 1);
-            if app.flip_v {
-                oh - 1 - v
-            } else {
-                v
-            }
-        })
-        .collect();
-    let coords: Vec<(usize, usize)> = (0..height)
-        .flat_map(|y| {
-            let horizontal = &horizontal;
-            let vertical = &vertical;
-            (0..width)
-                .map(move |x| inverse_rotation(horizontal[x], vertical[y], sw, sh, app.rotation))
-        })
-        .collect();
     for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
         let value = vol.sample(app.axis, app.index, h, v);
         if !value.is_finite() || value <= app.window.0 {
@@ -260,56 +360,7 @@ pub fn composite_format(
         if let Some(atlas) = &layers.atlas {
             if atlas.opacity > 0.0 {
                 if atlas.wireframe {
-                    for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
-                        let id =
-                            crate::layers::label_id(atlas.vol.sample(app.axis, app.index, h, v));
-                        if id > 0 {
-                            blend_pixel(px, atlas.color(id), atlas.opacity);
-                        }
-                    }
-                    // A precomputed binary outline has no region IDs at filled
-                    // voxels. When companion labels exist, enlarge only those
-                    // visible wireframe pixels belonging to the hovered region.
-                    if let Some(selected) = app.highlighted_region {
-                        if selected > 0 && atlas.labels.is_some() {
-                            let mut marks = Vec::new();
-                            for (idx, &(h, v)) in coords.iter().enumerate() {
-                                let id = crate::layers::label_id(
-                                    atlas.vol.sample(app.axis, app.index, h, v),
-                                );
-                                if id == 0 {
-                                    continue;
-                                }
-                                let label = atlas
-                                    .labels
-                                    .as_ref()
-                                    .map(|labels| {
-                                        crate::layers::label_id(
-                                            labels.sample(app.axis, app.index, h, v),
-                                        )
-                                    })
-                                    .unwrap_or(id);
-                                if label == selected {
-                                    marks.push(idx);
-                                }
-                            }
-                            for idx in marks {
-                                let x = (idx % width) as i32;
-                                let y = (idx / width) as i32;
-                                paint(
-                                    &mut raster,
-                                    width,
-                                    height,
-                                    channels,
-                                    x,
-                                    y,
-                                    atlas.color(selected),
-                                    3,
-                                    atlas.opacity,
-                                );
-                            }
-                        }
-                    }
+                    draw_wireframe(&mut raster, width, height, channels, app, atlas, coords);
                 } else {
                     draw_atlas_edges(&mut raster, width, height, channels, app, atlas, sw, sh);
                 }
@@ -429,35 +480,108 @@ fn paint(
     }
 }
 
-fn draw_face(
-    rgb: &mut [u8],
+/// A temporary per-pixel coverage/color buffer for atlas strokes. Each pixel
+/// is composited exactly once, so intersections, voxel corners and overlapping
+/// boundary segments cannot become brighter through repeated alpha blending.
+///
+/// Packed bits: priority (31), coverage 0..127 (24..30), RGB (0..23).
+/// Hovered-region strokes have higher priority than ordinary atlas edges.
+struct StrokeCanvas {
     width: usize,
     height: usize,
-    channels: usize,
-    app: &App,
-    sw: usize,
-    sh: usize,
-    p: (usize, usize),
-    q: (usize, usize),
-    color: [u8; 3],
-    thick: usize,
-    opacity: f32,
-) {
-    let (x0, y0) = project(app, p.0, p.1, sw, sh, width, height);
-    let (x1, y1) = project(app, q.0, q.1, sw, sh, width, height);
-    if x0 == x1 {
-        for y in y0.min(y1)..=y0.max(y1) {
-            paint(rgb, width, height, channels, x0, y, color, thick, opacity);
+    pixels: Vec<u32>,
+    touched: Vec<usize>,
+}
+
+impl StrokeCanvas {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![0; width * height],
+            touched: Vec::new(),
         }
-    } else {
-        for x in x0.min(x1)..=x0.max(x1) {
-            paint(rgb, width, height, channels, x, y0, color, thick, opacity);
+    }
+
+    #[inline]
+    fn plot(&mut self, x: i32, y: i32, color: [u8; 3], coverage: f32, selected: bool) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let alpha = (coverage.clamp(0.0, 1.0) * 127.0).round() as u32;
+        if alpha == 0 {
+            return;
+        }
+        let idx = y as usize * self.width + x as usize;
+        let old = self.pixels[idx];
+        let old_priority = old >> 31;
+        let priority = if selected { 1u32 } else { 0u32 };
+        let previous_coverage = (old >> 24) & 127;
+        if old_priority > priority || (old_priority == priority && previous_coverage >= alpha) {
+            return;
+        }
+        // When a hovered outline takes priority over an ordinary edge,
+        // preserve at least the old coverage so that a soft hover fringe
+        // cannot make an underlying solid atlas line *dimmer*.
+        let alpha = if priority > old_priority {
+            alpha.max(previous_coverage)
+        } else {
+            alpha
+        };
+        let encoded = (priority << 31)
+            | (alpha << 24)
+            | ((color[0] as u32) << 16)
+            | ((color[1] as u32) << 8)
+            | color[2] as u32;
+        if old == 0 {
+            self.touched.push(idx);
+        }
+        self.pixels[idx] = encoded;
+    }
+
+    #[inline]
+    fn box_stamp(&mut self, x: i32, y: i32, color: [u8; 3], thick: usize, selected: bool) {
+        let radius = ((thick - 1) / 2) as i32;
+        for yy in y - radius..y - radius + thick as i32 {
+            for xx in x - radius..x - radius + thick as i32 {
+                self.plot(xx, yy, color, 1.0, selected);
+            }
+        }
+    }
+
+    /// Soft-edged circular brush for precomputed wireframe highlights.
+    /// This alters only the stroke coverage, never the label or probe position.
+    fn soft_stamp(&mut self, x: i32, y: i32, color: [u8; 3], thick: usize) {
+        let radius = (thick as f32 * 0.5).max(1.5);
+        let extent = (radius + 0.85).ceil() as i32;
+        for yy in y - extent..=y + extent {
+            for xx in x - extent..=x + extent {
+                let dx = xx as f32 + 0.5 - x as f32;
+                let dy = yy as f32 + 0.5 - y as f32;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let coverage = (radius + 0.5 - dist).clamp(0.0, 1.0);
+                self.plot(xx, yy, color, coverage, true);
+            }
+        }
+    }
+
+    fn blend_into(self, raster: &mut [u8], channels: usize, opacity: f32) {
+        for idx in self.touched {
+            let packed = self.pixels[idx];
+            let coverage = ((packed >> 24) & 127) as f32 / 127.0;
+            let color = [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8];
+            let offset = idx * channels;
+            blend_pixel(
+                &mut raster[offset..offset + channels],
+                color,
+                opacity * coverage,
+            );
         }
     }
 }
 
-/// Subpixel projection of voxel FACE positions. Rounding is deferred to the
-/// antialiased renderer, unlike the exact voxel-edge renderer above.
+/// Subpixel projection of voxel FACE positions; the atlas's anatomical
+/// boundaries stay exactly between voxels, including when antialiasing.
 fn project_subpixel(
     app: &App,
     h: f32,
@@ -483,6 +607,85 @@ fn project_subpixel(
         y = oh - y;
     }
     (x * width as f32 / ow, y * height as f32 / oh)
+}
+
+fn stroke_face(
+    strokes: &mut StrokeCanvas,
+    app: &App,
+    sw: usize,
+    sh: usize,
+    p: (usize, usize),
+    q: (usize, usize),
+    color: [u8; 3],
+    thick: usize,
+    selected: bool,
+) {
+    let width = strokes.width;
+    let height = strokes.height;
+    if !app.atlas_aa {
+        let (x0, y0) = project(app, p.0, p.1, sw, sh, width, height);
+        let (x1, y1) = project(app, q.0, q.1, sw, sh, width, height);
+        if x0 == x1 {
+            for y in y0.min(y1)..=y0.max(y1) {
+                strokes.box_stamp(x0, y, color, thick, selected);
+            }
+        } else {
+            for x in x0.min(x1)..=x0.max(x1) {
+                strokes.box_stamp(x, y0, color, thick, selected);
+            }
+        }
+        return;
+    }
+
+    let (x0, y0) = project_subpixel(app, p.0 as f32, p.1 as f32, sw, sh, width, height);
+    let (x1, y1) = project_subpixel(app, q.0 as f32, q.1 as f32, sw, sh, width, height);
+    let vertical = (x1 - x0).abs() < (y1 - y0).abs();
+    // A centered 1.25px stroke (3px for hovered regions) with a smooth
+    // ~0.8px edge. The centerline is unchanged; only edge coverage is filtered.
+    let half_core = if selected {
+        thick as f32 * 0.5 - 0.4
+    } else {
+        thick as f32 * 0.5 - 0.2
+    };
+    let feather = 0.8_f32;
+    let (min_x, max_x, min_y, max_y) = if vertical {
+        (
+            x0 - half_core - feather,
+            x0 + half_core + feather,
+            y0.min(y1) - 0.5,
+            y0.max(y1) + 0.5,
+        )
+    } else {
+        (
+            x0.min(x1) - 0.5,
+            x0.max(x1) + 0.5,
+            y0 - half_core - feather,
+            y0 + half_core + feather,
+        )
+    };
+    let xa = min_x.floor().max(0.0) as i32;
+    let xb = max_x.ceil().min(width as f32) as i32;
+    let ya = min_y.floor().max(0.0) as i32;
+    let yb = max_y.ceil().min(height as f32) as i32;
+    for y in ya..yb {
+        let cy = y as f32 + 0.5;
+        for x in xa..xb {
+            let cx = x as f32 + 0.5;
+            let perp_dist = if vertical {
+                (cx - x0).abs()
+            } else {
+                (cy - y0).abs()
+            };
+            let cross_coverage = ((half_core + feather - perp_dist) / feather).clamp(0.0, 1.0);
+            let along = if vertical {
+                (cy - y0.min(y1)).min(y0.max(y1) - cy)
+            } else {
+                (cx - x0.min(x1)).min(x0.max(x1) - cx)
+            };
+            let end_coverage = (along + 0.5).clamp(0.0, 1.0);
+            strokes.plot(x, y, color, cross_coverage * end_coverage, selected);
+        }
+    }
 }
 
 fn draw_inspector_mark(
@@ -540,6 +743,7 @@ fn draw_atlas_edges(
     sh: usize,
 ) {
     use crate::layers::label_id;
+    let mut strokes = StrokeCanvas::new(width, height);
     // Horizontal-axis neighbors: draw face at h, for each v.
     for v in 0..sh {
         for h in 0..=sw {
@@ -554,33 +758,31 @@ fn draw_atlas_edges(
                 label_id(atlas.vol.sample(app.axis, app.index, h, v))
             };
             if left != right && (left != 0 || right != 0) {
-                let highlighted = app
+                let selected = app
                     .highlighted_region
                     .is_some_and(|id| id == left || id == right);
-                let id = if highlighted {
+                let id = if selected {
                     app.highlighted_region.unwrap_or(right)
                 } else if right != 0 {
                     right
                 } else {
                     left
                 };
-                draw_face(
-                    rgb,
-                    width,
-                    height,
-                    channels,
+                let thick = if selected {
+                    atlas.width.max(3)
+                } else {
+                    atlas.width
+                };
+                stroke_face(
+                    &mut strokes,
                     app,
                     sw,
                     sh,
                     (h, v),
                     (h, v + 1),
                     atlas.color(id),
-                    if highlighted {
-                        atlas.width.max(3)
-                    } else {
-                        atlas.width
-                    },
-                    atlas.opacity,
+                    thick,
+                    selected,
                 );
             }
         }
@@ -599,37 +801,81 @@ fn draw_atlas_edges(
                 label_id(atlas.vol.sample(app.axis, app.index, h, v))
             };
             if low != high && (low != 0 || high != 0) {
-                let highlighted = app
+                let selected = app
                     .highlighted_region
                     .is_some_and(|id| id == low || id == high);
-                let id = if highlighted {
+                let id = if selected {
                     app.highlighted_region.unwrap_or(high)
                 } else if high != 0 {
                     high
                 } else {
                     low
                 };
-                draw_face(
-                    rgb,
-                    width,
-                    height,
-                    channels,
+                let thick = if selected {
+                    atlas.width.max(3)
+                } else {
+                    atlas.width
+                };
+                stroke_face(
+                    &mut strokes,
                     app,
                     sw,
                     sh,
                     (h, v),
                     (h + 1, v),
                     atlas.color(id),
-                    if highlighted {
-                        atlas.width.max(3)
-                    } else {
-                        atlas.width
-                    },
-                    atlas.opacity,
+                    thick,
+                    selected,
                 );
             }
         }
     }
+    strokes.blend_into(rgb, channels, atlas.opacity);
+}
+
+fn draw_wireframe(
+    rgb: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    app: &App,
+    atlas: &crate::layers::Atlas,
+    coords: &[(usize, usize)],
+) {
+    use crate::layers::label_id;
+    let mut strokes = StrokeCanvas::new(width, height);
+    for (idx, &(h, v)) in coords.iter().enumerate() {
+        let id = label_id(atlas.vol.sample(app.axis, app.index, h, v));
+        if id == 0 {
+            continue;
+        }
+        let x = (idx % width) as i32;
+        let y = (idx / width) as i32;
+        strokes.plot(x, y, atlas.color(id), 1.0, false);
+    }
+    // A selected wireframe region can only be identified reliably when
+    // companion solid labels are available. Smooth/dilate its raster strokes
+    // with the same once-per-pixel compositor used for ordinary atlas edges.
+    if let (Some(selected), Some(labels)) = (app.highlighted_region, &atlas.labels) {
+        for (idx, &(h, v)) in coords.iter().enumerate() {
+            let id = label_id(atlas.vol.sample(app.axis, app.index, h, v));
+            if id == 0 {
+                continue;
+            }
+            let region_id = label_id(labels.sample(app.axis, app.index, h, v));
+            if region_id != selected {
+                continue;
+            }
+            let x = (idx % width) as i32;
+            let y = (idx / width) as i32;
+            if app.atlas_aa {
+                strokes.soft_stamp(x, y, atlas.color(selected), atlas.width.max(3));
+            } else {
+                strokes.box_stamp(x, y, atlas.color(selected), atlas.width.max(3), true);
+            }
+        }
+    }
+    strokes.blend_into(rgb, channels, atlas.opacity);
 }
 
 #[cfg(test)]
@@ -775,6 +1021,105 @@ mod layer_tests {
             &highlighted[(5 * 30 + 19) * 3..(5 * 30 + 19) * 3 + 3],
             &[255, 0, 255]
         );
+    }
+    #[test]
+    fn intersecting_edges_do_not_accumulate_opacity() {
+        // Four labeled regions form a cross at a voxel-face intersection.
+        // A single 50%-opaque stroke and its 4-way junction must be equally
+        // bright: drawing/alpha-blending every face separately brightened it.
+        let base = Volume {
+            data: Array3::zeros((4, 4, 1)),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let labels = Volume {
+            data: Array3::from_shape_fn((4, 4, 1), |(x, y, _)| match (x < 2, y < 2) {
+                (true, true) => 1.0,
+                (false, true) => 2.0,
+                (true, false) => 3.0,
+                (false, false) => 4.0,
+            }),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: labels,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 0, 255],
+                width: 1,
+                opacity: 0.5,
+                regions: HashMap::new(),
+            }),
+        };
+        let app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        let raster = composite_format(&base, &app, &layers, 40, 40, false);
+        let at = |x: usize, y: usize| (y * 40 + x) * 3;
+        assert_eq!(&raster[at(20, 20)..at(20, 20) + 3], &[128, 0, 128]);
+        assert_eq!(
+            &raster[at(20, 15)..at(20, 15) + 3],
+            &raster[at(20, 20)..at(20, 20) + 3]
+        );
+        assert_eq!(
+            &raster[at(15, 20)..at(15, 20) + 3],
+            &raster[at(20, 20)..at(20, 20) + 3]
+        );
+    }
+
+    #[test]
+    fn antialiasing_applies_to_thick_hovered_region() {
+        let base = volume(vec![0., 0., 0.]);
+        let atlas = volume(vec![1., 1., 2.]);
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: atlas,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 0, 255],
+                width: 1,
+                opacity: 1.0,
+                regions: HashMap::new(),
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        app.highlighted_region = Some(1);
+        let sharp = composite_format(&base, &app, &layers, 29, 10, false);
+        app.atlas_aa = true;
+        let smooth = composite_format(&base, &app, &layers, 29, 10, false);
+        assert_ne!(sharp, smooth);
+        assert!(smooth
+            .chunks_exact(3)
+            .any(|pixel| pixel[0] > 0 && pixel[0] < 255));
+    }
+
+    #[test]
+    fn atlas_aa_is_opt_in_and_produces_subpixel_coverage() {
+        let base = volume(vec![0., 0., 0.]);
+        let atlas = volume(vec![1., 1., 2.]);
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: atlas,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 0, 255],
+                width: 1,
+                opacity: 1.0,
+                regions: HashMap::new(),
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        // 3 voxel columns projected into 8 pixels puts one boundary at x=5.333.
+        let exact = composite_format(&base, &app, &layers, 8, 6, false);
+        app.atlas_aa = true;
+        let soft = composite_format(&base, &app, &layers, 8, 6, false);
+        assert_ne!(exact, soft);
+        assert!(soft.chunks_exact(3).any(|px| px[0] > 0 && px[0] < 255));
     }
     #[test]
     fn boundaries_project_to_faces_not_voxel_centers() {
