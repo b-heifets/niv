@@ -14,6 +14,7 @@ pub enum EditField {
     LayerOpacity,
     AtlasOpacity,
     AddPath,
+    SaveScene,
 }
 
 pub struct WindowEdit {
@@ -61,6 +62,8 @@ pub struct App {
     pub edit: Option<WindowEdit>,
     pub popup: Option<Popup>,
     pub notice: Option<String>,
+    /// Most recently loaded or saved scene; shown as the default save path.
+    pub scene_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +73,7 @@ pub enum Action {
     Ui,
     Layout,
     LoadOverlays(Vec<PathBuf>),
+    SaveScene(PathBuf),
     None,
 }
 
@@ -110,6 +114,7 @@ impl App {
             edit: None,
             popup: None,
             notice: None,
+            scene_path: None,
         }
     }
 
@@ -425,6 +430,16 @@ impl App {
             }
             KeyCode::Enter => {
                 let (field, text) = (editor.field, editor.text.trim().to_owned());
+                if field == EditField::SaveScene {
+                    if text.is_empty() {
+                        if let Some(e) = self.edit.as_mut() {
+                            e.error = Some("Enter a scene filename".into());
+                        }
+                        return Action::Ui;
+                    }
+                    self.edit = None;
+                    return Action::SaveScene(path_complete::resolve(&text));
+                }
                 if field == EditField::LayerOpacity || field == EditField::AtlasOpacity {
                     let value = text
                         .parse::<f32>()
@@ -469,6 +484,20 @@ impl App {
             }
             KeyCode::Backspace => {
                 editor.text.pop();
+                editor.error = None;
+                Action::Ui
+            }
+            KeyCode::Char(c)
+                if editor.field == EditField::SaveScene
+                    && editor.text.len() < 4096
+                    && !c.is_control() =>
+            {
+                let typed = if c == '-' && modifiers.contains(KeyModifiers::SHIFT) {
+                    '_'
+                } else {
+                    c
+                };
+                editor.text.push(typed);
                 editor.error = None;
                 Action::Ui
             }
@@ -534,6 +563,21 @@ impl App {
             KeyCode::Char('i') if m.contains(KeyModifiers::SHIFT) => {
                 self.popup = Some(Popup::Info);
                 Action::Layout
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                let filename = self
+                    .scene_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{}.niv.toml", self.path));
+                self.edit = Some(WindowEdit {
+                    field: EditField::SaveScene,
+                    text: filename,
+                    error: None,
+                    completion: None,
+                    checked: Vec::new(),
+                });
+                Action::Ui
             }
             KeyCode::Char('n') => {
                 self.edit = Some(WindowEdit {
@@ -943,6 +987,7 @@ mod tests {
         let vol = example();
         let mut layers = Layers {
             overlays: vec![IntensityOverlay {
+                path: PathBuf::from("overlay.nii.gz"),
                 vol: example(),
                 window: (2., 6.),
                 default_window: (2., 6.),
@@ -1347,6 +1392,7 @@ mod tests {
         use crate::layers::IntensityOverlay;
         let vol = example();
         let mk = |name: &str, window: (f32, f32), opacity: f32| IntensityOverlay {
+            path: PathBuf::from(name),
             vol: example(),
             window,
             default_window: window,
@@ -1493,6 +1539,71 @@ mod tests {
     }
 
     #[test]
+    fn save_scene_opens_filename_editor_and_returns_path() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::X, 0, 1, 90, (0., 1.), "image_A".into());
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('s'),
+                KeyModifiers::NONE
+            ),
+            Action::Ui
+        );
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::SaveScene);
+        assert_eq!(app.edit.as_ref().unwrap().text, "image_A.niv.toml");
+        for _ in 0..16 {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            );
+        }
+        for c in "saved".chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('-'),
+            KeyModifiers::SHIFT,
+        );
+        for c in "scene.niv.toml".chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
+        let outcome = key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            outcome,
+            Action::SaveScene(PathBuf::from("saved_scene.niv.toml"))
+        );
+        assert!(app.edit.is_none());
+    }
+
+    #[test]
     fn editor_validation() {
         assert_eq!(
             parse_edit(EditField::Minimum, "4", (0., 10.)).unwrap(),
@@ -1509,60 +1620,90 @@ mod layer_list_escape_tests {
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ndarray::Array3;
 
-    fn fixture() -> (Volume, Layers, App) {
+    #[test]
+    fn escape_closes_list_then_exits() {
         let volume = Volume {
             data: Array3::zeros((4, 4, 4)),
             spacing: [1.0; 3],
             sform: None,
             datatype: 16,
         };
-        let layers = Layers::default();
-        let app = App::new(Axis::Z, 0, 1, 0, (0.0, 1.0), "image".into());
-        (volume, layers, app)
-    }
-
-    fn send(app: &mut App, vol: &Volume, layers: &mut Layers, code: KeyCode) -> Action {
-        app.key(vol, layers, KeyEvent::new(code, KeyModifiers::NONE))
-    }
-
-    #[test]
-    fn esc_closes_list_then_exits() {
-        let (vol, mut layers, mut app) = fixture();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0.0, 1.0), "image".into());
         assert_eq!(
-            send(&mut app, &vol, &mut layers, KeyCode::Char('t')),
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)
+            ),
             Action::Layout
         );
         assert!(app.show_layer_list);
         assert_eq!(
-            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
             Action::Layout
         );
         assert!(!app.show_layer_list);
         assert_eq!(
-            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
             Action::Quit
         );
     }
 
     #[test]
-    fn esc_closes_popup_before_list() {
-        let (vol, mut layers, mut app) = fixture();
-        send(&mut app, &vol, &mut layers, KeyCode::Char('t'));
-        send(&mut app, &vol, &mut layers, KeyCode::Char('?'));
+    fn escape_closes_popup_before_layer_list() {
+        let volume = Volume {
+            data: Array3::zeros((4, 4, 4)),
+            spacing: [1.0; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0.0, 1.0), "image".into());
+        app.key(
+            &volume,
+            &mut layers,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        app.key(
+            &volume,
+            &mut layers,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
         assert!(app.popup.is_some());
         assert_eq!(
-            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
             Action::Layout
         );
         assert!(app.popup.is_none());
         assert!(app.show_layer_list);
         assert_eq!(
-            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
             Action::Layout
         );
         assert!(!app.show_layer_list);
         assert_eq!(
-            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
             Action::Quit
         );
     }

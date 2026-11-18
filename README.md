@@ -1,4 +1,4 @@
-# niv v0.13
+# niv v0.14
 
 Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
@@ -6,14 +6,14 @@ Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics term
 
 ```bash
 cd ~/Documents/_GitHub/niv
-# Extract v0.13 source-only update into this directory, or apply the patch if it fits your checkout.
+# Extract the v0.14 source-only update here, or apply its patch if it fits your checkout.
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # v0.13.0
+niv --version       # v0.14.0
 ```
 
-Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP contains only the modified source files, `Cargo.toml`, and `README.md`, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
+Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP includes updated Rust source files, `Cargo.toml`, `README.md`, and an example scene, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
 
 ## Viewer
 
@@ -53,7 +53,7 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `c` | Cycle gray → warm → cool → categorical integer-ID palette |
-| `t` | Show/hide layer list (top image first; Esc closes list) |
+| `t` | Show/hide layer list (top image first; Esc closes the list) |
 | Space | Toggle selected overlay visibility (original base image stays visible) |
 | `i` | Keyboard inspection crosshair (arrows move probe) |
 | `x`,`y`,`z` | Change array slicing axis |
@@ -141,3 +141,44 @@ niv data/sample.nii.gz --background transparent --bench 100
 ### Reordering image layers
 
 Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Press `Esc` once to close the list; a second `Esc` exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+
+## Save and reload scenes (v0.14)
+
+Press **`s`** in the viewer to save your current scene. An editable filename prompt
+appears, defaulting to `<base-name>.niv.toml` in the current working directory,
+or the current scene filename if you loaded a scene. Press **Enter** to save or
+**Esc** to cancel. Saving to an existing filename replaces that scene file atomically. The viewer
+requires the `.niv.toml` suffix to prevent accidentally overwriting NIfTI data.
+
+```bash
+niv brain.nii.gz -i zstat1.nii.gz zstat2.nii.gz  # browse and configure layers
+# press s, edit the scene filename if desired, then Enter
+niv --scene brain.niv.toml                         # restore the scene
+niv --scene brain.niv.toml --pixel-budget 200000   # optional performance override
+niv --scene brain.niv.toml --fps 20 --profile
+niv --scene examples/demo_scene.niv.toml           # bundled demonstration
+```
+
+Scenes are **plain TOML text**, not shell scripts. You can edit them in Neovim,
+share them with collaborators, or commit them to Git (they don't embed image
+bytes). They restore the base and additional NIfTI paths, **top-to-bottom layer
+ordering**, each layer's visibility, grayscale/color palette, display window
+and opacity, the atlas/LUT and atlas settings, slice/axis/rotation/flips,
+selected layer, inspection state, and performance defaults.
+
+`[[layers]]` entries are stored **top-to-bottom**, matching `t`; exactly one has `role = "base"`.
+The atlas is represented separately and always remains the topmost layer.
+`view.selected` is zero-based (0 is the top image).
+File paths below the scene directory are saved as **relative paths**, so moving
+the scene and its data directory together works. Files elsewhere are saved as
+absolute paths. On reload, relative paths are resolved from the scene location,
+regardless of the shell working directory. A scene is intended for files on the
+**same registered voxel grid**; it does not embed or resample NIfTI data.
+
+Use `niv --scene FILE.niv.toml` as a self-contained input mode. It deliberately
+rejects mixing in `-i`/`--atlas`/image paths; edit/save the scene or load images
+interactively instead. `--fps`, `--pixel-budget`, `--profile`, and `--bench`
+may be supplied alongside `--scene`. Standard image-loading commands remain
+unchanged.
+
+Scene files may include local research paths, so review them before sharing.

@@ -1,6 +1,9 @@
 //! Voxel-aligned intensity overlays and colored atlas outlines.
 //! On-the-fly outlines are rasterized at voxel FACE coordinates, not at centers.
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 
@@ -114,6 +117,7 @@ pub fn short_name(path: &Path) -> String {
 }
 
 pub struct IntensityOverlay {
+    pub path: PathBuf,
     pub name: String,
     pub vol: Volume,
     pub window: (f32, f32),
@@ -176,6 +180,7 @@ impl Layers {
             let window = spec.window.unwrap_or(default_window);
             let name = short_name(&spec.path);
             overlays.push(IntensityOverlay {
+                path: spec.path.clone(),
                 vol,
                 window,
                 default_window,
@@ -246,6 +251,7 @@ impl Layers {
             (data_range.0 - 0.5, data_range.1 + 0.5)
         };
         self.overlays.push(IntensityOverlay {
+            path: path.to_path_buf(),
             name: short_name(path),
             vol,
             window,

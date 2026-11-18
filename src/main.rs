@@ -5,6 +5,7 @@ mod kitty;
 mod layers;
 mod path_complete;
 mod render;
+mod scene;
 mod volume;
 
 use anyhow::{bail, Result};
@@ -176,7 +177,8 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
     }
 }
 
-/// Map a displayed row to a bottom-based stack index, topmost first.
+/// Map a visible list row to its bottom-based stack index. The image at
+/// the top of the stack must also appear at the top of the layer list.
 fn top_first_position(start: usize, count: usize, row: usize) -> usize {
     debug_assert!(row < count);
     start + count - 1 - row
@@ -383,6 +385,7 @@ fn draw_ui(
                 EditField::LayerOpacity => "image opacity (0..1)",
                 EditField::AtlasOpacity => "atlas opacity (0..1)",
                 EditField::AddPath => "new overlay path",
+                EditField::SaveScene => "save scene as",
             };
             let err = edit.error.as_deref().unwrap_or("");
             let hint = edit
@@ -565,8 +568,10 @@ fn draw_popup(
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
                     "  n      File picker: filter filename by substring",
+                    "  s      Save current scene (.niv.toml)",
                     "         ↑↓ select · Tab complete · Space mark · Enter load",
                     "  { / }  Lower / raise selected image (Shift+[ / ])",
+                    "  Reload saved scene: niv --scene FILE.niv.toml",
                     "         Atlas always stays on top; t shows stack order",
                     "  Space  Toggle selected overlay",
                     "  e      Edit min,max     m / M   Edit just min / max",
@@ -1031,6 +1036,9 @@ fn run() -> Result<()> {
     app.default_window = window_from_range(base_range);
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     app.sync_layer_order(layers.overlays.len());
+    if let Some(scene) = config.scene.as_ref() {
+        scene.apply_to_loaded(&mut app, &mut layers)?;
+    }
     if let Some(count) = config.benchmark_frames {
         return benchmark(&vol, &layers, &mut app, count);
     }
@@ -1144,6 +1152,21 @@ fn run() -> Result<()> {
                             Action::Layout => {
                                 pending_layout = true;
                                 pending_frame = true;
+                            }
+                            Action::SaveScene(path) => {
+                                match scene::save(&path, &config, &app, &layers) {
+                                    Ok(()) => {
+                                        app.scene_path = Some(
+                                            std::fs::canonicalize(&path).unwrap_or(path.clone()),
+                                        );
+                                        app.notice =
+                                            Some(format!("Scene saved: {}", path.display()));
+                                    }
+                                    Err(err) => {
+                                        app.notice = Some(format!("Scene save failed: {err:#}"));
+                                    }
+                                }
+                                pending_ui = true;
                             }
                             Action::LoadOverlays(paths) => {
                                 let mut loaded = 0usize;
@@ -1365,6 +1388,7 @@ mod layer_list_order_tests {
                 .collect::<Vec<_>>(),
             vec![2, 1, 0]
         );
+        // A six-row window within a larger stack is still top-first.
         assert_eq!(
             (0..3)
                 .map(|row| top_first_position(5, 3, row))

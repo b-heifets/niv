@@ -1,0 +1,50 @@
+# Example for `niv --scene examples/demo_scene.niv.toml` from the niv source.
+# Paths are resolved relative to this scene file, not the current directory.
+version = 1
+
+[view]
+axis = "x"
+slice = 48
+rotation = 90
+stride = 1
+flip_h = false
+flip_v = false
+selected = 0
+show_overlays = true
+fullscreen = false
+inspect_mode = false
+
+[render]
+background = "black"
+pixel_budget = 1000000
+fps = 30
+hover_delay_ms = 20
+mouse_pixels = false
+enhanced_keys = true
+
+[atlas]
+path = "../data/demo_atlas.nii.gz"
+kind = "solid"
+lut = "../data/demo_lut.csv"
+color = "#ffffff"
+opacity = 1.0
+width = 1
+aa = true
+visible = true
+
+# Layers are listed TOP to BOTTOM, atlas is always above them.
+[[layers]]
+role = "overlay"
+path = "../data/demo_activation.nii.gz"
+window = [2.0, 10.0]
+opacity = 0.65
+palette = "warm"
+visible = true
+
+[[layers]]
+role = "base"
+path = "../data/sample.nii.gz"
+window = [0.0, 250.0]
+opacity = 1.0
+palette = "gray"
+visible = true

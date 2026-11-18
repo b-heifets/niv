@@ -914,6 +914,7 @@ mod layer_tests {
         let atlas = volume(vec![0., 0., 0.]);
         let layers = Layers {
             overlays: vec![IntensityOverlay {
+                path: std::path::PathBuf::from("test.nii.gz"),
                 vol: top,
                 window: (2., 9.),
                 default_window: (2., 9.),
@@ -950,6 +951,7 @@ mod layer_tests {
         let label = volume(vec![0., 7., 0.]);
         let mut layers = Layers {
             overlays: vec![IntensityOverlay {
+                path: std::path::PathBuf::from("test.nii.gz"),
                 vol: volume(vec![9., 9., 9.]),
                 window: (0., 10.),
                 default_window: (0., 10.),
@@ -994,6 +996,7 @@ mod layer_tests {
         let top = volume(vec![0., 0., 5.]);
         let layers = Layers {
             overlays: vec![IntensityOverlay {
+                path: std::path::PathBuf::from("test.nii.gz"),
                 vol: top,
                 window: (0., 10.),
                 default_window: (0., 10.),

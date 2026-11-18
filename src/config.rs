@@ -38,12 +38,15 @@ pub struct Config {
     pub benchmark_frames: Option<usize>,
     pub pixel_budget: usize,
     pub profile: bool,
+    /// A fully specified scene overrides environment defaults.
+    pub scene: Option<crate::scene::SceneFile>,
 }
 
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE.nii.gz [-i FILE/GLOB ...] [--atlas FILE] [--lut FILE]
+       niv --scene FILE.niv.toml
 Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
-Keys: arrows/wheel slices · b RGB/RGBA · 1–9 select · e range · o opacity · n load · ? help
+Keys: arrows/wheel slices · 1–9 select · e range · o opacity · n load · s save scene · ? help
 Use --help for full options and controls.
 "#;
 
@@ -51,6 +54,15 @@ const HELP: &str = r#"niv — keyboard-driven NIfTI viewer using Kitty graphics
 
 USAGE
   niv FILE.nii[.gz] [-i IMAGE_OR_GLOB ...] [OPTIONS]
+  niv --scene FILE.niv.toml [--pixel-budget N] [--fps N] [--profile]
+
+SCENES
+  s                       Save current layers + viewing settings to .niv.toml
+  --scene FILE.niv.toml   Restore images, layer order, windows, palettes, atlas,
+                          opacity, slice/orientation, and rendering settings.
+                          Relative paths resolve from the scene file folder.
+                          With --scene, only --pixel-budget, --fps, --profile,
+                          and --bench may be supplied as overrides.
 
 VIEW
   -a, --axis x|y|z       Slice axis (default x; NIV_AXIS or NII_AXIS)
@@ -106,7 +118,7 @@ LAYERS
   n                        Open filterable NIfTI picker (substring matches)
                            ↑↓ select · Tab complete/cycle · Space mark multiple
                            → browse directory · Enter load chosen images
-  t                        Toggle layer list (top image first; Esc closes list)
+  t                        Toggle layer list (top image first); Esc closes list
                            Space show/hide selected overlay
   e                        Edit selected layer display min,max
   m / M                    Edit only min / max; 0 reset to data min,max
@@ -132,7 +144,29 @@ work in both modes; transparent terminal background requires Kitty RGBA (f=32).
 "#;
 
 pub fn parse() -> Result<Option<Config>> {
-    let mut args = env::args().skip(1).peekable();
+    let argv: Vec<String> = env::args().skip(1).collect();
+    // Help/version can be requested even when --scene is also on the command line.
+    if argv.iter().any(|a| a == "--help") {
+        print!("{HELP}");
+        return Ok(None);
+    }
+    if argv.iter().any(|a| a == "-h") {
+        print!("{SHORT_HELP}");
+        return Ok(None);
+    }
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("niv {}", env!("CARGO_PKG_VERSION"));
+        return Ok(None);
+    }
+    // A saved scene is a self-contained input mode. Accept only resource/perf
+    // overrides alongside --scene so layer options cannot silently conflict.
+    if argv
+        .iter()
+        .any(|a| a == "--scene" || a.starts_with("--scene="))
+    {
+        return Ok(Some(crate::scene::config_from_args(&argv)?));
+    }
+    let mut args = argv.into_iter().peekable();
     let mut axis = Axis::parse(
         &env::var("NIV_AXIS")
             .or_else(|_| env::var("NII_AXIS"))
@@ -379,6 +413,7 @@ pub fn parse() -> Result<Option<Config>> {
         benchmark_frames,
         pixel_budget,
         profile,
+        scene: None,
     }))
 }
 
