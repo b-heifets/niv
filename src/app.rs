@@ -17,6 +17,7 @@ pub enum EditField {
     SaveScene,
 }
 
+#[derive(Clone)]
 pub struct WindowEdit {
     pub field: EditField,
     pub text: String,
@@ -31,7 +32,37 @@ pub enum Popup {
     Info,
 }
 
+/// A montage shows the inclusive slice range in a single image, divided into
+/// pages at the chosen number of columns. The atlas is rendered above every tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MontageState {
+    pub enabled: bool,
+    pub start: usize,
+    pub stop: usize,
+    /// Difference in slice indices between consecutive thumbnails.
+    pub interval: usize,
+    /// Fewer columns means larger (zoomed-in) thumbnails.
+    pub columns: usize,
+    /// Gap in output raster pixels (at the selected pixel budget).
+    pub gap: usize,
+}
+
+impl Default for MontageState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start: 0,
+            stop: 0,
+            interval: 5,
+            columns: 4,
+            gap: 8,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct App {
+    pub montage: MontageState,
     pub axis: Axis,
     pub index: usize,
     pub stride: usize,
@@ -61,6 +92,7 @@ pub struct App {
     pub probe: Option<(usize, usize)>,
     pub edit: Option<WindowEdit>,
     pub popup: Option<Popup>,
+    pub popup_scroll: usize,
     pub notice: Option<String>,
     /// Most recently loaded or saved scene; shown as the default save path.
     pub scene_path: Option<PathBuf>,
@@ -87,6 +119,7 @@ impl App {
         path: String,
     ) -> Self {
         Self {
+            montage: MontageState::default(),
             axis,
             index,
             stride,
@@ -113,9 +146,41 @@ impl App {
             probe: None,
             edit: None,
             popup: None,
+            popup_scroll: 0,
             notice: None,
             scene_path: None,
         }
+    }
+
+    /// Called after the reference volume is available, or when the slicing axis
+    /// changes. Avoids letting a saved bound exceed the axis depth.
+    pub fn reset_montage(&mut self, vol: &Volume) {
+        self.montage.start = 0;
+        self.montage.stop = vol.depth(self.axis) - 1;
+        self.montage.interval = 5;
+        self.montage.columns = 4;
+        self.montage.gap = 8;
+    }
+
+    pub fn normalize_montage(&mut self, vol: &Volume) {
+        let last = vol.depth(self.axis) - 1;
+        self.montage.start = self.montage.start.min(last);
+        self.montage.stop = self.montage.stop.min(last).max(self.montage.start);
+        self.montage.interval = self.montage.interval.clamp(1, 256);
+        self.montage.columns = self.montage.columns.clamp(1, 12);
+        self.montage.gap = self.montage.gap.min(32);
+        if self.montage.enabled {
+            self.snap_montage_index();
+        }
+    }
+
+    fn snap_montage_index(&mut self) {
+        let m = self.montage;
+        let interval = m.interval.max(1);
+        let clamped = self.index.clamp(m.start, m.stop);
+        let step =
+            ((clamped - m.start + interval / 2) / interval).min((m.stop - m.start) / interval);
+        self.index = m.start + step * interval;
     }
 
     /// Keep the stack in sync after a new aligned image has been loaded.
@@ -229,11 +294,26 @@ impl App {
         self.axis = axis;
         self.probe = None;
         self.index = (fraction * (new_len - 1) as f64).round() as usize;
+        self.montage.start = 0;
+        self.montage.stop = new_len - 1;
+        if self.montage.enabled {
+            self.snap_montage_index();
+        }
     }
 
     pub fn move_slices(&mut self, vol: &Volume, delta: isize) -> bool {
-        let new_index =
-            (self.index as isize + delta).clamp(0, vol.depth(self.axis) as isize - 1) as usize;
+        let new_index = if self.montage.enabled {
+            let m = self.montage;
+            let interval = m.interval.max(1);
+            let current = (self.index.saturating_sub(m.start) + interval / 2) / interval;
+            let maximum = (m.stop - m.start) / interval;
+            let next = current.saturating_add_signed(delta).min(maximum);
+            m.start + next * interval
+        } else {
+            self.index
+                .saturating_add_signed(delta)
+                .min(vol.depth(self.axis) - 1)
+        };
         let changed = new_index != self.index;
         self.index = new_index;
         changed
@@ -526,6 +606,23 @@ impl App {
             return match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('/') => {
                     self.popup = None;
+                    self.popup_scroll = 0;
+                    Action::Layout
+                }
+                KeyCode::Up => {
+                    self.popup_scroll = self.popup_scroll.saturating_sub(1);
+                    Action::Layout
+                }
+                KeyCode::Down => {
+                    self.popup_scroll = self.popup_scroll.saturating_add(1);
+                    Action::Layout
+                }
+                KeyCode::PageUp => {
+                    self.popup_scroll = self.popup_scroll.saturating_sub(10);
+                    Action::Layout
+                }
+                KeyCode::PageDown => {
+                    self.popup_scroll = self.popup_scroll.saturating_add(10);
                     Action::Layout
                 }
                 KeyCode::Char('I') if popup == Popup::Info => {
@@ -554,14 +651,17 @@ impl App {
         match key.code {
             KeyCode::Char('?') | KeyCode::Char('/') => {
                 self.popup = Some(Popup::Help);
+                self.popup_scroll = 0;
                 Action::Layout
             }
             KeyCode::Char('I') => {
                 self.popup = Some(Popup::Info);
+                self.popup_scroll = 0;
                 Action::Layout
             }
             KeyCode::Char('i') if m.contains(KeyModifiers::SHIFT) => {
                 self.popup = Some(Popup::Info);
+                self.popup_scroll = 0;
                 Action::Layout
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -630,6 +730,14 @@ impl App {
                     Action::None
                 }
             }
+            KeyCode::Char('e') if m.contains(KeyModifiers::SHIFT) => {
+                self.montage.stop = self.index;
+                self.montage.start = self.montage.start.min(self.index);
+                if self.montage.enabled {
+                    self.snap_montage_index();
+                }
+                Action::Redraw
+            }
             KeyCode::Char('e') | KeyCode::Char('m') | KeyCode::Char('M') => {
                 // Crossterm enhanced-key reporting may send Shift+m as
                 // Char('m') + SHIFT instead of Char('M').
@@ -647,6 +755,38 @@ impl App {
                     checked: Vec::new(),
                 });
                 Action::Ui
+            }
+            KeyCode::Char('p') => {
+                self.montage.enabled = !self.montage.enabled;
+                if self.montage.enabled {
+                    self.inspect_mode = false;
+                }
+                self.normalize_montage(vol);
+                Action::Layout
+            }
+            KeyCode::Char('B') => {
+                self.montage.start = self.index;
+                self.montage.stop = self.montage.stop.max(self.index);
+                if self.montage.enabled {
+                    self.snap_montage_index();
+                }
+                Action::Redraw
+            }
+            KeyCode::Char('b') if m.contains(KeyModifiers::SHIFT) => {
+                self.montage.start = self.index;
+                self.montage.stop = self.montage.stop.max(self.index);
+                if self.montage.enabled {
+                    self.snap_montage_index();
+                }
+                Action::Redraw
+            }
+            KeyCode::Char('E') => {
+                self.montage.stop = self.index;
+                self.montage.start = self.montage.start.min(self.index);
+                if self.montage.enabled {
+                    self.snap_montage_index();
+                }
+                Action::Redraw
             }
             KeyCode::Char('c') => {
                 self.cycle_palette(layers);
@@ -714,6 +854,30 @@ impl App {
                 self.set_window(layers, self.default_selected_window(layers));
                 Action::Redraw
             }
+            KeyCode::Char('+') | KeyCode::Char('=') if self.montage.enabled => {
+                self.montage.columns = self.montage.columns.saturating_sub(1).max(1);
+                Action::Layout
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') if self.montage.enabled => {
+                self.montage.columns = (self.montage.columns + 1).min(12);
+                Action::Layout
+            }
+            KeyCode::Char('<') if self.montage.enabled => {
+                self.montage.gap = self.montage.gap.saturating_sub(1);
+                Action::Redraw
+            }
+            KeyCode::Char('>') if self.montage.enabled => {
+                self.montage.gap = (self.montage.gap + 1).min(32);
+                Action::Redraw
+            }
+            KeyCode::Char(',') if self.montage.enabled && m.contains(KeyModifiers::SHIFT) => {
+                self.montage.gap = self.montage.gap.saturating_sub(1);
+                Action::Redraw
+            }
+            KeyCode::Char('.') if self.montage.enabled && m.contains(KeyModifiers::SHIFT) => {
+                self.montage.gap = (self.montage.gap + 1).min(32);
+                Action::Redraw
+            }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.scale_window(layers, 0.8);
                 Action::Redraw
@@ -737,6 +901,16 @@ impl App {
             KeyCode::Char('}') => self.move_selected_layer(1),
             KeyCode::Char('[') if m.contains(KeyModifiers::SHIFT) => self.move_selected_layer(-1),
             KeyCode::Char(']') if m.contains(KeyModifiers::SHIFT) => self.move_selected_layer(1),
+            KeyCode::Char('[') if self.montage.enabled => {
+                self.montage.interval = self.montage.interval.saturating_sub(1).max(1);
+                self.snap_montage_index();
+                Action::Redraw
+            }
+            KeyCode::Char(']') if self.montage.enabled => {
+                self.montage.interval = self.montage.interval.saturating_add(1).min(256);
+                self.snap_montage_index();
+                Action::Redraw
+            }
             KeyCode::Char('[') => {
                 self.stride = self.stride.saturating_sub(1).max(1);
                 Action::Ui
@@ -746,19 +920,29 @@ impl App {
                 Action::Ui
             }
             KeyCode::PageUp => {
-                self.move_slices(vol, 25);
+                self.move_slices(vol, if self.montage.enabled { 8 } else { 25 });
                 Action::Redraw
             }
             KeyCode::PageDown => {
-                self.move_slices(vol, -25);
+                self.move_slices(vol, if self.montage.enabled { -8 } else { -25 });
                 Action::Redraw
             }
             KeyCode::Home => {
-                self.index = 0;
+                self.index = if self.montage.enabled {
+                    self.montage.start
+                } else {
+                    0
+                };
                 Action::Redraw
             }
             KeyCode::End => {
-                self.index = vol.depth(self.axis) - 1;
+                self.index = if self.montage.enabled {
+                    self.montage.start
+                        + (self.montage.stop - self.montage.start) / self.montage.interval
+                            * self.montage.interval
+                } else {
+                    vol.depth(self.axis) - 1
+                };
                 Action::Redraw
             }
             KeyCode::Up
@@ -1611,6 +1795,74 @@ mod tests {
         );
         assert!(parse_edit(EditField::Both, "5,1", (0., 10.)).is_err());
         assert!(parse_edit(EditField::Maximum, "NaN", (0., 10.)).is_err());
+    }
+
+    #[test]
+    fn montage_controls_and_bounds() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 30, 1, 90, (0., 1.), "test".into());
+        app.reset_montage(&vol);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('B'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.montage.start, 30);
+        app.index = 75;
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('E'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.montage.stop, 75);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        assert!(app.montage.enabled);
+        let cols = app.montage.columns;
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('+'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.montage.columns, cols - 1);
+        let step = app.montage.interval;
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.montage.interval, step + 1);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::End,
+            KeyModifiers::NONE,
+        );
+        assert!(app.index <= app.montage.stop);
+        assert!((app.index - app.montage.start) % app.montage.interval == 0);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        assert!(!app.montage.enabled);
     }
 }
 

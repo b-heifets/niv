@@ -46,7 +46,7 @@ const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE.nii.gz [-i FILE/GLOB ...] [--atlas FILE] [--lut FILE]
        niv --scene FILE.niv.toml
 Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
-Keys: arrows/wheel slices · 1–9 select · e range · o opacity · n load · s save scene · ? help
+Keys: arrows/wheel slices · p montage · B/E bounds · 1–9 select · n load · s scene · ? help
 Use --help for full options and controls.
 "#;
 
@@ -59,7 +59,7 @@ USAGE
 SCENES
   s                       Save current layers + viewing settings to .niv.toml
   --scene FILE.niv.toml   Restore images, layer order, windows, palettes, atlas,
-                          opacity, slice/orientation, and rendering settings.
+                          opacity, slice/orientation, montage, and rendering settings.
                           Relative paths resolve from the scene file folder.
                           With --scene, only --pixel-budget, --fps, --profile,
                           and --bench may be supplied as overrides.
@@ -112,6 +112,12 @@ NAVIGATION
   x / y / z                Slice axes; r / R rotate clockwise/counterclockwise
   f / v                    Flip horizontal / vertical; Tab image-only mode
   i                        Toggle keyboard voxel inspection
+  p                        Toggle paged montage (all image layers + atlas)
+  B / E                    Set montage start / stop at current slice
+  [ / ] (montage)          Decrease / increase montage slice interval
+  + / - (montage)          Zoom in / out (fewer / more thumbnail columns)
+  < / > (montage)          Decrease / increase montage tile gap
+  Mouse click (montage)    Select thumbnail slice; arrows/wheel move selection
 
 LAYERS
   1..9                     Select loaded layer; ; cycles selection

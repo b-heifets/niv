@@ -1,4 +1,4 @@
-# niv v0.14
+# niv v0.15
 
 Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
@@ -6,11 +6,11 @@ Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics term
 
 ```bash
 cd ~/Documents/_GitHub/niv
-# Extract the v0.14 source-only update here, or apply its patch if it fits your checkout.
+# Extract the v0.15 source-only update here, or apply its patch if it fits your checkout.
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # v0.14.0
+niv --version       # v0.15.0
 ```
 
 Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP includes updated Rust source files, `Cargo.toml`, `README.md`, and an example scene, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
@@ -41,6 +41,11 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | Control + direction | ×4 |
 | Option/Alt + direction | ×2 fallback for Command |
 | `[` / `]` | Decrease/increase base stride by one |
+| `p` | Toggle paged montage view (atlas and layers are retained) |
+| `B` / `E` (Shift+B / Shift+E) | Mark montage start / stop at the current slice |
+| `[` / `]` in montage | Decrease / increase slice spacing by one index |
+| `+` / `-` in montage | Zoom in / out (fewer / more columns) |
+| `<` / `>` in montage | Decrease / increase tile gap by one output pixel |
 | `b` | Toggle **black/RGB** ↔ **transparent/RGBA** background |
 | `a` | Toggle atlas outlines |
 | `g` | Toggle optional antialiasing for **solid-label atlas** contours (off by default) |
@@ -63,6 +68,47 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `q` | Quit (Esc dismisses popup/editor) |
 
 **Important:** Command/Super may be reserved by Ghostty, Rex, or the OS and not arrive as a terminal key modifier. Option/Alt has the same ×2 mapping as a fallback. Shift/Ctrl/Option support likewise depends on which input sequences your Rex client forwards.
+
+### Montage mode (v0.15)
+
+Press **`p`** to toggle between the single-slice viewer and a **paged montage**.
+Each thumbnail uses the same registered images, per-layer thresholds, opacity,
+color maps, atlas overlay, and orientation as single-slice mode. The atlas remains
+on top. The active tile has a thin gold border, and each thumbnail is labeled
+with its **zero-based slice index**. Click a tile to inspect/select that slice.
+
+The montage starts with the full range of the selected axis, a **5-slice
+interval**, **4 columns**, and **8 raster-pixel gaps**. A page contains as many
+aspect-correct tiles as fit in the terminal at the current pixel budget; use
+arrows/hjkl or the wheel to select consecutive montage positions. Navigating
+past the visible page shows the next or previous page. **Home/End** jump to
+first/last included slice; **PgUp/PgDn** jump eight montage positions.
+
+To choose a range, scroll to the desired first slice (in single-slice mode) and
+press **`B`**; scroll to the desired final slice and press **`E`**. The range is
+inclusive. Press `p` to enter montage. In montage mode:
+
+| Key | Effect |
+| --- | --- |
+| `B` / `E` | Set start/stop to the active slice |
+| `[` / `]` | Decrease/increase index interval (1–256) |
+| `+` / `-` | Zoom in/out by decreasing/increasing columns (1–12) |
+| `<` / `>` (Shift+`,` / Shift+`.`) | Adjust gap (0–32 pixels) |
+| `p` | Return to single-slice mode |
+
+**Performance:** All visible tiles are composited into a single RGB (or RGBA)
+frame and sent as one Kitty image. The existing `--pixel-budget` caps the **whole
+montage**, not each thumbnail; only the visible page is rasterized. The
+screen-to-voxel sampling map is computed once per tile size and reused across
+all thumbnail slices. A montage with many atlas-outlined tiles can still take
+longer to rasterize than a single slice, so zoom in or increase the slice
+interval if remote Rex performance drops.
+
+**Scene persistence:** Press `s` to save montage settings in `.niv.toml`, and
+restore with `niv --scene FILE.niv.toml`. The new optional `[view.montage]`
+section stores `enabled`, `start`, `stop`, `interval`, `columns`, and `gap`;
+older v0.14 scenes without it remain valid. Slicing axes are still *array
+X/Y/Z*, not anatomical reorientation. Only one montage page is shown at a time.
 
 ### Loading many images
 
@@ -142,7 +188,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Press `Esc` once to close the list; a second `Esc` exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
-## Save and reload scenes (v0.14)
+## Save and reload scenes (v0.15)
 
 Press **`s`** in the viewer to save your current scene. An editable filename prompt
 appears, defaulting to `<base-name>.niv.toml` in the current working directory,
@@ -164,7 +210,7 @@ share them with collaborators, or commit them to Git (they don't embed image
 bytes). They restore the base and additional NIfTI paths, **top-to-bottom layer
 ordering**, each layer's visibility, grayscale/color palette, display window
 and opacity, the atlas/LUT and atlas settings, slice/axis/rotation/flips,
-selected layer, inspection state, and performance defaults.
+selected layer, inspection state, montage range/layout, and performance defaults.
 
 `[[layers]]` entries are stored **top-to-bottom**, matching `t`; exactly one has `role = "base"`.
 The atlas is represented separately and always remains the topmost layer.

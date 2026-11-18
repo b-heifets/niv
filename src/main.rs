@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod kitty;
 mod layers;
+mod montage;
 mod path_complete;
 mod render;
 mod scene;
@@ -163,7 +164,11 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
         1 + list_count as u16 + extra as u16
     };
     let reserved = (head + footer_rows) as usize;
-    let geom = render::geometry(vol, app, cols, rows, reserved);
+    let geom = if app.montage.enabled {
+        montage::plan(vol, app, cols, rows, reserved).geom
+    } else {
+        render::geometry(vol, app, cols, rows, reserved)
+    };
     let available = rows.saturating_sub(head + footer_rows);
     let x = cols.saturating_sub(geom.cols) / 2;
     let y = head + available.saturating_sub(geom.rows) / 2;
@@ -335,8 +340,32 @@ fn draw_ui(
     let name_space =
         (cols as usize).saturating_sub(x as usize + prefix.len() + settings.chars().count() + 1);
     let name = middle_ellipsis(selected_name(app, layers), name_space);
-    let summary = format!("{prefix}{name}{settings}");
-    line(out, view.footer, &summary, cols, rgb_color(accent), x)?;
+    let summary = if app.montage.enabled {
+        let reserved = if app.fullscreen {
+            0
+        } else {
+            2 + 1 + view.list_count + usize::from(app.edit.is_some() || app.notice.is_some())
+        };
+        let plan = montage::plan(vol, app, cols, rows, reserved);
+        format!("Montage {}–{} / {}  |  grid {}×{}  |  gap {} px  |  {}/{} shown  |  page {}/{}  |  slice {}",
+            app.montage.start,app.montage.stop,app.montage.interval,
+            plan.columns,plan.rows,plan.gap,plan.tiles.len(),plan.total_slices,
+            plan.page+1,plan.pages,app.index)
+    } else {
+        format!("{prefix}{name}{settings}")
+    };
+    line(
+        out,
+        view.footer,
+        &summary,
+        cols,
+        if app.montage.enabled {
+            Color::Grey
+        } else {
+            rgb_color(accent)
+        },
+        x,
+    )?;
 
     for k in 0..view.list_count {
         let idx = top_first_position(view.list_start, view.list_count, k);
@@ -565,6 +594,14 @@ fn draw_popup(
                     "  [ / ] stride   r / R rotate   f / v flip   Tab fill",
                     "  i      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
+                    "MONTAGE (p toggles; rendered as one image)",
+                    "  B / E             Start / stop at current slice",
+                    "  [ / ]             Decrease / increase slice interval",
+                    "  + / -             Zoom in / out (fewer / more columns)",
+                    "  < / >             Decrease / increase tile gap (pixels)",
+                    "  Arrows / wheel    Select next / previous tile",
+                    "  PgUp / PgDn       Move 8 montage positions",
+                    "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
                     "  n      File picker: filter filename by substring",
@@ -625,18 +662,23 @@ fn draw_popup(
             ));
             lines.push(format!("Opacity    {:.0}%", app.base_opacity * 100.0));
             lines.push(format!(
-                "Background {} (Kitty {})",
-                if app.transparent_background {
-                    "transparent"
-                } else {
-                    "black"
-                },
+                "Background {}",
                 if app.transparent_background {
                     "RGBA"
                 } else {
                     "RGB"
                 }
             ));
+            if app.montage.enabled {
+                lines.push(format!(
+                    "Montage   {}..{} every {} | {} cols | gap {} px",
+                    app.montage.start,
+                    app.montage.stop,
+                    app.montage.interval,
+                    app.montage.columns,
+                    app.montage.gap
+                ));
+            }
             if let Some(atlas) = &layers.atlas {
                 lines.push(String::new());
                 lines.push(format!(
@@ -693,6 +735,7 @@ fn draw_popup(
     let content_w = width.saturating_sub(4);
     let max_lines = rows.saturating_sub(6) as usize;
     let showing = lines.len().min(max_lines);
+    let first = app.popup_scroll.min(lines.len().saturating_sub(showing));
     let block_h = showing + 4;
     let left = cols.saturating_sub(width as u16) / 2;
     let top = rows.saturating_sub(block_h as u16) / 2;
@@ -704,9 +747,9 @@ fn draw_popup(
     let fg = Color::Grey;
     let border_color = Color::DarkGrey;
     let title = if app.popup == Some(Popup::Help) {
-        " Help · ? / "
+        " Help · ↑↓ scroll · Esc close "
     } else {
-        " Image information · I "
+        " Image information · ↑↓ scroll · Esc close "
     };
     let bar = "─".repeat(width.saturating_sub(2));
     queue!(
@@ -741,16 +784,22 @@ fn draw_popup(
             ResetColor
         )?;
         if row < showing {
-            let text = crop(&lines[row], content_w);
+            let shown = &lines[first + row];
+            let text = crop(shown, content_w);
             queue!(
                 out,
                 MoveTo(left + 2, y),
                 SetBackgroundColor(bg),
-                SetForegroundColor(if lines[row] == "NAVIGATION" || lines[row] == "LAYERS" {
-                    Color::Yellow
-                } else {
-                    fg
-                }),
+                SetForegroundColor(
+                    if ["NAVIGATION", "LAYERS", "MONTAGE"]
+                        .iter()
+                        .any(|heading| shown.starts_with(heading))
+                    {
+                        Color::Yellow
+                    } else {
+                        fg
+                    }
+                ),
                 Print(text),
                 ResetColor
             )?;
@@ -817,24 +866,47 @@ fn draw(
     }
     let view = layout(vol, app, layers, cols, rows);
     let t = Instant::now();
-    if cache
-        .as_ref()
-        .is_none_or(|map| !map.matches(vol, app, view.geom.width, view.geom.height))
-    {
-        *cache = Some(render::SamplingMap::new(
+    let pixels = if app.montage.enabled {
+        let extra = usize::from(app.edit.is_some() || app.notice.is_some());
+        let head = if app.fullscreen { 0 } else { 2 };
+        let footer = if app.fullscreen {
+            0
+        } else {
+            1 + view.list_count + extra
+        };
+        let plan = montage::plan(vol, app, cols, rows, head + footer);
+        if cache
+            .as_ref()
+            .is_none_or(|map| !map.matches(vol, app, plan.tile_width, plan.tile_height))
+        {
+            *cache = Some(render::SamplingMap::new(
+                vol,
+                app,
+                plan.tile_width,
+                plan.tile_height,
+            ));
+        }
+        montage::composite(vol, app, layers, &plan, cache.as_ref().unwrap())
+    } else {
+        if cache
+            .as_ref()
+            .is_none_or(|map| !map.matches(vol, app, view.geom.width, view.geom.height))
+        {
+            *cache = Some(render::SamplingMap::new(
+                vol,
+                app,
+                view.geom.width,
+                view.geom.height,
+            ));
+        }
+        render::composite_with_map(
             vol,
             app,
-            view.geom.width,
-            view.geom.height,
-        ));
-    }
-    let pixels = render::composite_with_map(
-        vol,
-        app,
-        layers,
-        cache.as_ref().unwrap(),
-        app.transparent_background,
-    );
+            layers,
+            cache.as_ref().unwrap(),
+            app.transparent_background,
+        )
+    };
     let raster_time = t.elapsed();
     let t = Instant::now();
     let frame = kitty::encode_pixels(&pixels, app.transparent_background)?;
@@ -852,6 +924,44 @@ fn draw(
     stats.output += t.elapsed();
     stats.compressed_bytes += frame.bytes;
     Ok(view)
+}
+
+fn mouse_montage_tile(
+    vol: &Volume,
+    app: &App,
+    view: ViewLayout,
+    mouse: MouseEvent,
+    pixel_mouse: bool,
+) -> Option<(usize, (usize, usize))> {
+    let (cols, rows) = terminal::size().ok()?;
+    let (cw, ch) = render::cell_pixels(cols, rows);
+    let (rx, ry) = mouse_raster(view, mouse, pixel_mouse, cw, ch)?;
+    let extra = usize::from(app.edit.is_some() || app.notice.is_some());
+    let head = if app.fullscreen { 0 } else { 2 };
+    let footer = if app.fullscreen {
+        0
+    } else {
+        1 + view.list_count + extra
+    };
+    let plan = montage::plan(vol, app, cols, rows, head + footer);
+    for tile in &plan.tiles {
+        if rx >= tile.x
+            && ry >= tile.y
+            && rx < tile.x + plan.tile_width
+            && ry < tile.y + plan.tile_height
+        {
+            let probe = render::voxel_at_raster(
+                vol,
+                app,
+                rx - tile.x,
+                ry - tile.y,
+                plan.tile_width,
+                plan.tile_height,
+            )?;
+            return Some((tile.slice, probe));
+        }
+    }
+    None
 }
 
 fn mouse_voxel(
@@ -900,14 +1010,6 @@ fn mouse_raster(
         return None;
     }
     Some(((x / scale).floor() as usize, (y / scale).floor() as usize))
-}
-
-fn window_from_range((lo, hi): (f32, f32)) -> (f32, f32) {
-    if lo < hi {
-        (lo, hi)
-    } else {
-        (lo - 0.5, hi + 0.5)
-    }
 }
 
 fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, count: usize) -> Result<()> {
@@ -1016,9 +1118,7 @@ fn run() -> Result<()> {
         );
     }
     let base_range = vol.data_range();
-    let window = config
-        .window
-        .unwrap_or_else(|| window_from_range(base_range));
+    let window = config.window.unwrap_or_else(|| vol.auto_window());
     let mut layers = Layers::load(&config, &vol)?;
     let name = layers::short_name(&config.path);
     let mut app = App::new(
@@ -1033,12 +1133,14 @@ fn run() -> Result<()> {
     app.atlas_aa = config.atlas_aa;
     app.base_opacity = config.base_opacity;
     app.transparent_background = config.transparent_background;
-    app.default_window = window_from_range(base_range);
+    app.default_window = vol.auto_window();
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     app.sync_layer_order(layers.overlays.len());
+    app.reset_montage(&vol);
     if let Some(scene) = config.scene.as_ref() {
         scene.apply_to_loaded(&mut app, &mut layers)?;
     }
+    app.normalize_montage(&vol);
     if let Some(count) = config.benchmark_frames {
         return benchmark(&vol, &layers, &mut app, count);
     }
@@ -1109,7 +1211,11 @@ fn run() -> Result<()> {
                         if matches!(action, Action::Redraw | Action::Layout) {
                             // Slice/axis change: update the region associated with
                             // the cursor; don't retain an outline from another slice.
-                            if app.inspect_mode || app.probe.is_none() || !app.show_atlas {
+                            if app.montage.enabled
+                                || app.inspect_mode
+                                || app.probe.is_none()
+                                || !app.show_atlas
+                            {
                                 app.highlighted_region = None;
                                 hover_candidate = None;
                                 hover_deadline = None;
@@ -1229,10 +1335,24 @@ fn run() -> Result<()> {
                                 navigated = true;
                             }
                         }
+                        MouseEventKind::Down(_)
+                            if app.montage.enabled && app.edit.is_none() && app.popup.is_none() =>
+                        {
+                            if let Some((slice, probe)) =
+                                mouse_montage_tile(&vol, &app, view, mouse, config.mouse_pixels)
+                            {
+                                app.index = slice;
+                                app.probe = Some(probe);
+                                pending_frame = true;
+                            }
+                        }
                         MouseEventKind::Moved
                         | MouseEventKind::Drag(_)
                         | MouseEventKind::Down(_)
-                            if !app.inspect_mode && app.edit.is_none() && app.popup.is_none() =>
+                            if !app.montage.enabled
+                                && !app.inspect_mode
+                                && app.edit.is_none()
+                                && app.popup.is_none() =>
                         {
                             let next = mouse_voxel(&vol, &app, view, mouse, config.mouse_pixels);
                             if app.probe != next {

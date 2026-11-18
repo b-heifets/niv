@@ -1,7 +1,7 @@
 //! Human-editable, versioned TOML scenes. A scene is configuration, not executable
 //! shell commands; paths are resolved relative to the scene file when possible.
 use crate::{
-    app::App,
+    app::{App, MontageState},
     config::{Config, OverlaySpec},
     layers::{Layers, Palette},
     volume::Axis,
@@ -44,6 +44,45 @@ struct SceneView {
     inspect_mode: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe: Option<[usize; 2]>,
+    /// Optional for backward compatibility with v0.14 scene files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    montage: Option<SceneMontage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SceneMontage {
+    enabled: bool,
+    start: usize,
+    stop: usize,
+    interval: usize,
+    columns: usize,
+    gap: usize,
+}
+
+impl From<MontageState> for SceneMontage {
+    fn from(m: MontageState) -> Self {
+        Self {
+            enabled: m.enabled,
+            start: m.start,
+            stop: m.stop,
+            interval: m.interval,
+            columns: m.columns,
+            gap: m.gap,
+        }
+    }
+}
+impl From<&SceneMontage> for MontageState {
+    fn from(m: &SceneMontage) -> Self {
+        Self {
+            enabled: m.enabled,
+            start: m.start,
+            stop: m.stop,
+            interval: m.interval,
+            columns: m.columns,
+            gap: m.gap,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +265,7 @@ impl SceneFile {
                 fullscreen: app.fullscreen,
                 inspect_mode: app.inspect_mode,
                 probe: app.probe.map(|(x, y)| [x, y]),
+                montage: Some(app.montage.into()),
             },
             render: SceneRender {
                 background: if app.transparent_background {
@@ -261,6 +301,20 @@ impl SceneFile {
         }
         if self.view.selected >= self.layers.len() {
             bail!("Selected layer is outside stack");
+        }
+        if let Some(m) = &self.view.montage {
+            if m.start > m.stop {
+                bail!("Montage start must not exceed stop");
+            }
+            if !(1..=256).contains(&m.interval) {
+                bail!("Montage interval must be 1..256");
+            }
+            if !(1..=12).contains(&m.columns) {
+                bail!("Montage columns must be 1..12");
+            }
+            if m.gap > 32 {
+                bail!("Montage gap must be 0..32");
+            }
         }
         Axis::parse(&self.view.axis)?;
         if !matches!(self.view.rotation, 0 | 90 | 180 | 270) {
@@ -351,6 +405,9 @@ impl SceneFile {
         app.fullscreen = self.view.fullscreen;
         app.inspect_mode = self.view.inspect_mode;
         app.probe = self.view.probe.map(|[h, v]| (h, v));
+        if let Some(m) = &self.view.montage {
+            app.montage = m.into();
+        }
         app.scene_path = self.source.clone();
         app.show_atlas = self.atlas.as_ref().is_some_and(|a| a.visible);
         if let (Some(saved), Some(atlas)) = (&self.atlas, &mut layers.atlas) {
@@ -696,6 +753,7 @@ visible = false
                 fullscreen: false,
                 inspect_mode: false,
                 probe: None,
+                montage: None,
             },
             render: SceneRender {
                 background: "black".into(),
@@ -722,5 +780,37 @@ visible = false
         v.layers[0].palette = "gray".into();
         v.layers[0].window = [2.0, 1.0];
         assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn montage_scene_backward_compatible_and_roundtrips() {
+        let mut v = SceneView {
+            axis: "z".into(),
+            slice: 7,
+            rotation: 90,
+            stride: 1,
+            flip_h: false,
+            flip_v: false,
+            selected: 0,
+            show_overlays: true,
+            fullscreen: false,
+            inspect_mode: false,
+            probe: None,
+            montage: None,
+        };
+        let old = toml::to_string(&v).unwrap();
+        assert!(toml::from_str::<SceneView>(&old).unwrap().montage.is_none());
+        let m = MontageState {
+            enabled: true,
+            start: 2,
+            stop: 36,
+            interval: 4,
+            columns: 3,
+            gap: 6,
+        };
+        v.montage = Some(m.into());
+        let text = toml::to_string(&v).unwrap();
+        let parsed: SceneView = toml::from_str(&text).unwrap();
+        assert_eq!(MontageState::from(parsed.montage.as_ref().unwrap()), m);
     }
 }
