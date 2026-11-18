@@ -304,6 +304,7 @@ impl SamplingMap {
     }
 }
 
+#[cfg(test)]
 pub fn composite_format(
     vol: &Volume,
     app: &App,

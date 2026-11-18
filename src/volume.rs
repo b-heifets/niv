@@ -196,6 +196,7 @@ impl Volume {
 
     /// Exact finite data range, with a nonzero window for constant volumes.
     /// Values <= display minimum are transparent, by design.
+    #[cfg(test)]
     pub fn auto_window(&self) -> (f32, f32) {
         let (lo, hi) = self.data_range();
         if lo < hi {
