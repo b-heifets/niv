@@ -21,6 +21,7 @@ pub struct WindowEdit {
     pub text: String,
     pub error: Option<String>,
     pub completion: Option<PathMatches>,
+    pub checked: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +69,7 @@ pub enum Action {
     Redraw,
     Ui,
     Layout,
-    LoadOverlay(PathBuf),
+    LoadOverlays(Vec<PathBuf>),
     None,
 }
 
@@ -293,7 +294,127 @@ impl App {
         }
     }
 
+    fn picker_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Action {
+        let editor = self.edit.as_mut().expect("picker is open");
+        match key {
+            KeyCode::Esc => {
+                self.edit = None;
+                Action::Layout
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                if let Some(matches) = editor.completion.as_mut() {
+                    let delta = match key {
+                        KeyCode::Up => -1,
+                        KeyCode::Down => 1,
+                        KeyCode::PageUp => -10,
+                        _ => 10,
+                    };
+                    matches.move_by(delta);
+                }
+                Action::Layout
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(matches) = editor.completion.as_mut() {
+                    path_complete::advance(
+                        &mut editor.text,
+                        matches,
+                        key == KeyCode::BackTab || modifiers.contains(KeyModifiers::SHIFT),
+                    );
+                }
+                Action::Layout
+            }
+            KeyCode::Right => {
+                if let Some(m) = editor.completion.as_ref().and_then(|m| m.selected()) {
+                    if m.is_dir {
+                        editor.text = m.path.clone();
+                        editor.completion = Some(path_complete::search(&editor.text));
+                        editor.error = None;
+                    } else {
+                        editor.text = m.path.clone();
+                        editor.completion = Some(path_complete::search(&editor.text));
+                    }
+                }
+                Action::Layout
+            }
+            KeyCode::Char(' ') => {
+                if let Some(m) = editor.completion.as_ref().and_then(|m| m.selected()) {
+                    if !m.is_dir {
+                        let path = path_complete::resolve(&m.path);
+                        if let Some(i) = editor.checked.iter().position(|p| p == &path) {
+                            editor.checked.remove(i);
+                        } else {
+                            editor.checked.push(path);
+                        }
+                    }
+                }
+                Action::Layout
+            }
+            KeyCode::Enter => {
+                if !editor.checked.is_empty() {
+                    let paths = std::mem::take(&mut editor.checked);
+                    self.edit = None;
+                    return Action::LoadOverlays(paths);
+                }
+                let candidate = editor.completion.as_ref().and_then(|m| m.selected());
+                let path = candidate
+                    .map(|m| m.path.clone())
+                    .unwrap_or_else(|| editor.text.clone());
+                if path.is_empty() {
+                    editor.error = Some("Choose an image or type a filename substring".into());
+                    return Action::Layout;
+                }
+                let path = path_complete::resolve(&path);
+                if path.is_dir() {
+                    let mut dir = path.to_string_lossy().into_owned();
+                    if !dir.ends_with('/') {
+                        dir.push('/');
+                    }
+                    editor.text = dir;
+                    editor.completion = Some(path_complete::search(&editor.text));
+                    editor.error = None;
+                    return Action::Layout;
+                }
+                if !path_complete::is_nifti_file(&path) {
+                    editor.error = Some(format!(
+                        "Not an existing .nii or .nii.gz file: {}",
+                        path.display()
+                    ));
+                    return Action::Layout;
+                }
+                self.edit = None;
+                Action::LoadOverlays(vec![path])
+            }
+            KeyCode::Backspace => {
+                editor.text.pop();
+                editor.completion = Some(path_complete::search(&editor.text));
+                editor.error = None;
+                Action::Layout
+            }
+            KeyCode::Char(c) if editor.text.len() < 4096 && !c.is_control() => {
+                // Ghostty/Rex may report Shift+- as Char('-') with SHIFT, not Char('_').
+                // Accept both forms; keep the unshifted hyphen unchanged.
+                let typed = if c == '-' && modifiers.contains(KeyModifiers::SHIFT) {
+                    '_'
+                } else {
+                    c
+                };
+                editor.text.push(typed);
+                editor.completion = Some(path_complete::search(&editor.text));
+                editor.error = None;
+                Action::Layout
+            }
+            _ => Action::None,
+        }
+    }
+
     fn edit_key(&mut self, layers: &mut Layers, key: KeyCode, modifiers: KeyModifiers) -> Action {
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|e| e.field == EditField::AddPath)
+        {
+            return self.picker_key(key, modifiers);
+        }
         let Some(editor) = self.edit.as_mut() else {
             return Action::None;
         };
@@ -304,17 +425,6 @@ impl App {
             }
             KeyCode::Enter => {
                 let (field, text) = (editor.field, editor.text.trim().to_owned());
-                if field == EditField::AddPath {
-                    if text.is_empty() {
-                        if let Some(e) = self.edit.as_mut() {
-                            e.error = Some("Enter an image path".into());
-                        }
-                        return Action::Ui;
-                    }
-                    self.edit = None;
-                    let path = path_complete::resolve(&text);
-                    return Action::LoadOverlay(path);
-                }
                 if field == EditField::LayerOpacity || field == EditField::AtlasOpacity {
                     let value = text
                         .parse::<f32>()
@@ -357,30 +467,17 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab if editor.field == EditField::AddPath => {
-                path_complete::advance(
-                    &mut editor.text,
-                    &mut editor.completion,
-                    key == KeyCode::BackTab || modifiers.contains(KeyModifiers::SHIFT),
-                );
-                editor.error = None;
-                Action::Ui
-            }
             KeyCode::Backspace => {
                 editor.text.pop();
                 editor.error = None;
-                editor.completion = None;
                 Action::Ui
             }
             KeyCode::Char(c)
                 if editor.text.len() < 1024
-                    && (editor.field == EditField::AddPath
-                        || (c.is_ascii_digit()
-                            || matches!(c, ',' | '.' | '-' | '+' | 'e' | 'E'))) =>
+                    && (c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | '+' | 'e' | 'E')) =>
             {
                 editor.text.push(c);
                 editor.error = None;
-                editor.completion = None;
                 Action::Ui
             }
             _ => Action::None,
@@ -406,6 +503,10 @@ impl App {
                     self.popup = None;
                     Action::Layout
                 }
+                KeyCode::Char('i') if popup == Popup::Info && m.contains(KeyModifiers::SHIFT) => {
+                    self.popup = None;
+                    Action::Layout
+                }
                 _ => Action::None,
             };
         }
@@ -424,14 +525,19 @@ impl App {
                 self.popup = Some(Popup::Info);
                 Action::Layout
             }
+            KeyCode::Char('i') if m.contains(KeyModifiers::SHIFT) => {
+                self.popup = Some(Popup::Info);
+                Action::Layout
+            }
             KeyCode::Char('n') => {
                 self.edit = Some(WindowEdit {
                     field: EditField::AddPath,
                     text: String::new(),
                     error: None,
-                    completion: None,
+                    completion: Some(path_complete::search("")),
+                    checked: Vec::new(),
                 });
-                Action::Ui
+                Action::Layout
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 // Kitty enhanced keys can report uppercase O as lowercase 'o' + SHIFT.
@@ -449,6 +555,7 @@ impl App {
                     text: String::new(),
                     error: None,
                     completion: None,
+                    checked: Vec::new(),
                 });
                 Action::Ui
             }
@@ -487,6 +594,7 @@ impl App {
                     text: String::new(),
                     error: None,
                     completion: None,
+                    checked: Vec::new(),
                 });
                 Action::Ui
             }
@@ -949,25 +1057,169 @@ mod tests {
             KeyCode::Char('n'),
             KeyModifiers::NONE,
         );
-        for c in "~/test.nii.gz".chars() {
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::AddPath);
+        assert!(app.edit.as_ref().unwrap().completion.is_some());
+    }
+    #[test]
+    fn shifted_i_opens_and_closes_info_but_lowercase_i_inspects() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 10, 1, 0, (0., 100.), "test".into());
+        assert_eq!(
             key(
                 &mut app,
                 &vol,
                 &mut layers,
-                KeyCode::Char(c),
+                KeyCode::Char('i'),
+                KeyModifiers::SHIFT
+            ),
+            Action::Layout
+        );
+        assert_eq!(app.popup, Some(Popup::Info));
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('i'),
+                KeyModifiers::SHIFT
+            ),
+            Action::Layout
+        );
+        assert_eq!(app.popup, None);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+        );
+        assert!(app.inspect_mode);
+    }
+    #[test]
+    fn picker_can_filter_and_mark_multiple_images() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "niv-picker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("first_z.nii.gz"), b"").unwrap();
+        fs::write(root.join("second_z.nii.gz"), b"").unwrap();
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        );
+        let filter = format!("{}/z.nii", root.display());
+        for ch in filter.chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(ch),
                 KeyModifiers::NONE,
             );
         }
-        assert!(matches!(
-            key(
-                &mut app,
-                &vol,
-                &mut layers,
-                KeyCode::Enter,
-                KeyModifiers::NONE
-            ),
-            Action::LoadOverlay(_)
-        ));
+        assert_eq!(
+            app.edit
+                .as_ref()
+                .unwrap()
+                .completion
+                .as_ref()
+                .unwrap()
+                .values
+                .len(),
+            2
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        let result = key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        match result {
+            Action::LoadOverlays(paths) => assert_eq!(paths.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        assert!(app.edit.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn picker_accepts_underscores_with_both_terminal_key_encodings() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        );
+
+        // Enhanced keyboard reporting can send the keycode plus Shift.
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('-'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.edit.as_ref().unwrap().text, "_");
+        // Other terminals send the resulting character directly.
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('_'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.edit.as_ref().unwrap().text, "__");
+        // A plain hyphen remains a hyphen.
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('-'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.edit.as_ref().unwrap().text, "__-");
     }
     #[test]
     fn shifted_m_edits_maximum_even_with_lowercase_keycode() {
