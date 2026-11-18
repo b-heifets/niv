@@ -331,18 +331,29 @@ pub fn composite_with_map(
     let coords = &map.coords;
     let channels = if transparent_background { 4 } else { 3 };
     let mut raster = vec![0u8; width * height * channels];
-    for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
-        let value = vol.sample(app.axis, app.index, h, v);
-        if !value.is_finite() || value <= app.window.0 {
-            continue;
-        }
-        let color = app
-            .base_palette
-            .voxel_color(value, app.window.0, app.window.1, 0);
-        blend_pixel(px, color, app.base_opacity);
-    }
-    if app.show_overlays {
-        for (idx, layer) in layers.overlays.iter().enumerate() {
+    // Composite images from bottom to top. IDs refer to loaded images;
+    // stack positions can change without moving or reloading large volumes.
+    for position in 0..=layers.overlays.len() {
+        let id = app.layer_at(position);
+        if id == 0 {
+            if app.base_opacity <= 0.0 {
+                continue;
+            }
+            for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
+                let value = vol.sample(app.axis, app.index, h, v);
+                if !value.is_finite() || value <= app.window.0 {
+                    continue;
+                }
+                let color = app
+                    .base_palette
+                    .voxel_color(value, app.window.0, app.window.1, 0);
+                blend_pixel(px, color, app.base_opacity);
+            }
+        } else {
+            if !app.show_overlays {
+                continue;
+            }
+            let layer = &layers.overlays[id - 1];
             if !layer.visible || layer.opacity <= 0.0 {
                 continue;
             }
@@ -352,7 +363,7 @@ pub fn composite_with_map(
                 if !value.is_finite() || value <= lo {
                     continue;
                 }
-                let color = layer.palette.voxel_color(value, lo, hi, idx + 1);
+                let color = layer.palette.voxel_color(value, lo, hi, id);
                 blend_pixel(px, color, layer.opacity);
             }
         }
@@ -933,6 +944,50 @@ mod layer_tests {
             &[100, 100, 100, 255]
         );
     }
+    #[test]
+    fn reordered_base_can_render_above_overlay_without_losing_atlas() {
+        let base = volume(vec![5., 5., 5.]);
+        let label = volume(vec![0., 7., 0.]);
+        let mut layers = Layers {
+            overlays: vec![IntensityOverlay {
+                vol: volume(vec![9., 9., 9.]),
+                window: (0., 10.),
+                default_window: (0., 10.),
+                data_range: (0., 9.),
+                palette: crate::layers::Palette::Solid([255, 0, 0]),
+                visible: true,
+                opacity: 1.0,
+                name: "red".into(),
+            }],
+            atlas: Some(Atlas {
+                vol: label,
+                wireframe: true,
+                labels: None,
+                fallback: [0, 255, 0],
+                width: 1,
+                opacity: 1.0,
+                regions: HashMap::new(),
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 10.), "base".into());
+        app.sync_layer_order(layers.overlays.len());
+        let initial = composite_format(&base, &app, &layers, 3, 1, false);
+        assert_eq!(&initial[0..3], &[255, 0, 0]); // overlay on top
+        assert_eq!(&initial[3..6], &[0, 255, 0]); // atlas above both
+
+        // Base image becomes highest intensity layer; atlas remains uppermost.
+        app.layer_order.swap(0, 1);
+        let reordered = composite_format(&base, &app, &layers, 3, 1, false);
+        assert_eq!(&reordered[0..3], &[128, 128, 128]); // base above overlay
+        assert_eq!(&reordered[3..6], &[0, 255, 0]);
+        assert_eq!(layers.overlays[0].window, (0., 10.));
+
+        // Hidden overlay stays hidden after moving it.
+        layers.overlays[0].visible = false;
+        let hidden = composite_format(&base, &app, &layers, 3, 1, false);
+        assert_eq!(&hidden[0..3], &[128, 128, 128]);
+    }
+
     #[test]
     fn rgb_mode_blends_overlays_but_uses_opaque_black_for_empty_voxels() {
         let base = volume(vec![0., 10., 10.]);

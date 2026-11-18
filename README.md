@@ -1,4 +1,4 @@
-# niv v0.11
+# niv v0.12
 
 Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
@@ -6,11 +6,11 @@ Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics term
 
 ```bash
 cd ~/Documents/_GitHub/niv
-# Extract v0.11 source-only update into this directory, or apply the patch if it fits your checkout.
+# Extract v0.12 source-only update into this directory, or apply the patch if it fits your checkout.
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # v0.11.0
+niv --version       # v0.12.0
 ```
 
 The full project ZIP contains `niv-rust/` as its top-level directory. The source-only ZIP contains `src/`, `Cargo.toml`, and `README.md` directly, ready to extract into your repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
@@ -26,7 +26,7 @@ niv brain.nii.gz --atlas-aa                 # optional smoother atlas edges
 niv brain.nii.gz --fps 20 --profile        # if Rex still queues images after key release
 ```
 
-The screen has a colored region name at the upper left, `Press ? for help` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers, while `I` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity/path editors temporarily appear at the bottom.
+The screen has a colored region name at the upper left, `Press ? for help` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers in **bottom-to-top order**, while `I` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity/path editors temporarily appear at the bottom.
 
 ### Keys
 
@@ -44,13 +44,14 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `?` or `/` | Popup keyboard help |
 | `I` | Metadata and full layer names |
 | `n` | Load another registered image; Tab completes/extends, Tab again cycles, Shift+Tab reverses |
-| `1`–`9`; `;` | Select layer; cycle beyond nine layers |
+| `1`–`9`; `;` | Select image by current stack position (1 = bottom); cycle beyond nine layers |
+| `{` / `}` (Shift+`[` / Shift+`]`) | Move selected image down / up one position in the stack |
 | `e`, `m`, `M` | Edit selected-layer range / only min / only max |
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `c` | Cycle gray → warm → cool → categorical integer-ID palette |
 | `t` | Show/hide layer list |
-| Space | Toggle selected overlay visibility |
+| Space | Toggle selected overlay visibility (original base image stays visible) |
 | `i` | Keyboard inspection crosshair (arrows move probe) |
 | `x`,`y`,`z` | Change array slicing axis |
 | `r`,`R` | Rotate clockwise / counterclockwise |
@@ -119,3 +120,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 - Runtime `n` image loading and `.nii.gz` decompression are synchronous; loading large files can briefly block the UI.
 - Hover events, Command modifier events and pixel-mouse tracking are client-dependent.
 - `cargo test` and interactive visual testing should be run locally; this source distribution was assembled where Rust's toolchain was unavailable.
+
+### Reordering image layers
+
+Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the bottom-to-top layer list. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.

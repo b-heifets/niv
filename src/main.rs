@@ -231,15 +231,17 @@ fn line(out: &mut impl Write, row: u16, s: &str, cols: u16, fg: Color, x: u16) -
 }
 
 fn selected_name<'a>(app: &'a App, layers: &'a Layers) -> &'a str {
-    if app.selected == 0 {
+    let id = app.selected_layer_id();
+    if id == 0 {
         &app.path
     } else {
-        &layers.overlays[app.selected - 1].name
+        &layers.overlays[id - 1].name
     }
 }
 
 fn selected_visible(app: &App, layers: &Layers) -> bool {
-    app.selected == 0 || (app.show_overlays && layers.overlays[app.selected - 1].visible)
+    let id = app.selected_layer_id();
+    id == 0 || (app.show_overlays && layers.overlays[id - 1].visible)
 }
 
 fn draw_ui(
@@ -290,23 +292,25 @@ fn draw_ui(
     let (w, h, _) = vol.plane(app.axis);
     let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
     let [ix, iy, iz] = app.axis.xyz(app.index, vh, vv);
-    let mut inspect = format!(
-        "[{ix},{iy},{iz}]  |  1: {}",
-        intensity(vol.sample(app.axis, app.index, vh, vv))
-    );
-    for (idx, layer) in layers.overlays.iter().enumerate() {
-        inspect.push_str(&format!(
-            "  |  {}: {}",
-            idx + 2,
-            intensity(layer.vol.sample(app.axis, app.index, vh, vv))
-        ));
+    let mut inspect = format!("[{ix},{iy},{iz}]");
+    // Number images by the same bottom-to-top order as the layer selector.
+    for pos in 0..=layers.overlays.len() {
+        let id = app.layer_at(pos);
+        let value = if id == 0 {
+            vol.sample(app.axis, app.index, vh, vv)
+        } else {
+            layers.overlays[id - 1]
+                .vol
+                .sample(app.axis, app.index, vh, vv)
+        };
+        inspect.push_str(&format!("  |  {}: {}", pos + 1, intensity(value)));
     }
     line(out, 1, &inspect, cols, Color::Grey, x)?;
 
     // Layer window appears BELOW the image to separate it from voxel/atlas text.
     let (lo, hi) = app.selected_window(layers);
     let opacity = app.selected_opacity(layers);
-    let accent = app.selected_palette(layers).accent(app.selected);
+    let accent = app.selected_palette(layers).accent(app.selected_layer_id());
     let marker = if selected_visible(app, layers) {
         ""
     } else {
@@ -328,17 +332,18 @@ fn draw_ui(
 
     for k in 0..view.list_count {
         let idx = view.list_start + k;
-        let name = if idx == 0 {
+        let id = app.layer_at(idx);
+        let name = if id == 0 {
             &app.path
         } else {
-            &layers.overlays[idx - 1].name
+            &layers.overlays[id - 1].name
         };
-        let pal = if idx == 0 {
+        let pal = if id == 0 {
             app.base_palette
         } else {
-            layers.overlays[idx - 1].palette
+            layers.overlays[id - 1].palette
         };
-        let visible = idx == 0 || (app.show_overlays && layers.overlays[idx - 1].visible);
+        let visible = id == 0 || (app.show_overlays && layers.overlays[id - 1].visible);
         let mark = if idx == app.selected { ">" } else { " " };
         let prefix = format!("{} {}: ", mark, idx + 1);
         let max_name = (cols as usize).saturating_sub(x as usize + prefix.len() + 7);
@@ -354,7 +359,7 @@ fn draw_ui(
             &txt,
             cols,
             if idx == app.selected {
-                rgb_color(pal.accent(idx))
+                rgb_color(pal.accent(id))
             } else {
                 Color::DarkGrey
             },
@@ -431,6 +436,8 @@ fn draw_popup(
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
                     "  n      Load .nii.gz (Tab complete, Shift-Tab back)",
+                    "  { / }  Lower / raise selected image (Shift+[ / ])",
+                    "         Atlas always stays on top; t shows stack order",
                     "  Space  Toggle selected overlay",
                     "  e      Edit min,max     m / M   Edit just min / max",
                     "  0      Reset range      c       Cycle color map",
@@ -447,7 +454,7 @@ fn draw_popup(
             );
         }
         Some(Popup::Info) => {
-            lines.push(format!("Base  1  {}", app.path));
+            lines.push(format!("Original base image  {}", app.path));
             lines.push(format!(
                 "Grid       {} × {} × {} voxels",
                 vol.dims()[0],
@@ -517,19 +524,30 @@ fn draw_popup(
                 ));
                 lines.push(format!("LUT        {} region colors", atlas.regions.len()));
             }
-            if !layers.overlays.is_empty() {
-                lines.push(String::new());
-                lines.push("Additional images".into());
-            }
-            for (idx, layer) in layers.overlays.iter().enumerate() {
-                lines.push(format!(
-                    "  {} {}  {}  data {}..{}",
-                    idx + 2,
-                    layer.name,
-                    layer.vol.datatype_name(),
-                    compact_number(layer.data_range.0),
-                    compact_number(layer.data_range.1)
-                ));
+            lines.push(String::new());
+            lines.push("Image stack (bottom -> top; atlas above images)".into());
+            for pos in 0..=layers.overlays.len() {
+                let id = app.layer_at(pos);
+                if id == 0 {
+                    lines.push(format!(
+                        "  {} {}  {}  data {}..{}",
+                        pos + 1,
+                        app.path,
+                        vol.datatype_name(),
+                        compact_number(base_range.0),
+                        compact_number(base_range.1)
+                    ));
+                } else {
+                    let layer = &layers.overlays[id - 1];
+                    lines.push(format!(
+                        "  {} {}  {}  data {}..{}",
+                        pos + 1,
+                        layer.name,
+                        layer.vol.datatype_name(),
+                        compact_number(layer.data_range.0),
+                        compact_number(layer.data_range.1)
+                    ));
+                }
             }
             lines.push(String::new());
             lines.push("Esc / I / ?  close".into());
@@ -873,6 +891,7 @@ fn run() -> Result<()> {
     app.transparent_background = config.transparent_background;
     app.default_window = window_from_range(base_range);
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
+    app.sync_layer_order(layers.overlays.len());
     if let Some(count) = config.benchmark_frames {
         return benchmark(&vol, &layers, &mut app, count);
     }
@@ -992,10 +1011,11 @@ fn run() -> Result<()> {
                                 draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
                                 match layers.add_overlay(&path, &vol) {
                                     Ok(idx) => {
-                                        app.selected = idx;
+                                        app.sync_layer_order(layers.overlays.len());
+                                        app.selected = app.layer_order.len() - 1;
                                         app.notice = Some(format!(
                                             "Loaded layer {}: {}",
-                                            idx + 1,
+                                            app.selected + 1,
                                             layers.overlays[idx - 1].name
                                         ));
                                         pending_layout = true;

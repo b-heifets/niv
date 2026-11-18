@@ -44,7 +44,11 @@ pub struct App {
     pub highlighted_region: Option<i32>,
     pub path: String,
     pub atlas_name: Option<String>,
-    pub selected: usize, // 0 = base; subsequent indices = overlay layers
+    /// Position within the compositing stack (0 = bottom, highest = top).
+    pub selected: usize,
+    /// Image IDs from bottom to top: 0 = original base; 1+ = loaded overlays.
+    /// The atlas is always composited above this stack and is never reordered.
+    pub layer_order: Vec<usize>,
     pub flip_h: bool,
     pub flip_v: bool,
     pub show_atlas: bool,
@@ -93,6 +97,7 @@ impl App {
             path,
             atlas_name: None,
             selected: 0,
+            layer_order: vec![0],
             flip_h: false,
             flip_v: false,
             show_atlas: true,
@@ -107,43 +112,86 @@ impl App {
         }
     }
 
+    /// Keep the stack in sync after a new aligned image has been loaded.
+    /// Existing order is preserved; each new image is appended on top.
+    pub fn sync_layer_order(&mut self, overlay_count: usize) {
+        let count = overlay_count + 1;
+        if self.layer_order.len() == count {
+            return;
+        } // common interactive path
+        self.layer_order.retain(|&id| id < count);
+        for id in 0..count {
+            if !self.layer_order.contains(&id) {
+                self.layer_order.push(id);
+            }
+        }
+        self.selected = self.selected.min(count - 1);
+    }
+
+    /// Return the physical image ID at this visible stack position.
+    /// The fallback also supports small unit fixtures made without loading.
+    pub fn layer_at(&self, position: usize) -> usize {
+        self.layer_order.get(position).copied().unwrap_or(position)
+    }
+
+    pub fn selected_layer_id(&self) -> usize {
+        self.layer_at(self.selected)
+    }
+
+    fn move_selected_layer(&mut self, displacement: isize) -> Action {
+        let Some(next) = self.selected.checked_add_signed(displacement) else {
+            return Action::None;
+        };
+        if next >= self.layer_order.len() {
+            return Action::None;
+        }
+        self.layer_order.swap(self.selected, next);
+        self.selected = next; // Follow the image, not its previous stack position.
+        Action::Redraw
+    }
+
     pub fn selected_window(&self, layers: &Layers) -> (f32, f32) {
-        if self.selected == 0 {
+        let id = self.selected_layer_id();
+        if id == 0 {
             self.window
         } else {
-            layers.overlays[self.selected - 1].window
+            layers.overlays[id - 1].window
         }
     }
 
     fn set_window(&mut self, layers: &mut Layers, window: (f32, f32)) {
-        if self.selected == 0 {
+        let id = self.selected_layer_id();
+        if id == 0 {
             self.window = window;
         } else {
-            layers.overlays[self.selected - 1].window = window;
+            layers.overlays[id - 1].window = window;
         }
     }
 
     fn default_selected_window(&self, layers: &Layers) -> (f32, f32) {
-        if self.selected == 0 {
+        let id = self.selected_layer_id();
+        if id == 0 {
             self.default_window
         } else {
-            layers.overlays[self.selected - 1].default_window
+            layers.overlays[id - 1].default_window
         }
     }
 
     pub fn selected_palette(&self, layers: &Layers) -> Palette {
-        if self.selected == 0 {
+        let id = self.selected_layer_id();
+        if id == 0 {
             self.base_palette
         } else {
-            layers.overlays[self.selected - 1].palette
+            layers.overlays[id - 1].palette
         }
     }
 
     fn cycle_palette(&mut self, layers: &mut Layers) {
-        if self.selected == 0 {
+        let id = self.selected_layer_id();
+        if id == 0 {
             self.base_palette = self.base_palette.next();
         } else {
-            let layer = &mut layers.overlays[self.selected - 1];
+            let layer = &mut layers.overlays[id - 1];
             layer.palette = layer.palette.next();
         }
     }
@@ -237,10 +285,11 @@ impl App {
     }
 
     pub fn selected_opacity(&self, layers: &Layers) -> f32 {
-        if self.selected == 0 {
+        let id = self.selected_layer_id();
+        if id == 0 {
             self.base_opacity
         } else {
-            layers.overlays[self.selected - 1].opacity
+            layers.overlays[id - 1].opacity
         }
     }
 
@@ -276,10 +325,13 @@ impl App {
                             if let Some(atlas) = &mut layers.atlas {
                                 atlas.opacity = value;
                             }
-                        } else if self.selected == 0 {
-                            self.base_opacity = value;
                         } else {
-                            layers.overlays[self.selected - 1].opacity = value;
+                            let id = self.selected_layer_id();
+                            if id == 0 {
+                                self.base_opacity = value;
+                            } else {
+                                layers.overlays[id - 1].opacity = value;
+                            }
                         }
                         self.edit = None;
                         Action::Redraw
@@ -339,6 +391,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
+        self.sync_layer_order(layers.overlays.len());
         let m = key.modifiers;
         if self.edit.is_some() {
             return self.edit_key(layers, key.code, m);
@@ -400,7 +453,7 @@ impl App {
                 Action::Ui
             }
             KeyCode::Char(';') => {
-                self.selected = (self.selected + 1) % (layers.overlays.len() + 1);
+                self.selected = (self.selected + 1) % self.layer_order.len();
                 Action::Ui
             }
             KeyCode::Tab => {
@@ -442,8 +495,9 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char(' ') => {
-                if self.selected > 0 {
-                    let layer = &mut layers.overlays[self.selected - 1];
+                let id = self.selected_layer_id();
+                if id > 0 {
+                    let layer = &mut layers.overlays[id - 1];
                     layer.visible = !layer.visible;
                     Action::Redraw
                 } else {
@@ -518,6 +572,13 @@ impl App {
                 self.shift_window(layers, 0.1);
                 Action::Redraw
             }
+            // Braces (Shift+[ / Shift+]) move the *selected image* through
+            // the compositing stack. Support both ordinary keycodes and
+            // enhanced-key reporting of '['/']' with SHIFT.
+            KeyCode::Char('{') => self.move_selected_layer(-1),
+            KeyCode::Char('}') => self.move_selected_layer(1),
+            KeyCode::Char('[') if m.contains(KeyModifiers::SHIFT) => self.move_selected_layer(-1),
+            KeyCode::Char(']') if m.contains(KeyModifiers::SHIFT) => self.move_selected_layer(1),
             KeyCode::Char('[') => {
                 self.stride = self.stride.saturating_sub(1).max(1);
                 Action::Ui
@@ -1023,6 +1084,156 @@ mod tests {
         );
         assert!(app.atlas_aa);
     }
+    #[test]
+    fn reordering_keeps_image_properties_and_selected_image() {
+        use crate::layers::IntensityOverlay;
+        let vol = example();
+        let mk = |name: &str, window: (f32, f32), opacity: f32| IntensityOverlay {
+            vol: example(),
+            window,
+            default_window: window,
+            data_range: (0., 100.),
+            palette: Palette::Solid([255, 50, 20]),
+            visible: true,
+            opacity,
+            name: name.into(),
+        };
+        let mut layers = Layers {
+            overlays: vec![mk("red", (2., 6.), 0.7), mk("yellow", (9., 15.), 0.3)],
+            atlas: None,
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 99.), "base".into());
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('2'),
+                KeyModifiers::NONE
+            ),
+            Action::Ui
+        );
+        assert_eq!(app.selected_layer_id(), 1);
+        assert_eq!(app.selected_window(&layers), (2., 6.));
+
+        // Raise the first overlay above the second using Shift+].
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(']'),
+                KeyModifiers::SHIFT
+            ),
+            Action::Redraw
+        );
+        assert_eq!(app.layer_order, vec![0, 2, 1]);
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected_layer_id(), 1);
+        assert_eq!(app.selected_window(&layers), (2., 6.));
+        assert_eq!(app.selected_opacity(&layers), 0.7);
+        assert_eq!(app.stride, 1); // shifted bracket did not change stride
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('}'),
+                KeyModifiers::SHIFT
+            ),
+            Action::None
+        );
+
+        // Move above the base, then lower the base: both are reorderable.
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('1'),
+                KeyModifiers::NONE
+            ),
+            Action::Ui
+        );
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('}'),
+                KeyModifiers::SHIFT
+            ),
+            Action::Redraw
+        );
+        assert_eq!(app.layer_order, vec![2, 0, 1]);
+        assert_eq!(app.selected_layer_id(), 0);
+        assert_eq!(app.selected_window(&layers), (0., 99.));
+
+        // Selected image is followed when lowered via literal '{'.
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('{'),
+                KeyModifiers::NONE
+            ),
+            Action::Redraw
+        );
+        assert_eq!(app.layer_order, vec![0, 2, 1]);
+        assert_eq!(app.selected_layer_id(), 0);
+        assert_eq!(app.selected, 0);
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('{'),
+                KeyModifiers::SHIFT
+            ),
+            Action::None
+        );
+
+        // Editing position 2 edits image ID 2, not the previous position's ID.
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.selected_layer_id(), 2);
+        assert_eq!(app.selected_window(&layers), (9., 15.));
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('1'),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(layers.overlays[1].window, (1., 15.));
+        assert_eq!(layers.overlays[0].window, (2., 6.));
+
+        // Loading another image preserves this order and appends it on top.
+        layers.overlays.push(mk("new", (10., 20.), 1.));
+        app.sync_layer_order(layers.overlays.len());
+        assert_eq!(app.layer_order, vec![0, 2, 1, 3]);
+    }
+
     #[test]
     fn editor_validation() {
         assert_eq!(
