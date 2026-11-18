@@ -42,9 +42,9 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | Option/Alt + direction | ×2 fallback for Command |
 | `[` / `]` | Decrease/increase base stride by one |
 | `p` | Toggle paged montage view (atlas and layers are retained) |
-| `B` / `E` (Shift+B / Shift+E) | Mark montage start / stop at the current slice |
+| `B` / `E` | Edit montage start / stop |
 | `[` / `]` in montage | Decrease / increase slice spacing by one index |
-| `+` / `-` in montage | Zoom in / out (fewer / more columns) |
+| `+` / `-` in montage | Zoom in / out (fewer / more rows and columns) |
 | `<` / `>` in montage | Decrease / increase tile gap by one output pixel |
 | `b` | Toggle **black/RGB** ↔ **transparent/RGBA** background |
 | `a` | Toggle atlas outlines |
@@ -71,44 +71,57 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 
 ### Montage mode (v0.15)
 
-Press **`p`** to toggle between the single-slice viewer and a **paged montage**.
-Each thumbnail uses the same registered images, per-layer thresholds, opacity,
-color maps, atlas overlay, and orientation as single-slice mode. The atlas remains
-on top. The active tile has a thin gold border, and each thumbnail is labeled
-with its **zero-based slice index**. Click a tile to inspect/select that slice.
-
-The montage starts with the full range of the selected axis, a **5-slice
-interval**, **4 columns**, and **8 raster-pixel gaps**. A page contains as many
-aspect-correct tiles as fit in the terminal at the current pixel budget; use
-arrows/hjkl or the wheel to select consecutive montage positions. Navigating
-past the visible page shows the next or previous page. **Home/End** jump to
-first/last included slice; **PgUp/PgDn** jump eight montage positions.
-
-To choose a range, scroll to the desired first slice (in single-slice mode) and
-press **`B`**; scroll to the desired final slice and press **`E`**. The range is
-inclusive. Press `p` to enter montage. In montage mode:
+Press **`p`** to open a montage for figure preparation. The default is a
+**3-row × 4-column** grid with 8-raster-pixel gaps and up to 12 evenly spaced
+slices including the bounds. If a solid atlas (or companion solid labels) is
+loaded, bounds trim about 10% from each end of the occupied atlas along the
+current array axis. Otherwise the central 80% of the reference grid is used.
+There are no gold selection borders or slice numbers by default.
 
 | Key | Effect |
 | --- | --- |
-| `B` / `E` | Set start/stop to the active slice |
-| `[` / `]` | Decrease/increase index interval (1–256) |
-| `+` / `-` | Zoom in/out by decreasing/increasing columns (1–12) |
-| `<` / `>` (Shift+`,` / Shift+`.`) | Adjust gap (0–32 pixels) |
-| `p` | Return to single-slice mode |
+| `p` / `P` | Toggle montage / reset to preset |
+| `B` / `E` | Edit inclusive start / stop (zero-based slice indices) |
+| `Z` / `F` | Edit columns / rows (1–12) |
+| `U` | Edit slice interval (0 = automatic 12 slices, 1–256 manual) |
+| `D` | Edit tile gap (0–32 output pixels) |
+| `+` / `-` | Zoom in/out by decreasing/increasing grid dimensions |
+| `[` / `]` | Adjust manual slice interval |
+| `<` / `>` | Adjust tile gap |
+| ↑/↓ or wheel | Move the visible window by one row when more slices exist |
+| ←/→ | Move one montage position; PgUp/PgDn move one grid |
+| `N` | Toggle slice numbers |
+| `C` | Toggle numeric cluster IDs |
+| `Tab` | Image-only mode for screenshots |
+| `?` or `/` | Dedicated montage help |
 
-**Performance:** All visible tiles are composited into a single RGB (or RGBA)
-frame and sent as one Kitty image. The existing `--pixel-budget` caps the **whole
-montage**, not each thumbnail; only the visible page is rasterized. The
-screen-to-voxel sampling map is computed once per tile size and reused across
-all thumbnail slices. A montage with many atlas-outlined tiles can still take
-longer to rasterize than a single slice, so zoom in or increase the slice
-interval if remote Rex performance drops.
+For numeric editors, type a replacement value or use arrows to change the
+current draft. Enter applies; Esc cancels; Ctrl+U clears the draft. The grid
+fits both screen dimensions without changing aspect ratio. Manual intervals
+show additional rows when needed. The last slice is included when on the
+specified manual interval; automatic mode includes both endpoints.
 
-**Scene persistence:** Press `s` to save montage settings in `.niv.toml`, and
-restore with `niv --scene FILE.niv.toml`. The new optional `[view.montage]`
-section stores `enabled`, `start`, `stop`, `interval`, `columns`, and `gap`;
-older v0.14 scenes without it remain valid. Slicing axes are still *array
-X/Y/Z*, not anatomical reorientation. Only one montage page is shown at a time.
+Cluster labels use the selected visible categorical image (`c` cycles to the
+categorical palette), or the topmost visible categorical image if the selection
+is not categorical. Positive or negative integer IDs other than zero above
+the display threshold are labeled once per slice, using the same color as the
+cluster. The renderer anchors labels near the cluster centroid at an actual
+cluster pixel, prioritizes larger regions, and omits colliding or oversized
+labels. Atlas acronym labels are not drawn by this toggle.
+
+**Atlas Gaussian blur:** `G` opens a numeric sigma editor (0–4 output pixels,
+0 disables it; arrows change by 0.25 px). `--atlas-blur SIGMA` or
+`NIV_ATLAS_BLUR` sets the initial value for ordinary image loading. The filter
+blurs premultiplied color and alpha of the wireframe only, including hover
+strokes, preserving the underlying intensity rasters. It can be used with or
+without the original `g` edge antialiasing. Blur and cluster annotations cost
+additional time; both default off for fast browsing. Blur can soften/widen
+contours and mix neighboring region colors without changing label IDs.
+
+**Performance and scenes:** The montage is one Kitty image, and its total
+raster is capped by the pixel budget. Only the visible rows are rendered.
+`s` saves the range, grid, gap, label toggles, and atlas blur with normal scene
+settings; older scenes remain readable (new fields default to off or 3 rows).
 
 ### Loading many images
 

@@ -58,30 +58,27 @@ pub fn plan(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, reserved_ro
     }
     let aspect = aspect.clamp(0.05, 20.0);
     let columns = app.montage.columns.clamp(1, 12).min(width);
-    // Leave at least one raster pixel per column even in very narrow terminals.
-    let max_gap = if columns > 1 {
-        width.saturating_sub(columns) / (columns - 1)
+    let rows = app.montage.rows.clamp(1, 12).min(height);
+    let max_gap_x = if columns > 1 {
+        (width - columns) / (columns - 1)
     } else {
         32
     };
-    let gap = app.montage.gap.min(32).min(max_gap);
-    let raw_tile_width = width
-        .saturating_sub(gap.saturating_mul(columns.saturating_sub(1)))
-        .checked_div(columns)
-        .unwrap_or(1)
-        .max(1);
-    let tile_height = ((raw_tile_width as f64 / aspect).round() as usize).clamp(1, height);
-    let tile_width = ((tile_height as f64 * aspect).round() as usize).clamp(1, raw_tile_width);
-    let rows = ((height + gap) / (tile_height + gap)).clamp(1, 16);
-    let range = app.montage.stop.saturating_sub(app.montage.start);
-    let interval = app.montage.interval.max(1);
-    let total_slices = range / interval + 1;
-    let capacity = columns.saturating_mul(rows).max(1);
-    let pages = total_slices.div_ceil(capacity);
-    let selected = ((app.index.saturating_sub(app.montage.start) + interval / 2) / interval)
-        .min(total_slices - 1);
-    let page = selected / capacity;
-    let first = page * capacity;
+    let max_gap_y = if rows > 1 {
+        (height - rows) / (rows - 1)
+    } else {
+        32
+    };
+    let gap = app.montage.gap.min(32).min(max_gap_x).min(max_gap_y);
+    let max_w = (width - gap * (columns - 1)) / columns;
+    let max_h = (height - gap * (rows - 1)) / rows;
+    let tile_height = ((max_w as f64 / aspect).round() as usize).clamp(1, max_h);
+    let tile_width = ((tile_height as f64 * aspect).round() as usize).clamp(1, max_w);
+    let total_slices = app.montage.count();
+    let capacity = columns * rows;
+    let pages = total_slices.div_ceil(columns).saturating_sub(rows) + 1;
+    let page = (app.montage.position(app.index) / columns).min(pages - 1);
+    let first = page * columns;
     let count = capacity.min(total_slices - first);
     // Center the visible set of rows/columns within the raster.
     let used_rows = count.div_ceil(columns);
@@ -92,7 +89,7 @@ pub fn plan(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, reserved_ro
     let top = height.saturating_sub(used_height) / 2;
     let tiles = (0..count)
         .map(|k| Tile {
-            slice: app.montage.start + (first + k) * interval,
+            slice: app.montage.slice_at(first + k),
             x: left + (k % columns) * (tile_width + gap),
             y: top + (k / columns) * (tile_height + gap),
         })
@@ -175,27 +172,136 @@ fn draw_label(
     }
 }
 
-fn draw_selection(
+/// Label the topmost visible categorical image (or the selected categorical
+/// image when visible). Labels are numeric IDs, not atlas abbreviations.
+fn cluster_labels(
     frame: &mut [u8],
     width: usize,
-    _height: usize,
+    height: usize,
     channels: usize,
     tile: &Tile,
-    tw: usize,
-    th: usize,
+    app: &App,
+    vol: &Volume,
+    layers: &Layers,
+    map: &SamplingMap,
 ) {
-    if tw < 5 || th < 5 {
+    use crate::layers::Palette;
+    use std::collections::BTreeMap;
+    let categorical = |id: usize| -> Option<(&Volume, (f32, f32))> {
+        if id == 0 {
+            (app.base_palette == Palette::Random && app.base_opacity > 0.)
+                .then_some((vol, app.window))
+        } else {
+            let o = layers.overlays.get(id - 1)?;
+            (app.show_overlays && o.visible && o.opacity > 0. && o.palette == Palette::Random)
+                .then_some((&o.vol, o.window))
+        }
+    };
+    let Some((source, window)) = categorical(app.selected_layer_id()).or_else(|| {
+        (0..=layers.overlays.len())
+            .rev()
+            .find_map(|pos| categorical(app.layer_at(pos)))
+    }) else {
+        return;
+    };
+    let tw = map.width;
+    let th = map.height;
+    if tw < 14 || th < 12 {
         return;
     }
-    let color = [255, 204, 75];
-    for d in 0..2.min(tw / 2).min(th / 2) {
-        for x in tile.x + d..tile.x + tw - d {
-            put_pixel(frame, width, channels, x, tile.y + d, color);
-            put_pixel(frame, width, channels, x, tile.y + th - 1 - d, color);
+    let read = |(h, v): (usize, usize)| {
+        let v = source.sample(app.axis, tile.slice, h, v);
+        if v.is_finite() && v > window.0 && v != 0. && (v - v.round()).abs() < 0.001 {
+            Some(v.round() as i32)
+        } else {
+            None
         }
-        for y in tile.y + d..tile.y + th - d {
-            put_pixel(frame, width, channels, tile.x + d, y, color);
-            put_pixel(frame, width, channels, tile.x + tw - 1 - d, y, color);
+    };
+    // Track the centroid, then find an actual pixel of the cluster closest to
+    // it, so labels are anchored inside the cluster rather than in empty space.
+    let mut ids: BTreeMap<i32, (usize, usize, usize)> = BTreeMap::new();
+    for (i, &hv) in map.coords.iter().enumerate() {
+        if let Some(id) = read(hv) {
+            let entry = ids.entry(id).or_default();
+            entry.0 += i % tw;
+            entry.1 += i / tw;
+            entry.2 += 1;
+        }
+    }
+    let mut best: BTreeMap<i32, (f64, usize, usize)> = BTreeMap::new();
+    for (i, &hv) in map.coords.iter().enumerate() {
+        if let Some(id) = read(hv) {
+            let (sx, sy, n) = ids[&id];
+            let x = i % tw;
+            let y = i / tw;
+            let dx = x as f64 - sx as f64 / n as f64;
+            let dy = y as f64 - sy as f64 / n as f64;
+            let dist = dx * dx + dy * dy;
+            let entry = best.entry(id).or_insert((f64::INFINITY, x, y));
+            if dist < entry.0 {
+                *entry = (dist, x, y);
+            }
+        }
+    }
+    // Large clusters first; don't place unreadable overlapping text.
+    let mut ordered: Vec<_> = best.into_iter().collect();
+    ordered.sort_by_key(|(id, _)| std::cmp::Reverse(ids[id].2));
+    let mut boxes: Vec<(usize, usize, usize, usize)> = Vec::new();
+    if app.montage.show_numbers {
+        boxes.push((2, 2, tile.slice.to_string().len() * 4 + 5, 13));
+    }
+    let scale = if tw >= 210 && th >= 100 { 2 } else { 1 };
+    for (id, (_, cx, cy)) in ordered {
+        let text = id.to_string();
+        let w = text.len() * 4 * scale + 2;
+        let h = 7 * scale + 2;
+        if w > tw || h > th {
+            continue;
+        }
+        let x = cx.saturating_sub(w / 2).min(tw - w);
+        let y = cy.saturating_sub(h / 2).min(th - h);
+        if boxes
+            .iter()
+            .any(|&(a, b, c, d)| x < c && x + w > a && y < d && y + h > b)
+        {
+            continue;
+        }
+        boxes.push((x, y, x + w, y + h));
+        let color = Palette::Random.voxel_color(id as f32, window.0, window.1, 0);
+        // Dark small backing and foreground matching the categorical LUT.
+        for yy in y..y + h {
+            for xx in x..x + w {
+                put_pixel(
+                    frame,
+                    width,
+                    channels,
+                    tile.x + xx,
+                    tile.y + yy,
+                    [12, 12, 16],
+                );
+            }
+        }
+        for (j, c) in text.bytes().enumerate() {
+            let glyph = if c == b'-' {
+                [0, 0, 0, 0b111, 0, 0, 0]
+            } else {
+                DIGITS[(c - b'0') as usize]
+            };
+            for (gy, row) in glyph.iter().enumerate() {
+                for gx in 0..3 {
+                    if *row & (1u8 << (2 - gx)) != 0 {
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                let px = tile.x + x + 1 + j * 4 * scale + gx * scale + sx;
+                                let py = tile.y + y + 1 + gy * scale + sy;
+                                if px < width && py < height {
+                                    put_pixel(frame, width, channels, px, py, color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -230,17 +336,8 @@ pub fn composite(
             frame[target..target + plan.tile_width * channels]
                 .copy_from_slice(&pixels[source..source + plan.tile_width * channels]);
         }
-        draw_label(
-            &mut frame,
-            plan.geom.width,
-            plan.geom.height,
-            channels,
-            tile,
-            plan.tile_width,
-            plan.tile_height,
-        );
-        if tile.slice == app.index {
-            draw_selection(
+        if app.montage.show_numbers {
+            draw_label(
                 &mut frame,
                 plan.geom.width,
                 plan.geom.height,
@@ -248,6 +345,19 @@ pub fn composite(
                 tile,
                 plan.tile_width,
                 plan.tile_height,
+            );
+        }
+        if app.montage.show_clusters {
+            cluster_labels(
+                &mut frame,
+                plan.geom.width,
+                plan.geom.height,
+                channels,
+                tile,
+                app,
+                vol,
+                layers,
+                sampling,
             );
         }
     }
@@ -290,12 +400,66 @@ mod tests {
         assert_eq!(rgb.len(), p.geom.width * p.geom.height * 3);
     }
     #[test]
+    fn default_grid_has_twelve_clean_tiles_and_includes_both_bounds() {
+        let v = vol();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 30000.), "test".into());
+        app.reset_montage(&v);
+        app.montage.enabled = true;
+        app.index = app.montage.start;
+        let p = plan(&v, &app, 100, 40, 3);
+        assert_eq!((p.rows, p.columns), (3, 4));
+        assert_eq!(p.tiles.len(), 12);
+        assert_eq!(p.tiles.first().unwrap().slice, app.montage.start);
+        assert_eq!(p.tiles.last().unwrap().slice, app.montage.stop);
+        let sample = SamplingMap::new(&v, &app, p.tile_width, p.tile_height);
+        let image = composite(&v, &app, &Layers::default(), &p, &sample);
+        app.index = app.montage.stop;
+        let other = plan(&v, &app, 100, 40, 3);
+        assert_eq!(other.tiles, p.tiles);
+        assert_eq!(
+            composite(&v, &app, &Layers::default(), &other, &sample),
+            image
+        );
+        app.montage.show_numbers = true;
+        assert_ne!(
+            composite(&v, &app, &Layers::default(), &other, &sample),
+            image
+        );
+    }
+    #[test]
+    fn categorical_cluster_labels_use_the_source_palette() {
+        let v = Volume {
+            data: Array3::from_elem((20, 20, 12), 2.),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 4.), "clusters".into());
+        app.reset_montage(&v);
+        app.montage.enabled = true;
+        app.base_palette = crate::layers::Palette::Random;
+        app.index = app.montage.start;
+        let plan = plan(&v, &app, 100, 40, 3);
+        let map = SamplingMap::new(&v, &app, plan.tile_width, plan.tile_height);
+        let plain = composite(&v, &app, &Layers::default(), &plan, &map);
+        app.montage.show_clusters = true;
+        let annotated = composite(&v, &app, &Layers::default(), &plan, &map);
+        assert_ne!(plain, annotated);
+        let color = app.base_palette.voxel_color(2., 0., 4., 0);
+        assert!(annotated
+            .chunks_exact(3)
+            .all(|p| p == color.as_slice() || p == &[0u8, 0, 0][..] || p == &[12u8, 12, 16][..]));
+    }
+    #[test]
     fn page_changes_when_selection_leaves_current_page() {
         let v = vol();
         let mut app = App::new(Axis::Z, 0, 1, 90, (0., 100.), "test".into());
         app.reset_montage(&v);
         app.montage.enabled = true;
         app.montage.columns = 10;
+        app.montage.rows = 1;
+        app.montage.start = 0;
+        app.montage.stop = 29;
         app.montage.interval = 1;
         let before = plan(&v, &app, 80, 20, 4);
         app.index = 29;

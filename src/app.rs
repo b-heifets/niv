@@ -15,6 +15,13 @@ pub enum EditField {
     AtlasOpacity,
     AddPath,
     SaveScene,
+    MontageStart,
+    MontageStop,
+    MontageColumns,
+    MontageRows,
+    MontageGap,
+    MontageInterval,
+    AtlasBlur,
 }
 
 #[derive(Clone)]
@@ -29,6 +36,7 @@ pub struct WindowEdit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Popup {
     Help,
+    MontageHelp,
     Info,
 }
 
@@ -45,6 +53,9 @@ pub struct MontageState {
     pub columns: usize,
     /// Gap in output raster pixels (at the selected pixel budget).
     pub gap: usize,
+    pub rows: usize,
+    pub show_numbers: bool,
+    pub show_clusters: bool,
 }
 
 impl Default for MontageState {
@@ -53,9 +64,51 @@ impl Default for MontageState {
             enabled: false,
             start: 0,
             stop: 0,
-            interval: 5,
+            interval: 0,
             columns: 4,
             gap: 8,
+            rows: 3,
+            show_numbers: false,
+            show_clusters: false,
+        }
+    }
+}
+
+impl MontageState {
+    pub fn count(self) -> usize {
+        let span = self.stop.saturating_sub(self.start);
+        if self.interval == 0 {
+            (span + 1).min(12)
+        } else {
+            span / self.interval + 1
+        }
+    }
+    pub fn slice_at(self, n: usize) -> usize {
+        let n = n.min(self.count() - 1);
+        if self.interval != 0 {
+            self.start + n * self.interval
+        } else if self.count() == 1 {
+            self.start
+        } else {
+            self.start
+                + ((self.stop - self.start) * n + (self.count() - 1) / 2) / (self.count() - 1)
+        }
+    }
+    pub fn position(self, slice: usize) -> usize {
+        let d = slice.clamp(self.start, self.stop) - self.start;
+        if self.interval != 0 {
+            ((d + self.interval / 2) / self.interval).min(self.count() - 1)
+        } else if self.stop == self.start {
+            0
+        } else {
+            (d * (self.count() - 1) + (self.stop - self.start) / 2) / (self.stop - self.start)
+        }
+    }
+    pub fn spacing(self) -> usize {
+        if self.interval > 0 {
+            self.interval
+        } else {
+            ((self.stop - self.start) / self.count().saturating_sub(1).max(1)).max(1)
         }
     }
 }
@@ -63,6 +116,8 @@ impl Default for MontageState {
 #[derive(Clone)]
 pub struct App {
     pub montage: MontageState,
+    pub montage_preset_pending: bool,
+    pub atlas_blur: f32,
     pub axis: Axis,
     pub index: usize,
     pub stride: usize,
@@ -120,6 +175,8 @@ impl App {
     ) -> Self {
         Self {
             montage: MontageState::default(),
+            montage_preset_pending: true,
+            atlas_blur: 0.,
             axis,
             index,
             stride,
@@ -155,32 +212,127 @@ impl App {
     /// Called after the reference volume is available, or when the slicing axis
     /// changes. Avoids letting a saved bound exceed the axis depth.
     pub fn reset_montage(&mut self, vol: &Volume) {
-        self.montage.start = 0;
-        self.montage.stop = vol.depth(self.axis) - 1;
-        self.montage.interval = 5;
-        self.montage.columns = 4;
-        self.montage.gap = 8;
+        let last = vol.depth(self.axis) - 1;
+        self.montage = MontageState {
+            enabled: self.montage.enabled,
+            start: last / 10,
+            stop: last - last / 10,
+            ..MontageState::default()
+        };
+        self.montage_preset_pending = true;
     }
-
+    // Only scan the atlas when montage is entered or the preset is requested.
+    // Without a solid atlas, use the central 80% of the reference grid.
+    fn montage_preset(&mut self, vol: &Volume, layers: &Layers) {
+        self.reset_montage(vol);
+        if let Some(solid) = layers.atlas.as_ref().and_then(|a| {
+            if a.wireframe {
+                a.labels.as_ref()
+            } else {
+                Some(&a.vol)
+            }
+        }) {
+            let (w, h, _) = solid.plane(self.axis);
+            let occupied = |i| {
+                (0..h).any(|y| {
+                    (0..w).any(|x| crate::layers::label_id(solid.sample(self.axis, i, x, y)) != 0)
+                })
+            };
+            let depth = solid.depth(self.axis);
+            if let (Some(first), Some(last)) = (
+                (0..depth).find(|&i| occupied(i)),
+                (0..depth).rev().find(|&i| occupied(i)),
+            ) {
+                let margin = (last - first) / 10;
+                self.montage.start = first + margin;
+                self.montage.stop = last - margin;
+            }
+        }
+        self.montage_preset_pending = false;
+        self.index = self.montage.start;
+    }
     pub fn normalize_montage(&mut self, vol: &Volume) {
         let last = vol.depth(self.axis) - 1;
         self.montage.start = self.montage.start.min(last);
         self.montage.stop = self.montage.stop.min(last).max(self.montage.start);
-        self.montage.interval = self.montage.interval.clamp(1, 256);
+        self.montage.interval = self.montage.interval.min(256);
         self.montage.columns = self.montage.columns.clamp(1, 12);
+        self.montage.rows = self.montage.rows.clamp(1, 12);
         self.montage.gap = self.montage.gap.min(32);
         if self.montage.enabled {
             self.snap_montage_index();
         }
     }
-
     fn snap_montage_index(&mut self) {
-        let m = self.montage;
-        let interval = m.interval.max(1);
-        let clamped = self.index.clamp(m.start, m.stop);
-        let step =
-            ((clamped - m.start + interval / 2) / interval).min((m.stop - m.start) / interval);
-        self.index = m.start + step * interval;
+        self.index = self.montage.slice_at(self.montage.position(self.index));
+    }
+    pub fn numeric_montage_value(&self, field: EditField) -> Option<f32> {
+        Some(match field {
+            EditField::MontageStart => self.montage.start as f32,
+            EditField::MontageStop => self.montage.stop as f32,
+            EditField::MontageColumns => self.montage.columns as f32,
+            EditField::MontageRows => self.montage.rows as f32,
+            EditField::MontageGap => self.montage.gap as f32,
+            EditField::MontageInterval => self.montage.interval as f32,
+            EditField::AtlasBlur => self.atlas_blur,
+            _ => return None,
+        })
+    }
+    fn open_number(&mut self, field: EditField) -> Action {
+        self.edit = Some(WindowEdit {
+            field,
+            text: String::new(),
+            error: None,
+            completion: None,
+            checked: Vec::new(),
+        });
+        if self.fullscreen {
+            self.fullscreen = false;
+            Action::Layout
+        } else {
+            Action::Ui
+        }
+    }
+    fn apply_number(&mut self, vol: &Volume, field: EditField, value: f32) -> Result<(), String> {
+        if field == EditField::AtlasBlur {
+            if !value.is_finite() || !(0.0..=4.0).contains(&value) {
+                return Err("Blur sigma must be 0..4 px".into());
+            }
+            self.atlas_blur = value;
+            return Ok(());
+        }
+        if !value.is_finite() || value < 0. || value.fract() != 0. {
+            return Err("Enter a nonnegative integer".into());
+        }
+        let n = value as usize;
+        let valid = match field {
+            EditField::MontageStart => n <= self.montage.stop,
+            EditField::MontageStop => n >= self.montage.start && n < vol.depth(self.axis),
+            EditField::MontageColumns | EditField::MontageRows => (1..=12).contains(&n),
+            EditField::MontageGap => n <= 32,
+            EditField::MontageInterval => n <= 256,
+            _ => false,
+        };
+        if !valid {
+            return Err("Outside allowed range (start ≤ stop; within volume; grid 1..12; gap 0..32; interval 0..256)".into());
+        }
+        match field {
+            EditField::MontageStart => {
+                self.montage.start = n;
+                self.montage_preset_pending = false;
+            }
+            EditField::MontageStop => {
+                self.montage.stop = n;
+                self.montage_preset_pending = false;
+            }
+            EditField::MontageColumns => self.montage.columns = n,
+            EditField::MontageRows => self.montage.rows = n,
+            EditField::MontageGap => self.montage.gap = n,
+            EditField::MontageInterval => self.montage.interval = n,
+            _ => unreachable!(),
+        }
+        self.index = self.montage.start;
+        Ok(())
     }
 
     /// Keep the stack in sync after a new aligned image has been loaded.
@@ -294,8 +446,7 @@ impl App {
         self.axis = axis;
         self.probe = None;
         self.index = (fraction * (new_len - 1) as f64).round() as usize;
-        self.montage.start = 0;
-        self.montage.stop = new_len - 1;
+        self.reset_montage(vol);
         if self.montage.enabled {
             self.snap_montage_index();
         }
@@ -304,11 +455,7 @@ impl App {
     pub fn move_slices(&mut self, vol: &Volume, delta: isize) -> bool {
         let new_index = if self.montage.enabled {
             let m = self.montage;
-            let interval = m.interval.max(1);
-            let current = (self.index.saturating_sub(m.start) + interval / 2) / interval;
-            let maximum = (m.stop - m.start) / interval;
-            let next = current.saturating_add_signed(delta).min(maximum);
-            m.start + next * interval
+            m.slice_at(m.position(self.index).saturating_add_signed(delta))
         } else {
             self.index
                 .saturating_add_signed(delta)
@@ -492,13 +639,87 @@ impl App {
         }
     }
 
-    fn edit_key(&mut self, layers: &mut Layers, key: KeyCode, modifiers: KeyModifiers) -> Action {
+    fn edit_key(
+        &mut self,
+        vol: &Volume,
+        layers: &mut Layers,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Action {
         if self
             .edit
             .as_ref()
             .is_some_and(|e| e.field == EditField::AddPath)
         {
             return self.picker_key(key, modifiers);
+        }
+        if let Some((field, current)) = self
+            .edit
+            .as_ref()
+            .and_then(|e| self.numeric_montage_value(e.field).map(|v| (e.field, v)))
+        {
+            let text = self.edit.as_ref().unwrap().text.trim().to_owned();
+            match key {
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                    let step = if field == EditField::AtlasBlur {
+                        0.25
+                    } else {
+                        1.0
+                    };
+                    let sign = if matches!(key, KeyCode::Up | KeyCode::Right) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    let draft = text
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(current);
+                    let (low, high) = match field {
+                        EditField::MontageStart => (0., self.montage.stop as f32),
+                        EditField::MontageStop => {
+                            (self.montage.start as f32, (vol.depth(self.axis) - 1) as f32)
+                        }
+                        EditField::MontageColumns | EditField::MontageRows => (1., 12.),
+                        EditField::MontageGap => (0., 32.),
+                        EditField::MontageInterval => (0., 256.),
+                        _ => (0., 4.),
+                    };
+                    let value = (draft + sign * step * Self::multiplier(modifiers, false) as f32)
+                        .clamp(low, high);
+                    let editor = self.edit.as_mut().unwrap();
+                    editor.text = value.to_string();
+                    editor.error = None;
+                    return Action::Ui;
+                }
+                KeyCode::Enter => {
+                    let result = if text.is_empty() {
+                        Ok(())
+                    } else {
+                        text.parse::<f32>()
+                            .map_err(|_| "Enter a number".to_owned())
+                            .and_then(|v| self.apply_number(vol, field, v))
+                    };
+                    return match result {
+                        Ok(()) => {
+                            self.edit = None;
+                            Action::Layout
+                        }
+                        Err(e) => {
+                            self.edit.as_mut().unwrap().error = Some(e);
+                            Action::Ui
+                        }
+                    };
+                }
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    let e = self.edit.as_mut().unwrap();
+                    e.text.clear();
+                    e.error = None;
+                    return Action::Ui;
+                }
+                _ => {}
+            }
         }
         let Some(editor) = self.edit.as_mut() else {
             return Action::None;
@@ -600,7 +821,7 @@ impl App {
         self.sync_layer_order(layers.overlays.len());
         let m = key.modifiers;
         if self.edit.is_some() {
-            return self.edit_key(layers, key.code, m);
+            return self.edit_key(vol, layers, key.code, m);
         }
         if let Some(popup) = self.popup {
             return match key.code {
@@ -650,7 +871,11 @@ impl App {
         }
         match key.code {
             KeyCode::Char('?') | KeyCode::Char('/') => {
-                self.popup = Some(Popup::Help);
+                self.popup = Some(if self.montage.enabled {
+                    Popup::MontageHelp
+                } else {
+                    Popup::Help
+                });
                 self.popup_scroll = 0;
                 Action::Layout
             }
@@ -678,6 +903,10 @@ impl App {
                     checked: Vec::new(),
                 });
                 Action::Ui
+            }
+            KeyCode::Char('n') if self.montage.enabled && m.contains(KeyModifiers::SHIFT) => {
+                self.montage.show_numbers = !self.montage.show_numbers;
+                Action::Redraw
             }
             KeyCode::Char('n') => {
                 self.edit = Some(WindowEdit {
@@ -711,7 +940,11 @@ impl App {
             }
             KeyCode::Char(';') => {
                 self.selected = (self.selected + 1) % self.layer_order.len();
-                Action::Ui
+                if self.montage.enabled && self.montage.show_clusters {
+                    Action::Redraw
+                } else {
+                    Action::Ui
+                }
             }
             KeyCode::Tab => {
                 self.fullscreen = !self.fullscreen;
@@ -725,18 +958,64 @@ impl App {
                 let selected = (c as u8 - b'1') as usize;
                 if selected <= layers.overlays.len() {
                     self.selected = selected;
-                    Action::Ui
+                    if self.montage.enabled && self.montage.show_clusters {
+                        Action::Redraw
+                    } else {
+                        Action::Ui
+                    }
                 } else {
                     Action::None
                 }
             }
+            KeyCode::Char('B') => self.open_number(EditField::MontageStart),
+            KeyCode::Char('b') if m.contains(KeyModifiers::SHIFT) => {
+                self.open_number(EditField::MontageStart)
+            }
+            KeyCode::Char('E') => self.open_number(EditField::MontageStop),
             KeyCode::Char('e') if m.contains(KeyModifiers::SHIFT) => {
-                self.montage.stop = self.index;
-                self.montage.start = self.montage.start.min(self.index);
-                if self.montage.enabled {
-                    self.snap_montage_index();
+                self.open_number(EditField::MontageStop)
+            }
+            KeyCode::Char('P') => {
+                self.montage_preset(vol, layers);
+                Action::Layout
+            }
+            KeyCode::Char('p') if m.contains(KeyModifiers::SHIFT) => {
+                self.montage_preset(vol, layers);
+                Action::Layout
+            }
+            KeyCode::Char('Z' | 'F' | 'D' | 'U' | 'N' | 'C') if self.montage.enabled => {
+                match key.code {
+                    KeyCode::Char('Z') => self.open_number(EditField::MontageColumns),
+                    KeyCode::Char('F') => self.open_number(EditField::MontageRows),
+                    KeyCode::Char('D') => self.open_number(EditField::MontageGap),
+                    KeyCode::Char('U') => self.open_number(EditField::MontageInterval),
+                    KeyCode::Char('N') => {
+                        self.montage.show_numbers = !self.montage.show_numbers;
+                        Action::Redraw
+                    }
+                    _ => {
+                        self.montage.show_clusters = !self.montage.show_clusters;
+                        Action::Redraw
+                    }
                 }
-                Action::Redraw
+            }
+            KeyCode::Char('z' | 'f' | 'd' | 'u' | 'c')
+                if self.montage.enabled && m.contains(KeyModifiers::SHIFT) =>
+            {
+                match key.code {
+                    KeyCode::Char('z') => self.open_number(EditField::MontageColumns),
+                    KeyCode::Char('f') => self.open_number(EditField::MontageRows),
+                    KeyCode::Char('d') => self.open_number(EditField::MontageGap),
+                    KeyCode::Char('u') => self.open_number(EditField::MontageInterval),
+                    _ => {
+                        self.montage.show_clusters = !self.montage.show_clusters;
+                        Action::Redraw
+                    }
+                }
+            }
+            KeyCode::Char('G') => self.open_number(EditField::AtlasBlur),
+            KeyCode::Char('g') if m.contains(KeyModifiers::SHIFT) => {
+                self.open_number(EditField::AtlasBlur)
             }
             KeyCode::Char('e') | KeyCode::Char('m') | KeyCode::Char('M') => {
                 // Crossterm enhanced-key reporting may send Shift+m as
@@ -760,33 +1039,13 @@ impl App {
                 self.montage.enabled = !self.montage.enabled;
                 if self.montage.enabled {
                     self.inspect_mode = false;
+                    if self.montage_preset_pending {
+                        self.montage_preset(vol, layers);
+                    }
+                    self.index = self.montage.start;
                 }
                 self.normalize_montage(vol);
                 Action::Layout
-            }
-            KeyCode::Char('B') => {
-                self.montage.start = self.index;
-                self.montage.stop = self.montage.stop.max(self.index);
-                if self.montage.enabled {
-                    self.snap_montage_index();
-                }
-                Action::Redraw
-            }
-            KeyCode::Char('b') if m.contains(KeyModifiers::SHIFT) => {
-                self.montage.start = self.index;
-                self.montage.stop = self.montage.stop.max(self.index);
-                if self.montage.enabled {
-                    self.snap_montage_index();
-                }
-                Action::Redraw
-            }
-            KeyCode::Char('E') => {
-                self.montage.stop = self.index;
-                self.montage.start = self.montage.start.min(self.index);
-                if self.montage.enabled {
-                    self.snap_montage_index();
-                }
-                Action::Redraw
             }
             KeyCode::Char('c') => {
                 self.cycle_palette(layers);
@@ -816,14 +1075,23 @@ impl App {
             }
             KeyCode::Char('x') => {
                 self.set_axis(vol, Axis::X);
+                if self.montage.enabled && self.montage_preset_pending {
+                    self.montage_preset(vol, layers);
+                }
                 Action::Redraw
             }
             KeyCode::Char('y') => {
                 self.set_axis(vol, Axis::Y);
+                if self.montage.enabled && self.montage_preset_pending {
+                    self.montage_preset(vol, layers);
+                }
                 Action::Redraw
             }
             KeyCode::Char('z') => {
                 self.set_axis(vol, Axis::Z);
+                if self.montage.enabled && self.montage_preset_pending {
+                    self.montage_preset(vol, layers);
+                }
                 Action::Redraw
             }
             KeyCode::Char('r') => {
@@ -842,6 +1110,7 @@ impl App {
                 self.flip_v = !self.flip_v;
                 Action::Redraw
             }
+            KeyCode::Char('i') if self.montage.enabled => Action::None,
             KeyCode::Char('i') => {
                 self.inspect_mode = !self.inspect_mode;
                 if self.inspect_mode && self.probe.is_none() {
@@ -856,10 +1125,12 @@ impl App {
             }
             KeyCode::Char('+') | KeyCode::Char('=') if self.montage.enabled => {
                 self.montage.columns = self.montage.columns.saturating_sub(1).max(1);
+                self.montage.rows = self.montage.rows.saturating_sub(1).max(1);
                 Action::Layout
             }
             KeyCode::Char('-') | KeyCode::Char('_') if self.montage.enabled => {
                 self.montage.columns = (self.montage.columns + 1).min(12);
+                self.montage.rows = (self.montage.rows + 1).min(12);
                 Action::Layout
             }
             KeyCode::Char('<') if self.montage.enabled => {
@@ -902,12 +1173,12 @@ impl App {
             KeyCode::Char('[') if m.contains(KeyModifiers::SHIFT) => self.move_selected_layer(-1),
             KeyCode::Char(']') if m.contains(KeyModifiers::SHIFT) => self.move_selected_layer(1),
             KeyCode::Char('[') if self.montage.enabled => {
-                self.montage.interval = self.montage.interval.saturating_sub(1).max(1);
+                self.montage.interval = self.montage.spacing().saturating_sub(1).max(1);
                 self.snap_montage_index();
                 Action::Redraw
             }
             KeyCode::Char(']') if self.montage.enabled => {
-                self.montage.interval = self.montage.interval.saturating_add(1).min(256);
+                self.montage.interval = self.montage.spacing().saturating_add(1).min(256);
                 self.snap_montage_index();
                 Action::Redraw
             }
@@ -920,11 +1191,25 @@ impl App {
                 Action::Ui
             }
             KeyCode::PageUp => {
-                self.move_slices(vol, if self.montage.enabled { 8 } else { 25 });
+                self.move_slices(
+                    vol,
+                    if self.montage.enabled {
+                        -((self.montage.columns * self.montage.rows) as isize)
+                    } else {
+                        25
+                    },
+                );
                 Action::Redraw
             }
             KeyCode::PageDown => {
-                self.move_slices(vol, if self.montage.enabled { -8 } else { -25 });
+                self.move_slices(
+                    vol,
+                    if self.montage.enabled {
+                        (self.montage.columns * self.montage.rows) as isize
+                    } else {
+                        -25
+                    },
+                );
                 Action::Redraw
             }
             KeyCode::Home => {
@@ -937,9 +1222,7 @@ impl App {
             }
             KeyCode::End => {
                 self.index = if self.montage.enabled {
-                    self.montage.start
-                        + (self.montage.stop - self.montage.start) / self.montage.interval
-                            * self.montage.interval
+                    self.montage.slice_at(self.montage.count() - 1)
                 } else {
                     vol.depth(self.axis) - 1
                 };
@@ -960,6 +1243,14 @@ impl App {
                         _ => (0, 1),
                     };
                     self.move_probe(vol, dx * multiplier as isize, dy * multiplier as isize);
+                } else if self.montage.enabled {
+                    let delta = match key.code {
+                        KeyCode::Up | KeyCode::Char('k' | 'K') => -(self.montage.columns as isize),
+                        KeyCode::Down | KeyCode::Char('j' | 'J') => self.montage.columns as isize,
+                        KeyCode::Left | KeyCode::Char('h' | 'H') => -1,
+                        _ => 1,
+                    };
+                    self.move_slices(vol, delta * multiplier as isize);
                 } else {
                     let sign = match key.code {
                         KeyCode::Up | KeyCode::Right | KeyCode::Char('k' | 'l' | 'K' | 'L') => 1,
@@ -1807,54 +2098,98 @@ mod tests {
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('B'),
-            KeyModifiers::SHIFT,
-        );
-        assert_eq!(app.montage.start, 30);
-        app.index = 75;
-        key(
-            &mut app,
-            &vol,
-            &mut layers,
-            KeyCode::Char('E'),
-            KeyModifiers::SHIFT,
-        );
-        assert_eq!(app.montage.stop, 75);
-        key(
-            &mut app,
-            &vol,
-            &mut layers,
             KeyCode::Char('p'),
             KeyModifiers::NONE,
         );
         assert!(app.montage.enabled);
-        let cols = app.montage.columns;
+        assert_eq!(app.montage.count(), 12);
+        assert!(!app.montage.show_numbers);
+        assert!(!app.montage.show_clusters);
         key(
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('+'),
-            KeyModifiers::NONE,
+            KeyCode::Char('B'),
+            KeyModifiers::SHIFT,
         );
-        assert_eq!(app.montage.columns, cols - 1);
-        let step = app.montage.interval;
+        for c in ['2', '0'] {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
         key(
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char(']'),
+            KeyCode::Enter,
             KeyModifiers::NONE,
         );
-        assert_eq!(app.montage.interval, step + 1);
+        assert_eq!(app.montage.start, 20);
         key(
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::End,
+            KeyCode::Char('e'),
+            KeyModifiers::SHIFT,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Down,
             KeyModifiers::NONE,
         );
-        assert!(app.index <= app.montage.stop);
-        assert!((app.index - app.montage.start) % app.montage.interval == 0);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.montage.stop, 89);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT,
+        );
+        assert!(app.montage.show_numbers);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('g'),
+            KeyModifiers::SHIFT,
+        );
+        key(&mut app, &vol, &mut layers, KeyCode::Up, KeyModifiers::NONE);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.atlas_blur, 0.25);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.popup, Some(Popup::MontageHelp));
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
         key(
             &mut app,
             &vol,

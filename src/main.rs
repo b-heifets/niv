@@ -347,10 +347,24 @@ fn draw_ui(
             2 + 1 + view.list_count + usize::from(app.edit.is_some() || app.notice.is_some())
         };
         let plan = montage::plan(vol, app, cols, rows, reserved);
-        format!("Montage {}–{} / {}  |  grid {}×{}  |  gap {} px  |  {}/{} shown  |  page {}/{}  |  slice {}",
-            app.montage.start,app.montage.stop,app.montage.interval,
-            plan.columns,plan.rows,plan.gap,plan.tiles.len(),plan.total_slices,
-            plan.page+1,plan.pages,app.index)
+        format!(
+            "Montage {}–{} / {}  |  {}×{}  |  gap {} px  |  {}/{} shown  |  row {}/{}  |  slice {}",
+            app.montage.start,
+            app.montage.stop,
+            if app.montage.interval == 0 {
+                "auto".into()
+            } else {
+                app.montage.interval.to_string()
+            },
+            plan.rows,
+            plan.columns,
+            plan.gap,
+            plan.tiles.len(),
+            plan.total_slices,
+            plan.page + 1,
+            plan.pages,
+            app.index
+        )
     } else {
         format!("{prefix}{name}{settings}")
     };
@@ -415,13 +429,23 @@ fn draw_ui(
                 EditField::AtlasOpacity => "atlas opacity (0..1)",
                 EditField::AddPath => "new overlay path",
                 EditField::SaveScene => "save scene as",
+                EditField::MontageStart => "start slice (0-based)",
+                EditField::MontageStop => "stop slice (0-based)",
+                EditField::MontageColumns => "columns (zoom)",
+                EditField::MontageRows => "rows",
+                EditField::MontageGap => "tile gap (px)",
+                EditField::MontageInterval => "slice interval (0 = auto)",
+                EditField::AtlasBlur => "atlas blur sigma (px, 0 = off)",
             };
             let err = edit.error.as_deref().unwrap_or("");
-            let hint = edit
-                .completion
-                .as_ref()
-                .map(|m| m.status())
-                .unwrap_or_default();
+            let hint = if let Some(v) = app.numeric_montage_value(edit.field) {
+                format!("current: {v} · ↑↓ adjust")
+            } else {
+                edit.completion
+                    .as_ref()
+                    .map(|m| m.status())
+                    .unwrap_or_default()
+            };
             let cols_available = cols.saturating_sub(x) as usize;
             let hint = middle_ellipsis(&hint, (cols_available / 3).max(12));
             let overhead = what.chars().count() + err.chars().count() + hint.chars().count() + 24;
@@ -594,13 +618,7 @@ fn draw_popup(
                     "  [ / ] stride   r / R rotate   f / v flip   Tab fill",
                     "  i      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
-                    "MONTAGE (p toggles; rendered as one image)",
-                    "  B / E             Start / stop at current slice",
-                    "  [ / ]             Decrease / increase slice interval",
-                    "  + / -             Zoom in / out (fewer / more columns)",
-                    "  < / >             Decrease / increase tile gap (pixels)",
-                    "  Arrows / wheel    Select next / previous tile",
-                    "  PgUp / PgDn       Move 8 montage positions",
+                    "  p      Montage mode (press ? there for controls)",
                     "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
@@ -614,12 +632,39 @@ fn draw_popup(
                     "  e      Edit min,max     m / M   Edit just min / max",
                     "  0      Reset range      c       Cycle color map",
                     "  o      Image opacity    O       Atlas opacity",
-                    "  a      Atlas visible    g       Smooth edge AA (optional)",
+                    "  a      Atlas visible    g       Edge AA (optional)",
+                    "  G      Atlas Gaussian blur (0 = off)",
                     "  b      Black / transparent",
                     "  t      Layer list      ?       Help",
                     "  + / -  Contrast         , / .   Brightness",
                     "",
                     "? or /  help     Shift+I  info     q  quit     Esc  close",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        Some(Popup::MontageHelp) => {
+            lines.extend(
+                [
+                    "MONTAGE · figure preparation",
+                    "  p   Return to single slice     P   Reset preset (3×4)",
+                    "  B / E    Edit inclusive start / stop (zero-based)",
+                    "  Z / F    Edit columns / rows (zoom and grid)",
+                    "  U        Edit slice interval (0 = 12 evenly spaced)",
+                    "  D        Edit tile gap (pixels)",
+                    "  Type value or ↑↓ to adjust; Enter apply; Esc cancel",
+                    "  +/- zoom   [/] interval   </> gap (quick adjustment)",
+                    "  ↑↓ or wheel    Move rows; ←→ move by one slice",
+                    "  PgUp/PgDn a screen; Home/End first/last slice",
+                    "  N   Toggle slice numbers (off by default)",
+                    "  C   Toggle IDs for a visible categorical layer",
+                    "  Tab   Image only (no UI text)",
+                    "  g   Edge AA    G   Atlas Gaussian blur (0..4 px)",
+                    "  a   Atlas on/off    O   Atlas opacity",
+                    "  1–9 select layer · e window · c palette · o opacity",
+                    "  n   Load images    t   Layer list    s   Save scene",
+                    "  I   Info   ? or Esc   Close help",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -699,6 +744,7 @@ fn draw_popup(
                         "off"
                     }
                 ));
+                lines.push(format!("Atlas blur {:.2} px sigma", app.atlas_blur));
                 lines.push(format!("LUT        {} region colors", atlas.regions.len()));
             }
             lines.push(String::new());
@@ -746,10 +792,10 @@ fn draw_popup(
     };
     let fg = Color::Grey;
     let border_color = Color::DarkGrey;
-    let title = if app.popup == Some(Popup::Help) {
-        " Help · ↑↓ scroll · Esc close "
-    } else {
-        " Image information · ↑↓ scroll · Esc close "
+    let title = match app.popup {
+        Some(Popup::Help) => " Help · ↑↓ scroll · Esc close ",
+        Some(Popup::MontageHelp) => " Montage help · ↑↓ scroll · Esc close ",
+        _ => " Image information · ↑↓ scroll · Esc close ",
     };
     let bar = "─".repeat(width.saturating_sub(2));
     queue!(
@@ -1131,6 +1177,7 @@ fn run() -> Result<()> {
     );
     app.pixel_budget = config.pixel_budget;
     app.atlas_aa = config.atlas_aa;
+    app.atlas_blur = config.atlas_blur;
     app.base_opacity = config.base_opacity;
     app.transparent_background = config.transparent_background;
     app.default_window = vol.auto_window();
@@ -1329,8 +1376,12 @@ fn run() -> Result<()> {
                                 -1
                             };
                             let multiplier = App::multiplier(mouse.modifiers, false);
-                            if app.move_slices(&vol, direction * (app.stride * multiplier) as isize)
-                            {
+                            let delta = if app.montage.enabled {
+                                -direction * (app.montage.columns * multiplier) as isize
+                            } else {
+                                direction * (app.stride * multiplier) as isize
+                            };
+                            if app.move_slices(&vol, delta) {
                                 pending_frame = true;
                                 navigated = true;
                             }

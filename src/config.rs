@@ -30,6 +30,7 @@ pub struct Config {
     pub atlas_color: [u8; 3],
     pub atlas_width: usize,
     pub atlas_aa: bool,
+    pub atlas_blur: f32,
     pub atlas_labels_path: Option<PathBuf>,
     pub mouse_pixels: bool,
     pub lut_path: Option<PathBuf>,
@@ -46,7 +47,7 @@ const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE.nii.gz [-i FILE/GLOB ...] [--atlas FILE] [--lut FILE]
        niv --scene FILE.niv.toml
 Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
-Keys: arrows/wheel slices · p montage · B/E bounds · 1–9 select · n load · s scene · ? help
+Keys: arrows/wheel slices · p montage · 1–9 select · n load · s scene · ? help
 Use --help for full options and controls.
 "#;
 
@@ -101,6 +102,8 @@ LAYERS AND ATLAS
       --atlas-color RRGGBB        Fallback contour color (default white)
       --atlas-opacity 0..1        Atlas opacity (default 1)
       --atlas-width N             Contour width, 1–3 pixels (default 1)
+      --atlas-blur SIGMA          Gaussian blur of atlas strokes only, 0..4 px
+                                  (NIV_ATLAS_BLUR; default 0; G edits)
       --atlas-aa                  Optional subpixel antialiasing of solid-atlas outlines
                                   (NIV_ATLAS_AA=1; toggle with g; slower than exact)
 
@@ -113,11 +116,10 @@ NAVIGATION
   f / v                    Flip horizontal / vertical; Tab image-only mode
   i                        Toggle keyboard voxel inspection
   p                        Toggle paged montage (all image layers + atlas)
-  B / E                    Set montage start / stop at current slice
-  [ / ] (montage)          Decrease / increase montage slice interval
-  + / - (montage)          Zoom in / out (fewer / more thumbnail columns)
-  < / > (montage)          Decrease / increase montage tile gap
-  Mouse click (montage)    Select thumbnail slice; arrows/wheel move selection
+  In montage, ? opens a dedicated guide; P resets the 3×4 preset.
+  B/E edit bounds; Z/F edit columns/rows; U interval (0 auto); D gap.
+  +/- zoom; [/] interval; </> gap; N slice numbers; C cluster IDs.
+  ↑↓/wheel move one row; PgUp/PgDn move a screen. G edits atlas blur.
 
 LAYERS
   1..9                     Select loaded layer; ; cycles selection
@@ -197,6 +199,11 @@ pub fn parse() -> Result<Option<Config>> {
     let mut atlas_wireframe = false;
     let mut atlas_color = [255, 255, 255];
     let mut atlas_width = 1;
+    let mut atlas_blur = env::var("NIV_ATLAS_BLUR")
+        .ok()
+        .map(|s| parse_blur(&s))
+        .transpose()?
+        .unwrap_or(0.);
     let mut atlas_aa = matches!(
         env::var("NIV_ATLAS_AA").ok().as_deref(),
         Some("1" | "true" | "yes")
@@ -301,6 +308,7 @@ pub fn parse() -> Result<Option<Config>> {
                 | "--atlas-wireframe"
                 | "--atlas-color"
                 | "--atlas-width"
+                | "--atlas-blur"
                 | "--lut"
                 | "--atlas-labels"
                 | "--atlas-opacity"
@@ -365,6 +373,7 @@ pub fn parse() -> Result<Option<Config>> {
                     atlas_path = Some(PathBuf::from(val));
                 }
                 "--atlas-color" => atlas_color = parse_color(&val)?,
+                "--atlas-blur" => atlas_blur = parse_blur(&val)?,
                 "--atlas-width" => atlas_width = parse_range(&val, flag, 1, 3)?,
                 "--lut" => lut_path = Some(PathBuf::from(val)),
                 "--atlas-labels" => atlas_labels_path = Some(PathBuf::from(val)),
@@ -411,6 +420,7 @@ pub fn parse() -> Result<Option<Config>> {
         atlas_color,
         atlas_width,
         atlas_aa,
+        atlas_blur,
         lut_path,
         atlas_labels_path,
         mouse_pixels,
@@ -481,6 +491,14 @@ fn parse_delay(s: &str) -> Result<u64> {
         bail!("Hover delay must be between 0 and 2000 ms");
     }
     Ok(n)
+}
+
+fn parse_blur(s: &str) -> Result<f32> {
+    let sigma: f32 = s.parse().context("Invalid atlas blur")?;
+    if !sigma.is_finite() || !(0.0..=4.0).contains(&sigma) {
+        bail!("Atlas blur sigma must be 0..4 px");
+    }
+    Ok(sigma)
 }
 
 fn parse_opacity(s: &str) -> Result<f32> {

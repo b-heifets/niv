@@ -58,6 +58,15 @@ struct SceneMontage {
     interval: usize,
     columns: usize,
     gap: usize,
+    #[serde(default = "default_montage_rows")]
+    rows: usize,
+    #[serde(default)]
+    show_numbers: bool,
+    #[serde(default)]
+    show_clusters: bool,
+}
+fn default_montage_rows() -> usize {
+    3
 }
 
 impl From<MontageState> for SceneMontage {
@@ -69,6 +78,9 @@ impl From<MontageState> for SceneMontage {
             interval: m.interval,
             columns: m.columns,
             gap: m.gap,
+            rows: m.rows,
+            show_numbers: m.show_numbers,
+            show_clusters: m.show_clusters,
         }
     }
 }
@@ -81,6 +93,9 @@ impl From<&SceneMontage> for MontageState {
             interval: m.interval,
             columns: m.columns,
             gap: m.gap,
+            rows: m.rows,
+            show_numbers: m.show_numbers,
+            show_clusters: m.show_clusters,
         }
     }
 }
@@ -109,6 +124,8 @@ struct SceneAtlas {
     opacity: f32,
     width: usize,
     aa: bool,
+    #[serde(default)]
+    blur: f32,
     visible: bool,
 }
 
@@ -248,6 +265,7 @@ impl SceneFile {
                 opacity: a.opacity,
                 width: a.width,
                 aa: app.atlas_aa,
+                blur: app.atlas_blur,
                 visible: app.show_atlas,
             })
         });
@@ -265,7 +283,11 @@ impl SceneFile {
                 fullscreen: app.fullscreen,
                 inspect_mode: app.inspect_mode,
                 probe: app.probe.map(|(x, y)| [x, y]),
-                montage: Some(app.montage.into()),
+                montage: if app.montage_preset_pending {
+                    None
+                } else {
+                    Some(app.montage.into())
+                },
             },
             render: SceneRender {
                 background: if app.transparent_background {
@@ -306,8 +328,11 @@ impl SceneFile {
             if m.start > m.stop {
                 bail!("Montage start must not exceed stop");
             }
-            if !(1..=256).contains(&m.interval) {
-                bail!("Montage interval must be 1..256");
+            if m.interval > 256 {
+                bail!("Montage interval must be 0..256 (0 = auto)");
+            }
+            if !(1..=12).contains(&m.rows) {
+                bail!("Montage rows must be 1..12");
             }
             if !(1..=12).contains(&m.columns) {
                 bail!("Montage columns must be 1..12");
@@ -366,6 +391,9 @@ impl SceneFile {
             if !valid_opacity(a.opacity) {
                 bail!("Atlas opacity must be 0..1");
             }
+            if !a.blur.is_finite() || !(0.0..=4.0).contains(&a.blur) {
+                bail!("Atlas blur must be 0..4 px");
+            }
             parse_color(&a.color)?;
         }
         Ok(())
@@ -407,12 +435,14 @@ impl SceneFile {
         app.probe = self.view.probe.map(|[h, v]| (h, v));
         if let Some(m) = &self.view.montage {
             app.montage = m.into();
+            app.montage_preset_pending = false;
         }
         app.scene_path = self.source.clone();
         app.show_atlas = self.atlas.as_ref().is_some_and(|a| a.visible);
         if let (Some(saved), Some(atlas)) = (&self.atlas, &mut layers.atlas) {
             atlas.opacity = saved.opacity;
             app.atlas_aa = saved.aa;
+            app.atlas_blur = saved.blur;
         }
         Ok(())
     }
@@ -552,6 +582,7 @@ pub fn config_from_args(argv: &[String]) -> Result<Config> {
             .unwrap_or([255; 3]),
         atlas_width: scene.atlas.as_ref().map_or(1, |a| a.width),
         atlas_aa: scene.atlas.as_ref().is_some_and(|a| a.aa),
+        atlas_blur: scene.atlas.as_ref().map_or(0., |a| a.blur),
         atlas_labels_path: labels,
         lut_path,
         mouse_pixels: scene.render.mouse_pixels,
@@ -807,6 +838,9 @@ visible = false
             interval: 4,
             columns: 3,
             gap: 6,
+            rows: 2,
+            show_numbers: true,
+            show_clusters: true,
         };
         v.montage = Some(m.into());
         let text = toml::to_string(&v).unwrap();

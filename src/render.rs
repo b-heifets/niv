@@ -242,7 +242,7 @@ pub struct SamplingMap {
     flip_v: bool,
     sw: usize,
     sh: usize,
-    coords: Vec<(usize, usize)>,
+    pub(crate) coords: Vec<(usize, usize)>,
 }
 impl SamplingMap {
     pub fn matches(&self, vol: &Volume, app: &App, width: usize, height: usize) -> bool {
@@ -577,16 +577,98 @@ impl StrokeCanvas {
         }
     }
 
-    fn blend_into(self, raster: &mut [u8], channels: usize, opacity: f32) {
+    fn blend_into(self, raster: &mut [u8], channels: usize, opacity: f32, sigma: f32) {
+        if sigma < 0.05 {
+            for idx in self.touched {
+                let packed = self.pixels[idx];
+                let coverage = ((packed >> 24) & 127) as f32 / 127.;
+                let color = [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8];
+                let offset = idx * channels;
+                blend_pixel(
+                    &mut raster[offset..offset + channels],
+                    color,
+                    opacity * coverage,
+                );
+            }
+            return;
+        }
+        // Blur premultiplied RGB and alpha together rather than blurring the
+        // already composited image. Symmetric, normalized Gaussian; no shift.
+        let radius = (sigma * 3.).ceil() as i32;
+        let mut weights: Vec<f32> = (-radius..=radius)
+            .map(|d| (-0.5 * (d as f32 / sigma).powi(2)).exp())
+            .collect();
+        let sum: f32 = weights.iter().sum();
+        for w in &mut weights {
+            *w /= sum;
+        }
+        let mut horiz = vec![[0f32; 4]; self.pixels.len()];
+        let mut touched_h = Vec::new();
         for idx in self.touched {
-            let packed = self.pixels[idx];
-            let coverage = ((packed >> 24) & 127) as f32 / 127.0;
-            let color = [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8];
+            let p = self.pixels[idx];
+            let a = ((p >> 24) & 127) as f32 / 127.;
+            let c = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
+            let x = (idx % self.width) as i32;
+            let y = idx / self.width;
+            for (k, &w) in weights.iter().enumerate() {
+                if w == 0. {
+                    continue;
+                }
+                let xx = x + k as i32 - radius;
+                if xx < 0 || xx >= self.width as i32 {
+                    continue;
+                }
+                let i = y * self.width + xx as usize;
+                let target = &mut horiz[i];
+                if target[3] == 0. {
+                    touched_h.push(i);
+                }
+                let a = a * w;
+                for ch in 0..3 {
+                    target[ch] += c[ch] as f32 * a;
+                }
+                target[3] += a;
+            }
+        }
+        let mut vertical = vec![[0f32; 4]; self.pixels.len()];
+        let mut touched_v = Vec::new();
+        for idx in touched_h {
+            let x = idx % self.width;
+            let y = (idx / self.width) as i32;
+            let src = horiz[idx];
+            for (k, &w) in weights.iter().enumerate() {
+                if w == 0. {
+                    continue;
+                }
+                let yy = y + k as i32 - radius;
+                if yy < 0 || yy >= self.height as i32 {
+                    continue;
+                }
+                let i = yy as usize * self.width + x;
+                let target = &mut vertical[i];
+                if target[3] == 0. {
+                    touched_v.push(i);
+                }
+                for ch in 0..4 {
+                    target[ch] += src[ch] * w;
+                }
+            }
+        }
+        for idx in touched_v {
+            let p = vertical[idx];
+            if p[3] <= 0. {
+                continue;
+            }
+            let color = [
+                (p[0] / p[3]).round() as u8,
+                (p[1] / p[3]).round() as u8,
+                (p[2] / p[3]).round() as u8,
+            ];
             let offset = idx * channels;
             blend_pixel(
                 &mut raster[offset..offset + channels],
                 color,
-                opacity * coverage,
+                opacity * p[3],
             );
         }
     }
@@ -842,7 +924,7 @@ fn draw_atlas_edges(
             }
         }
     }
-    strokes.blend_into(rgb, channels, atlas.opacity);
+    strokes.blend_into(rgb, channels, atlas.opacity, app.atlas_blur);
 }
 
 fn draw_wireframe(
@@ -887,7 +969,7 @@ fn draw_wireframe(
             }
         }
     }
-    strokes.blend_into(rgb, channels, atlas.opacity);
+    strokes.blend_into(rgb, channels, atlas.opacity, app.atlas_blur);
 }
 
 #[cfg(test)]
@@ -899,6 +981,19 @@ mod layer_tests {
     };
     use ndarray::Array3;
     use std::collections::HashMap;
+    #[test]
+    fn gaussian_blur_spreads_atlas_coverage_symmetrically() {
+        let mut canvas = StrokeCanvas::new(9, 9);
+        canvas.plot(4, 4, [255, 0, 0], 1., false);
+        let mut rgb = vec![0u8; 9 * 9 * 3];
+        canvas.blend_into(&mut rgb, 3, 1., 1.0);
+        let red = |x: usize, y: usize| rgb[(y * 9 + x) * 3];
+        assert!(red(4, 4) > red(3, 4));
+        assert!(red(3, 4) > 0);
+        assert_eq!(red(3, 4), red(5, 4));
+        assert_eq!(red(4, 3), red(4, 5));
+        assert_eq!(red(0, 0), 0);
+    }
     fn volume(a: Vec<f32>) -> Volume {
         Volume {
             data: Array3::from_shape_vec((3, 1, 1), a).unwrap(),
