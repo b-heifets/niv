@@ -1,34 +1,45 @@
-//! Filesystem completion for the raw-mode `n` image loader.
-//! Unlike a shell prompt, raw terminal input never goes through zsh completion.
-use std::{fs, path::PathBuf};
+//! Fast, in-TUI NIfTI file picker. Shell completion is not active in raw mode.
+//! Match any substring of a filename; keep directory navigation explicit so a
+//! large research tree is never scanned recursively on every keystroke.
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-#[derive(Debug)]
-pub struct PathMatches {
-    values: Vec<String>,
-    selected: Option<usize>,
+#[derive(Debug, Clone)]
+pub struct PathMatch {
+    pub path: String,
+    pub is_dir: bool,
 }
+
+#[derive(Debug, Clone)]
+pub struct PathMatches {
+    pub values: Vec<PathMatch>,
+    pub selected: Option<usize>,
+    pub directory: String,
+}
+
 impl PathMatches {
     pub fn status(&self) -> String {
         let count = self.values.len();
         if count == 0 {
-            return "No matching NIfTI files or directories".into();
+            "No matching NIfTI files or directories".into()
+        } else {
+            format!("{count} matches · ↑↓ choose · Tab complete/cycle · Space mark · Enter load")
         }
-        if count == 1 {
-            return "1 match".into();
+    }
+    pub fn selected_index(&self) -> usize {
+        self.selected.unwrap_or(0)
+    }
+    pub fn selected(&self) -> Option<&PathMatch> {
+        self.values.get(self.selected_index())
+    }
+    pub fn move_by(&mut self, delta: isize) {
+        if self.values.is_empty() {
+            return;
         }
-        let shown = self
-            .values
-            .iter()
-            .take(4)
-            .map(|s| {
-                s.rsplit('/')
-                    .filter(|part| !part.is_empty())
-                    .next()
-                    .unwrap_or(s)
-            })
-            .collect::<Vec<_>>()
-            .join("  ·  ");
-        format!("{count} matches · Tab cycle · Shift-Tab back · {shown}")
+        let current = self.selected_index() as isize;
+        self.selected = Some((current + delta).rem_euclid(self.values.len() as isize) as usize);
     }
 }
 
@@ -46,50 +57,106 @@ fn expand_home(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
-
 pub fn resolve(path: &str) -> PathBuf {
     expand_home(path)
 }
 
-fn candidates(prefix: &str) -> Vec<String> {
-    let (dir, fragment) = match prefix.rsplit_once('/') {
-        Some((dir, name)) => (format!("{dir}/"), name),
-        None => (String::new(), prefix),
-    };
+fn dir_and_fragment(input: &str) -> (String, &str) {
+    match input.rsplit_once('/') {
+        Some((dir, frag)) => (format!("{dir}/"), frag),
+        None => (String::new(), input),
+    }
+}
+
+fn wild_match(pattern: &str, name: &str) -> bool {
+    // A simple case-insensitive glob for the *current filename*; unlike a
+    // recursive glob it is bounded by the number of entries in one directory.
+    let pat = pattern.as_bytes();
+    let word = name.as_bytes();
+    let (mut p, mut w, mut star, mut resume) = (0, 0, None, 0);
+    while w < word.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p].eq_ignore_ascii_case(&word[w])) {
+            p += 1;
+            w += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            resume = w;
+        } else if let Some(s) = star {
+            p = s + 1;
+            resume += 1;
+            w = resume;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+pub fn search(input: &str) -> PathMatches {
+    let (dir, fragment) = dir_and_fragment(input);
     let base = if dir.is_empty() {
         PathBuf::from(".")
     } else {
         expand_home(&dir)
     };
     let Ok(entries) = fs::read_dir(&base) else {
-        return Vec::new();
+        return PathMatches {
+            values: Vec::new(),
+            selected: None,
+            directory: dir,
+        };
     };
+    let needle = fragment.to_lowercase();
+    let wildcard = fragment.contains('*') || fragment.contains('?');
     let mut values = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(fragment) || (name.starts_with('.') && !fragment.starts_with('.')) {
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if filename.starts_with('.') && !fragment.starts_with('.') {
             continue;
         }
-        let path = entry.path();
-        let is_dir = path.is_dir();
-        if !is_dir && !(name.ends_with(".nii.gz") || name.ends_with(".nii")) {
+        let is_dir = entry.path().is_dir();
+        let lower = filename.to_lowercase();
+        if !is_dir && !(lower.ends_with(".nii") || lower.ends_with(".nii.gz")) {
             continue;
         }
-        values.push(format!("{}{}{}", dir, name, if is_dir { "/" } else { "" }));
+        let matches = if wildcard {
+            wild_match(fragment, &filename)
+        } else {
+            lower.contains(&needle)
+        };
+        if matches {
+            values.push(PathMatch {
+                path: format!("{dir}{filename}{}", if is_dir { "/" } else { "" }),
+                is_dir,
+            });
+        }
     }
-    values.sort_unstable();
-    values
+    // Directories first, then alphabetical filenames. Stable order across Tab presses.
+    values.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
+    PathMatches {
+        values,
+        selected: None,
+        directory: dir,
+    }
 }
 
-fn common_prefix(values: &[String]) -> String {
+fn common_prefix(values: &[PathMatch]) -> String {
     let Some(first) = values.first() else {
         return String::new();
     };
-    let mut prefix = first.clone();
-    for value in values.iter().skip(1) {
+    let mut prefix = first.path.clone();
+    for item in values.iter().skip(1) {
         let len = prefix
             .chars()
-            .zip(value.chars())
+            .zip(item.path.chars())
             .take_while(|(a, b)| a == b)
             .count();
         prefix = prefix.chars().take(len).collect();
@@ -97,97 +164,148 @@ fn common_prefix(values: &[String]) -> String {
     prefix
 }
 
-/// First Tab extends the unambiguous prefix. Repeated Tab cycles matches.
-/// Shift-Tab cycles in reverse. Completing a directory permits browsing inside.
-pub fn advance(text: &mut String, state: &mut Option<PathMatches>, reverse: bool) {
-    if state.is_none() {
-        let values = candidates(text);
-        if values.is_empty() {
-            *state = Some(PathMatches {
-                values,
-                selected: None,
-            });
-            return;
-        }
-        if values.len() == 1 {
-            *text = values[0].clone();
-            // Directories should be browsable on the next Tab.
-            *state = None;
-            return;
-        }
-        let common = common_prefix(&values);
-        if common.chars().count() > text.chars().count() {
-            *text = common;
-            *state = Some(PathMatches {
-                values,
-                selected: None,
-            });
-            return;
-        }
-        *state = Some(PathMatches {
-            values,
-            selected: None,
-        });
-        return;
-    }
-    let matches = state.as_mut().expect("checked above");
+/// Tab extends a true common *prefix* if one exists, otherwise cycles the
+/// visible selection. A unique match completes directly. Shift-Tab reverses.
+pub fn advance(text: &mut String, matches: &mut PathMatches, reverse: bool) {
     if matches.values.is_empty() {
         return;
     }
-    let next = match matches.selected {
-        None => {
-            if reverse {
-                matches.values.len() - 1
-            } else {
-                0
-            }
+    if matches.values.len() == 1 {
+        *text = matches.values[0].path.clone();
+        *matches = search(text); // Tab into directories automatically
+        return;
+    }
+    if matches.selected.is_none() && !reverse {
+        // Substring search also matches e.g. posterior-Brain when the user typed 'br'.
+        // For Tab extension, prefer filenames that actually BEGIN with the fragment.
+        // Keep all substring hits for normal arrow/Tab selection when no extension exists.
+        let (_, fragment) = dir_and_fragment(text);
+        let needle = fragment.to_lowercase();
+        let prefix_candidates: Vec<PathMatch> = matches
+            .values
+            .iter()
+            .filter(|item| {
+                let name = item
+                    .path
+                    .strip_prefix(matches.directory.as_str())
+                    .unwrap_or(item.path.as_str());
+                name.to_lowercase().starts_with(&needle)
+            })
+            .cloned()
+            .collect();
+        let prefix = common_prefix(&prefix_candidates);
+        if prefix.to_lowercase().starts_with(&text.to_lowercase()) && prefix.len() > text.len() {
+            *text = prefix;
+            *matches = search(text);
+            return;
         }
-        Some(i) => {
-            if reverse {
-                (i + matches.values.len() - 1) % matches.values.len()
-            } else {
-                (i + 1) % matches.values.len()
-            }
-        }
-    };
-    *text = matches.values[next].clone();
-    matches.selected = Some(next);
+        matches.selected = Some(0);
+    } else {
+        matches.move_by(if reverse { -1 } else { 1 });
+    }
+}
+
+pub fn is_nifti_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (name.ends_with(".nii") || name.ends_with(".nii.gz")) && path.is_file()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    #[test]
-    fn tabs_extend_prefix_cycle_and_follow_directories() {
-        let p = std::env::temp_dir().join(format!(
-            "niv-test-{}-{}",
+    fn test_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "niv-path-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir(&p).unwrap();
-        for s in ["brain_01.nii.gz", "brain_02.nii.gz", "ignore.txt"] {
-            fs::write(p.join(s), b"").unwrap();
+        fs::create_dir(&path).unwrap();
+        for name in [
+            "brain_anterior_01.nii.gz",
+            "brain_anterior_02.nii.gz",
+            "posterior-Brain.nii",
+            "ignore.txt",
+        ] {
+            fs::write(path.join(name), b"").unwrap();
         }
-        fs::create_dir(p.join("other")).unwrap();
-        let mut input = format!("{}/br", p.display());
-        let mut state = None;
-        advance(&mut input, &mut state, false);
-        assert!(input.ends_with("/brain_0"));
-        advance(&mut input, &mut state, false);
-        assert!(input.ends_with("/brain_01.nii.gz"));
-        advance(&mut input, &mut state, false);
-        assert!(input.ends_with("/brain_02.nii.gz"));
-        advance(&mut input, &mut state, true);
-        assert!(input.ends_with("/brain_01.nii.gz"));
-        let mut input = format!("{}/ot", p.display());
-        let mut state = None;
-        advance(&mut input, &mut state, false);
-        assert!(input.ends_with("/other/"));
-        assert!(state.is_none());
-        fs::remove_dir_all(&p).unwrap();
+        fs::create_dir(path.join("groupA")).unwrap();
+        path
+    }
+    #[test]
+    fn substring_anywhere_is_case_insensitive_and_directories_are_browsable() {
+        let root = test_directory();
+        let list = search(&format!("{}/BRaIn", root.display()));
+        assert_eq!(list.values.len(), 3);
+        assert!(list
+            .values
+            .iter()
+            .any(|m| m.path.ends_with("posterior-Brain.nii")));
+        let folders = search(&format!("{}/gro", root.display()));
+        assert!(folders.values[0].is_dir);
+        let mut text = format!("{}/gro", root.display());
+        let mut state = folders;
+        advance(&mut text, &mut state, false);
+        assert!(text.ends_with("/groupA/"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn tab_extends_shared_prefix_and_cycles_selections_without_losing_filter() {
+        let root = test_directory();
+        let mut text = format!("{}/br", root.display());
+        let mut state = search(&text);
+        advance(&mut text, &mut state, false);
+        assert!(text.ends_with("/brain_anterior_0"));
+        advance(&mut text, &mut state, false);
+        assert_eq!(state.selected_index(), 0);
+        advance(&mut text, &mut state, false);
+        assert_eq!(state.selected_index(), 1);
+        assert!(text.ends_with("/brain_anterior_0"));
+        advance(&mut text, &mut state, true);
+        assert_eq!(state.selected_index(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn tab_completion_prefers_prefix_even_with_uppercase_filter() {
+        let root = test_directory();
+        let mut text = format!("{}/BR", root.display());
+        let mut state = search(&text);
+        assert_eq!(state.values.len(), 3); // two prefix hits and one substring hit
+        advance(&mut text, &mut state, false);
+        assert!(text.ends_with("/brain_anterior_0"));
+        assert_eq!(state.values.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn tab_still_cycles_when_only_substring_matches_exist() {
+        let root = test_directory();
+        let mut text = format!("{}/terior", root.display());
+        let mut state = search(&text);
+        assert_eq!(state.values.len(), 3);
+        advance(&mut text, &mut state, false);
+        assert_eq!(state.selected, Some(0));
+        assert!(text.ends_with("/terior"));
+        advance(&mut text, &mut state, false);
+        assert_eq!(state.selected, Some(1));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn wildcard_in_picker_filters_same_directory() {
+        let root = test_directory();
+        assert_eq!(
+            search(&format!("{}/*anterior*", root.display()))
+                .values
+                .len(),
+            2
+        );
+        assert!(wild_match("*posterior*", "posterior-Brain.nii"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
