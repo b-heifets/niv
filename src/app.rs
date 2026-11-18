@@ -510,6 +510,12 @@ impl App {
                 _ => Action::None,
             };
         }
+        // The first Esc closes the `t` layer list; another Esc exits niv.
+        // Editors and modal popups have already handled Esc above.
+        if key.code == KeyCode::Esc && self.show_layer_list {
+            self.show_layer_list = false;
+            return Action::Layout;
+        }
         if key.code == KeyCode::Esc
             || key.code == KeyCode::Char('q')
             || (key.code == KeyCode::Char('c') && m.contains(KeyModifiers::CONTROL))
@@ -1494,5 +1500,70 @@ mod tests {
         );
         assert!(parse_edit(EditField::Both, "5,1", (0., 10.)).is_err());
         assert!(parse_edit(EditField::Maximum, "NaN", (0., 10.)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod layer_list_escape_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use ndarray::Array3;
+
+    fn fixture() -> (Volume, Layers, App) {
+        let volume = Volume {
+            data: Array3::zeros((4, 4, 4)),
+            spacing: [1.0; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let layers = Layers::default();
+        let app = App::new(Axis::Z, 0, 1, 0, (0.0, 1.0), "image".into());
+        (volume, layers, app)
+    }
+
+    fn send(app: &mut App, vol: &Volume, layers: &mut Layers, code: KeyCode) -> Action {
+        app.key(vol, layers, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn esc_closes_list_then_exits() {
+        let (vol, mut layers, mut app) = fixture();
+        assert_eq!(
+            send(&mut app, &vol, &mut layers, KeyCode::Char('t')),
+            Action::Layout
+        );
+        assert!(app.show_layer_list);
+        assert_eq!(
+            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            Action::Layout
+        );
+        assert!(!app.show_layer_list);
+        assert_eq!(
+            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn esc_closes_popup_before_list() {
+        let (vol, mut layers, mut app) = fixture();
+        send(&mut app, &vol, &mut layers, KeyCode::Char('t'));
+        send(&mut app, &vol, &mut layers, KeyCode::Char('?'));
+        assert!(app.popup.is_some());
+        assert_eq!(
+            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            Action::Layout
+        );
+        assert!(app.popup.is_none());
+        assert!(app.show_layer_list);
+        assert_eq!(
+            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            Action::Layout
+        );
+        assert!(!app.show_layer_list);
+        assert_eq!(
+            send(&mut app, &vol, &mut layers, KeyCode::Esc),
+            Action::Quit
+        );
     }
 }

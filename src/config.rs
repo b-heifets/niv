@@ -9,6 +9,7 @@ pub struct OverlaySpec {
     pub path: PathBuf,
     pub window: Option<(f32, f32)>,
     pub color: [u8; 3],
+    pub grayscale: bool,
     pub opacity: f32,
 }
 
@@ -40,7 +41,7 @@ pub struct Config {
 }
 
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
-Usage: niv FILE.nii.gz [--overlay FILE] [--atlas FILE] [--lut FILE]
+Usage: niv FILE.nii.gz [-i FILE/GLOB ...] [--atlas FILE] [--lut FILE]
 Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
 Keys: arrows/wheel slices · b RGB/RGBA · 1–9 select · e range · o opacity · n load · ? help
 Use --help for full options and controls.
@@ -49,7 +50,7 @@ Use --help for full options and controls.
 const HELP: &str = r#"niv — keyboard-driven NIfTI viewer using Kitty graphics
 
 USAGE
-  niv FILE.nii[.gz] [OPTIONS]
+  niv FILE.nii[.gz] [-i IMAGE_OR_GLOB ...] [OPTIONS]
 
 VIEW
   -a, --axis x|y|z       Slice axis (default x; NIV_AXIS or NII_AXIS)
@@ -72,10 +73,15 @@ VIEW
       --bench N          Benchmark N frames without a terminal
 
 LAYERS AND ATLAS
-      --overlay FILE              Additional intensity image, repeatable
+  -i, --images FILE/GLOB ...      Load several additional NIfTI images at startup.
+                                   Supports multiple space-separated files,
+                                   quoted globs, and repeated -i groups.
+                                   Matched files are sorted; all images are
+                                   aligned to the base volume. Default grayscale.
+      --overlay FILE              Additional image with fixed warm tint; repeatable
       --overlay-window MIN,MAX    Most recently supplied overlay range
       --overlay-color RRGGBB      Most recent overlay fixed tint
-      --overlay-opacity 0..1      Most recent overlay opacity (default 0.8)
+      --overlay-opacity 0..1      Most recent overlay opacity (default 1)
       --atlas FILE                Solid ID-label atlas; default $ATLAS
       --atlas-wireframe FILE      Precomputed ID/binary wireframe; overrides $ATLAS
       --atlas-labels FILE         Companion solid atlas for wireframe inspection
@@ -97,8 +103,11 @@ NAVIGATION
 
 LAYERS
   1..9                     Select loaded layer; ; cycles selection
-  n                        Type image path; Tab completes/cycles NIfTI files
-  t                        Toggle layer list; Space show/hide selected overlay
+  n                        Open filterable NIfTI picker (substring matches)
+                           ↑↓ select · Tab complete/cycle · Space mark multiple
+                           → browse directory · Enter load chosen images
+  t                        Toggle layer list (top image first; Esc closes list)
+                           Space show/hide selected overlay
   e                        Edit selected layer display min,max
   m / M                    Edit only min / max; 0 reset to data min,max
   c                        Gray → warm → cool → categorical palette
@@ -107,12 +116,14 @@ LAYERS
   b                        Toggle black/transparent background
   + / -                    Narrow / widen selected display range
   , / .                    Shift selected display range down / up
-  ? or /                   Toggle help panel; I opens volume information
-  q                        Quit (Esc cancels dialogs)
+  ? or /                   Toggle help panel; Shift+I opens volume information
+  q                        Quit (Esc closes a popup/list first, then quits)
 
 EXAMPLES
   niv mean_IF.nii.gz
   ATLAS=/data/atlas.nii.gz ATLAS_LUT=/data/CCFv3-2020_regional_summary.csv niv mean_IF.nii.gz
+  niv mean_IF.nii.gz -i 'stat*.nii.gz' '*clusters*.nii.gz'
+  niv mean_IF.nii.gz -i layer1.nii.gz layer2.nii.gz --atlas atlas.nii.gz
   niv mean_IF.nii.gz --atlas other.nii.gz --overlay zstat.nii.gz --overlay-window 2,6
 
 Atlas and intensity overlays require identical voxel grids; no affine reorientation
@@ -121,7 +132,7 @@ work in both modes; transparent terminal background requires Kitty RGBA (f=32).
 "#;
 
 pub fn parse() -> Result<Option<Config>> {
-    let mut args = env::args().skip(1);
+    let mut args = env::args().skip(1).peekable();
     let mut axis = Axis::parse(
         &env::var("NIV_AXIS")
             .or_else(|_| env::var("NII_AXIS"))
@@ -195,6 +206,38 @@ pub fn parse() -> Result<Option<Config>> {
             enhanced_keys = false;
             continue;
         }
+        // -i consumes filenames/globs until the next flag, then expands each
+        // pattern in place. Quoted globs work even if zsh does not expand them.
+        // Keep the legacy --overlay flag (with its own tint/window options).
+        if arg == "-i" || arg == "--images" || arg.starts_with("--images=") {
+            let mut patterns = Vec::new();
+            if let Some((_, v)) = arg.split_once('=') {
+                patterns.push(v.to_owned());
+            }
+            while let Some(next) = args.peek() {
+                if next.starts_with('-') {
+                    break;
+                }
+                patterns.push(args.next().expect("peeked"));
+            }
+            if patterns.is_empty() || patterns.iter().any(|p| p.is_empty()) {
+                bail!("-i/--images requires at least one image path or glob");
+            }
+            for pattern in patterns {
+                for found in expand_images(&pattern)? {
+                    if !overlays.iter().any(|s| s.path.as_path() == found.as_path()) {
+                        overlays.push(OverlaySpec {
+                            path: found,
+                            window: None,
+                            color: [255, 184, 77],
+                            grayscale: true,
+                            opacity: 1.0,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
         // Handle both "--option value" and "--option=value" forms.
         let (flag, inline_value) = arg
             .split_once('=')
@@ -252,7 +295,8 @@ pub fn parse() -> Result<Option<Config>> {
                     path: PathBuf::from(val),
                     window: None,
                     color: [255, 184, 77],
-                    opacity: 0.8,
+                    grayscale: false,
+                    opacity: 1.0,
                 }),
                 "--overlay-window" => {
                     overlays
@@ -261,10 +305,11 @@ pub fn parse() -> Result<Option<Config>> {
                         .window = Some(parse_window(&val)?);
                 }
                 "--overlay-color" => {
-                    overlays
+                    let overlay = overlays
                         .last_mut()
-                        .context("--overlay-color requires a preceding --overlay")?
-                        .color = parse_color(&val)?;
+                        .context("--overlay-color requires a preceding image")?;
+                    overlay.color = parse_color(&val)?;
+                    overlay.grayscale = false;
                 }
                 "--overlay-opacity" => {
                     overlays
@@ -335,6 +380,38 @@ pub fn parse() -> Result<Option<Config>> {
         pixel_budget,
         profile,
     }))
+}
+
+/// Expand a shell-style glob without relying on the user's zsh glob settings.
+/// Non-glob paths are kept for the normal NIfTI loader to report any errors.
+fn expand_images(input: &str) -> Result<Vec<PathBuf>> {
+    let input_path = crate::path_complete::resolve(input);
+    let pattern = input_path.to_string_lossy().into_owned();
+    if !(pattern.contains('*') || pattern.contains('?') || pattern.contains('[')) {
+        return Ok(vec![input_path]);
+    }
+    let mut found = Vec::new();
+    for entry in glob::glob(&pattern).with_context(|| format!("Invalid image glob {input:?}"))? {
+        let path = entry.with_context(|| format!("Expanding image glob {input:?}"))?;
+        if path.is_file()
+            && (path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".nii")
+                || path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(".nii.gz"))
+        {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found.dedup();
+    if found.is_empty() {
+        bail!("No NIfTI files match glob {input:?}");
+    }
+    Ok(found)
 }
 
 fn parse_pixel_budget(s: &str) -> Result<usize> {
@@ -420,6 +497,36 @@ fn parse_window(s: &str) -> Result<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multiple_glob_patterns_expand_in_sorted_order() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "niv-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        for name in ["x_a.nii.gz", "x_b.nii.gz", "y_1.nii", "ignore.csv"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        let files = expand_images(&format!("{}/x_*.nii.gz", root.display())).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("x_a.nii.gz"));
+        assert_eq!(
+            expand_images(&format!("{}/y_?.nii", root.display()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(expand_images(&format!("{}/z*.nii.gz", root.display())).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn test_window() {
         assert_eq!(parse_window("-5, 10").unwrap(), (-5., 10.));

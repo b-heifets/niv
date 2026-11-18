@@ -176,6 +176,12 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
     }
 }
 
+/// Map a displayed row to a bottom-based stack index, topmost first.
+fn top_first_position(start: usize, count: usize, row: usize) -> usize {
+    debug_assert!(row < count);
+    start + count - 1 - row
+}
+
 fn crop(s: &str, cols: usize) -> String {
     s.chars().take(cols).collect()
 }
@@ -331,7 +337,7 @@ fn draw_ui(
     line(out, view.footer, &summary, cols, rgb_color(accent), x)?;
 
     for k in 0..view.list_count {
-        let idx = view.list_start + k;
+        let idx = top_first_position(view.list_start, view.list_count, k);
         let id = app.layer_at(idx);
         let name = if id == 0 {
             &app.path
@@ -409,6 +415,129 @@ fn draw_ui(
     Ok(())
 }
 
+/// Visible file picker, rather than blind cycling of one filename at a time.
+/// This hides the Kitty placement while the picker is open, so selections only
+/// redraw terminal text (not an expensive NIfTI raster).
+fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    queue!(out, Clear(ClearType::All))?;
+    let Some(editor) = &app.edit else {
+        return Ok(());
+    };
+    let Some(matches) = &editor.completion else {
+        return Ok(());
+    };
+    let x = if cols >= 70 { 3 } else { 1 };
+    let width = cols.saturating_sub(x + 1) as usize;
+    if rows == 0 {
+        return Ok(());
+    }
+    line(out, 0, "Load NIfTI images", cols, Color::White, x)?;
+    if rows > 1 {
+        let filter = if editor.text.is_empty() {
+            "(type any substring)"
+        } else {
+            &editor.text
+        };
+        line(out, 1, &format!("Filter: {filter}"), cols, Color::Yellow, x)?;
+    }
+    if rows > 2 {
+        let directory = if matches.directory.is_empty() {
+            "."
+        } else {
+            &matches.directory
+        };
+        line(
+            out,
+            2,
+            &format!(
+                "{} · marked {} · in {}",
+                matches.status(),
+                editor.checked.len(),
+                directory
+            ),
+            cols,
+            Color::DarkGrey,
+            x,
+        )?;
+    }
+    let visible = (rows as usize).saturating_sub(8).min(18);
+    let selected = matches.selected_index();
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(matches.values.len().saturating_sub(visible));
+    for (line_idx, item) in matches.values.iter().enumerate().skip(start).take(visible) {
+        let row = 3 + (line_idx - start) as u16;
+        let active = line_idx == selected;
+        let marked = editor
+            .checked
+            .iter()
+            .any(|p| p == &crate::path_complete::resolve(&item.path));
+        let prefix = format!(
+            "{} {} ",
+            if active { ">" } else { " " },
+            if marked { "[x]" } else { "[ ]" }
+        );
+        let label = item
+            .path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or(&item.path);
+        let display = format!(
+            "{prefix}{}{}",
+            middle_ellipsis(label, width.saturating_sub(9)),
+            if item.is_dir { " /" } else { "" }
+        );
+        line(
+            out,
+            row,
+            &display,
+            cols,
+            if active { Color::Cyan } else { Color::Grey },
+            x,
+        )?;
+    }
+    if rows >= 5 {
+        let row = rows - 4;
+        let selected_path = matches.selected().map(|m| m.path.as_str()).unwrap_or("");
+        line(
+            out,
+            row,
+            &format!(
+                "Selected: {}",
+                middle_ellipsis(selected_path, width.saturating_sub(11))
+            ),
+            cols,
+            Color::Grey,
+            x,
+        )?;
+    }
+    if rows >= 4 {
+        if let Some(e) = &editor.error {
+            line(out, rows - 3, &format!("Error: {e}"), cols, Color::Red, x)?;
+        } else {
+            line(
+                out,
+                rows - 3,
+                "↑↓ choose · Tab complete/cycle · → browse directory · Space mark",
+                cols,
+                Color::DarkGrey,
+                x,
+            )?;
+        }
+        line(
+            out,
+            rows - 2,
+            "Enter load selected/marked · Esc cancel · PgUp/PgDn page",
+            cols,
+            Color::DarkGrey,
+            x,
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// Small modal sheet; the graphics placement is temporarily hidden while open
 /// to ensure text remains readable even in multiplexers that draw Kitty images
 /// above terminal character cells.
@@ -435,7 +564,8 @@ fn draw_popup(
                     "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
-                    "  n      Load .nii.gz (Tab complete, Shift-Tab back)",
+                    "  n      File picker: filter filename by substring",
+                    "         ↑↓ select · Tab complete · Space mark · Enter load",
                     "  { / }  Lower / raise selected image (Shift+[ / ])",
                     "         Atlas always stays on top; t shows stack order",
                     "  Space  Toggle selected overlay",
@@ -447,7 +577,7 @@ fn draw_popup(
                     "  t      Layer list      ?       Help",
                     "  + / -  Contrast         , / .   Brightness",
                     "",
-                    "? or /  help     I  info     q  quit     Esc  close",
+                    "? or /  help     Shift+I  info     q  quit     Esc  close",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -525,8 +655,8 @@ fn draw_popup(
                 lines.push(format!("LUT        {} region colors", atlas.regions.len()));
             }
             lines.push(String::new());
-            lines.push("Image stack (bottom -> top; atlas above images)".into());
-            for pos in 0..=layers.overlays.len() {
+            lines.push("Image stack (top -> bottom; atlas above images)".into());
+            for pos in (0..=layers.overlays.len()).rev() {
                 let id = app.layer_at(pos);
                 if id == 0 {
                     lines.push(format!(
@@ -646,6 +776,15 @@ fn draw(
     if app.popup.is_some() {
         frames.clear(out)?;
         draw_popup(out, vol, layers, app, base_range)?;
+        return Ok(layout(vol, app, layers, cols, rows));
+    }
+    if app
+        .edit
+        .as_ref()
+        .is_some_and(|e| e.field == EditField::AddPath)
+    {
+        frames.clear(out)?;
+        draw_picker(out, app)?;
         return Ok(layout(vol, app, layers, cols, rows));
     }
     if cols < 16 || rows < 6 {
@@ -1006,26 +1145,39 @@ fn run() -> Result<()> {
                                 pending_layout = true;
                                 pending_frame = true;
                             }
-                            Action::LoadOverlay(path) => {
-                                app.notice = Some(format!("Loading {} ...", path.display()));
-                                draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
-                                match layers.add_overlay(&path, &vol) {
-                                    Ok(idx) => {
-                                        app.sync_layer_order(layers.overlays.len());
-                                        app.selected = app.layer_order.len() - 1;
-                                        app.notice = Some(format!(
-                                            "Loaded layer {}: {}",
-                                            app.selected + 1,
-                                            layers.overlays[idx - 1].name
-                                        ));
-                                        pending_layout = true;
-                                        pending_frame = true;
-                                    }
-                                    Err(err) => {
-                                        app.notice = Some(format!("Could not load: {err:#}"));
-                                        pending_ui = true;
+                            Action::LoadOverlays(paths) => {
+                                let mut loaded = 0usize;
+                                let mut failed = Vec::new();
+                                for path in paths {
+                                    app.notice = Some(format!("Loading {} ...", path.display()));
+                                    draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
+                                    match layers.add_overlay(&path, &vol) {
+                                        Ok(_) => {
+                                            loaded += 1;
+                                        }
+                                        Err(err) => {
+                                            failed.push(format!("{}: {err:#}", path.display()));
+                                        }
                                     }
                                 }
+                                app.sync_layer_order(layers.overlays.len());
+                                if loaded > 0 {
+                                    app.selected = app.layer_order.len() - 1;
+                                }
+                                app.notice = Some(if failed.is_empty() {
+                                    format!(
+                                        "Loaded {loaded} image{}",
+                                        if loaded == 1 { "" } else { "s" }
+                                    )
+                                } else {
+                                    format!(
+                                        "Loaded {loaded}; {} failed: {}",
+                                        failed.len(),
+                                        failed[0]
+                                    )
+                                });
+                                pending_layout = true;
+                                pending_frame = true;
                             }
                             Action::None => {}
                         }
@@ -1198,5 +1350,26 @@ mod mouse_tests {
             Some((20, 24))
         );
         assert_eq!(mouse_raster(view, mouse(1, 3), false, 8, 16), None);
+    }
+}
+
+#[cfg(test)]
+mod layer_list_order_tests {
+    use super::top_first_position;
+
+    #[test]
+    fn first_list_row_is_topmost_visible_image() {
+        assert_eq!(
+            (0..3)
+                .map(|row| top_first_position(0, 3, row))
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        assert_eq!(
+            (0..3)
+                .map(|row| top_first_position(5, 3, row))
+                .collect::<Vec<_>>(),
+            vec![7, 6, 5]
+        );
     }
 }

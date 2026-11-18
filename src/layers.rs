@@ -180,7 +180,11 @@ impl Layers {
                 window,
                 default_window,
                 data_range,
-                palette: Palette::Solid(spec.color),
+                palette: if spec.grayscale {
+                    Palette::Gray
+                } else {
+                    Palette::Solid(spec.color)
+                },
                 visible: true,
                 opacity: spec.opacity,
                 name,
@@ -249,7 +253,7 @@ impl Layers {
             data_range,
             palette: Palette::Gray,
             visible: true,
-            opacity: 0.8,
+            opacity: 1.0,
         });
         Ok(self.overlays.len()) // index 0 = base; index 1 = first overlay
     }
