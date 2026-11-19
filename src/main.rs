@@ -674,7 +674,7 @@ fn draw_popup(
                     "  Projections: current axis, full depth; atlas silhouette only",
                     "  G      Atlas Gaussian blur (0 = off)",
                     "  b      Black / transparent",
-                    "  t      Layer list      ?       Help",
+                    "  t      Layer list: ↑↓ / jk select; Enter or Esc close",
                     "  + / -  Contrast         , / .   Brightness",
                     "",
                     "? or /  help     Shift+I  info     q  quit     Esc  close",
@@ -704,6 +704,7 @@ fn draw_popup(
                     "  1–9 select layer · e window · c palette · o opacity",
                     "  Projection toggles are disabled in montage mode",
                     "  n   Load images    t   Layer list    s   Save scene",
+                    "  In layer list: ↑↓ / jk select; Enter or Esc close",
                     "  I   Info   ? or Esc   Close help",
                 ]
                 .into_iter()

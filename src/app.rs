@@ -908,11 +908,35 @@ impl App {
                 _ => Action::None,
             };
         }
-        // The first Esc closes the `t` layer list; another Esc exits niv.
-        // Editors and modal popups have already handled Esc above.
-        if key.code == KeyCode::Esc && self.show_layer_list {
-            self.show_layer_list = false;
-            return Action::Layout;
+        // The layer list is top-first, whereas selected is a bottom-based
+        // stack position. Modal editors/popups take precedence over this list.
+        if self.show_layer_list && !self.fullscreen {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.show_layer_list = false;
+                    return Action::Layout;
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                    let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                        self.selected
+                            .saturating_add(1)
+                            .min(self.layer_order.len() - 1)
+                    } else {
+                        self.selected.saturating_sub(1)
+                    };
+                    if next == self.selected {
+                        return Action::None;
+                    }
+                    self.selected = next;
+                    // Cluster labels in a montage can depend on the selection.
+                    return if self.montage.enabled && self.montage.show_clusters {
+                        Action::Redraw
+                    } else {
+                        Action::Ui
+                    };
+                }
+                _ => {}
+            }
         }
         if key.code == KeyCode::Esc
             || key.code == KeyCode::Char('q')
@@ -999,10 +1023,16 @@ impl App {
             }
             KeyCode::Tab => {
                 self.fullscreen = !self.fullscreen;
+                if self.fullscreen {
+                    self.show_layer_list = false;
+                }
                 Action::Layout
             }
             KeyCode::Char('t') => {
                 self.show_layer_list = !self.show_layer_list;
+                if self.show_layer_list {
+                    self.fullscreen = false;
+                }
                 Action::Layout
             }
             KeyCode::Char(c @ '1'..='9') => {
@@ -2082,6 +2112,95 @@ mod tests {
         layers.overlays.push(mk("new", (10., 20.), 1.));
         app.sync_layer_order(layers.overlays.len());
         assert_eq!(app.layer_order, vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn layer_list_navigation_tracks_visual_order_and_enter_keeps_selection() {
+        use crate::layers::IntensityOverlay;
+        let vol = example();
+        let mut layers = Layers {
+            overlays: (1..=8)
+                .map(|id| IntensityOverlay {
+                    path: PathBuf::from(format!("image{id}.nii.gz")),
+                    name: format!("image{id}"),
+                    vol: example(),
+                    window: (id as f32, 20.),
+                    default_window: (id as f32, 20.),
+                    data_range: (0., 20.),
+                    palette: Palette::Gray,
+                    visible: true,
+                    opacity: 1.,
+                })
+                .collect(),
+            atlas: None,
+        };
+        let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
+        app.sync_layer_order(layers.overlays.len());
+        app.layer_order.swap(7, 8);
+        let order = app.layer_order.clone();
+        let none = KeyModifiers::NONE;
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none),
+            Action::Layout
+        );
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Down, none),
+            Action::None
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                key(&mut app, &vol, &mut layers, KeyCode::Up, none),
+                Action::Ui
+            );
+        }
+        assert_eq!(app.selected, 8);
+        assert_eq!(app.selected_layer_id(), 7);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('k'), none),
+            Action::None
+        );
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Down, none),
+            Action::Ui
+        );
+        assert_eq!(app.selected_layer_id(), 8);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('j'), none),
+            Action::Ui
+        );
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('k'), none),
+            Action::Ui
+        );
+        assert_eq!(app.selected_layer_id(), 8);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Enter, none),
+            Action::Layout
+        );
+        assert!(!app.show_layer_list);
+        assert_eq!(app.selected_layer_id(), 8);
+        assert_eq!(app.selected_window(&layers), (8., 20.));
+        assert_eq!(app.layer_order, order);
+        assert_eq!(app.index, 30);
+        key(&mut app, &vol, &mut layers, KeyCode::Up, none);
+        assert_eq!(app.index, 31);
+        assert_eq!(app.selected_layer_id(), 8);
+    }
+
+    #[test]
+    fn layer_list_does_not_capture_keys_when_hidden_by_fullscreen() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
+        let none = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Tab, none);
+        assert!(app.fullscreen);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none);
+        assert!(app.show_layer_list && !app.fullscreen);
+        key(&mut app, &vol, &mut layers, KeyCode::Tab, none);
+        assert!(app.fullscreen && !app.show_layer_list);
+        key(&mut app, &vol, &mut layers, KeyCode::Up, none);
+        assert_eq!(app.index, 31);
     }
 
     #[test]

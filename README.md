@@ -59,7 +59,7 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `c` | Cycle gray → warm → cool → categorical integer-ID palette |
-| `t` | Show/hide layer list (top image first; Esc closes the list) |
+| `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter or Esc closes and retains the selection |
 | Space | Toggle selected image visibility (including the original base) |
 | `i` | Keyboard inspection crosshair (arrows move probe) |
 | `x`,`y`,`z` | Change array slicing axis |
@@ -200,7 +200,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 ### Reordering image layers
 
-Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Press `Esc` once to close the list; a second `Esc` exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter or Esc to close the list, retaining the selected image; a further Esc exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
 ## Save and reload scenes (v0.15)
 

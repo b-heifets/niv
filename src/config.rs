@@ -127,7 +127,8 @@ LAYERS
   n                        Open filterable NIfTI picker (substring matches)
                            ↑↓ select · Tab complete/cycle · Space mark multiple
                            → browse directory · Enter load chosen images
-  t                        Toggle layer list (top image first); Esc closes list
+  t                        Toggle layer list (top image first)
+                           ↑↓ / jk select; Enter or Esc close, keeping selection
                            Space show/hide selected image (including base)
   e                        Edit selected layer display min,max
   m / M                    Edit only min / max; 0 reset to data min,max
