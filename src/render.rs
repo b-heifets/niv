@@ -1,6 +1,9 @@
 use crossterm::terminal;
 
-use crate::{app::App, volume::Volume};
+use crate::{
+    app::{App, ProjectionMode},
+    volume::Volume,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Geometry {
@@ -76,6 +79,15 @@ pub(crate) fn cell_pixels(cols: u16, rows: u16) -> (usize, usize) {
     (8, 16)
 }
 
+pub fn display_value(vol: &Volume, app: &App, id: usize, h: usize, v: usize) -> f32 {
+    if app.projection == ProjectionMode::Slice {
+        vol.sample(app.axis, app.index, h, v)
+    } else {
+        app.projection_cache
+            .value(id, vol, app.axis, app.projection, h, v)
+    }
+}
+
 /// Nearest neighbor. Rotations are *screen-space*, clockwise in 90-degree
 /// increments, not affine-based reorientation. Screen-space flips apply AFTER rotation.
 #[cfg(test)]
@@ -119,7 +131,7 @@ pub fn grayscale(vol: &Volume, app: &App, width: usize, height: usize) -> Vec<u8
                 270 => (source_w - 1 - out_v, source_h - 1 - out_h),
                 _ => unreachable!("rotation must be 0, 90, 180, or 270"),
             };
-            let intensity = vol.sample(app.axis, app.index, h, v);
+            let intensity = display_value(vol, app, 0, h, v);
             if !intensity.is_finite() {
                 px.copy_from_slice(&[0; 3]);
                 continue;
@@ -136,6 +148,22 @@ mod tests {
     use super::*;
     use crate::volume::Axis;
     use ndarray::Array3;
+
+    #[test]
+    fn projected_value_matches_expected_max_and_mean() {
+        let vol = Volume {
+            data: Array3::from_shape_fn((2, 2, 3), |(_, _, z)| [0.0, 10.0, 20.0][z]),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut app = App::new(crate::volume::Axis::Z, 1, 1, 0, (0., 20.), "test".into());
+        assert_eq!(display_value(&vol, &app, 0, 1, 0), 10.0);
+        app.projection = ProjectionMode::Max;
+        assert_eq!(display_value(&vol, &app, 0, 1, 0), 20.0);
+        app.projection = ProjectionMode::Mean;
+        assert!((display_value(&vol, &app, 0, 1, 0) - 10.0).abs() < 1e-6);
+    }
 
     #[test]
     fn cached_sampling_matches_uncached_after_slice_change() {
@@ -335,43 +363,47 @@ pub fn composite_with_map(
     // stack positions can change without moving or reloading large volumes.
     for position in 0..=layers.overlays.len() {
         let id = app.layer_at(position);
-        if id == 0 {
-            if app.base_opacity <= 0.0 {
-                continue;
-            }
-            for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
-                let value = vol.sample(app.axis, app.index, h, v);
-                if !value.is_finite() || value <= app.window.0 {
-                    continue;
-                }
-                let color = app
-                    .base_palette
-                    .voxel_color(value, app.window.0, app.window.1, 0);
-                blend_pixel(px, color, app.base_opacity);
-            }
+        if !app.layer_visible(layers, id) {
+            continue;
+        }
+        let (source, (lo, hi), palette, opacity) = if id == 0 {
+            (vol, app.window, app.base_palette, app.base_opacity)
         } else {
-            if !app.show_overlays {
-                continue;
-            }
             let layer = &layers.overlays[id - 1];
-            if !layer.visible || layer.opacity <= 0.0 {
-                continue;
-            }
-            let (lo, hi) = layer.window;
+            (&layer.vol, layer.window, layer.palette, layer.opacity)
+        };
+        if opacity <= 0. {
+            continue;
+        }
+        // Keep the normal slice path separate: no cache lookup or projection
+        // computation in the per-pixel loop during ordinary browsing.
+        if app.projection == ProjectionMode::Slice {
             for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
-                let value = layer.vol.sample(app.axis, app.index, h, v);
+                let value = source.sample(app.axis, app.index, h, v);
                 if !value.is_finite() || value <= lo {
                     continue;
                 }
-                let color = layer.palette.voxel_color(value, lo, hi, id);
-                blend_pixel(px, color, layer.opacity);
+                blend_pixel(px, palette.voxel_color(value, lo, hi, id), opacity);
+            }
+        } else {
+            let plane = app
+                .projection_cache
+                .plane(id, source, app.axis, app.projection);
+            for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
+                let value = plane[[h, v]];
+                if !value.is_finite() || value <= lo {
+                    continue;
+                }
+                blend_pixel(px, palette.voxel_color(value, lo, hi, id), opacity);
             }
         }
     }
     if app.show_atlas {
         if let Some(atlas) = &layers.atlas {
             if atlas.opacity > 0.0 {
-                if atlas.wireframe {
+                if app.projection != ProjectionMode::Slice {
+                    draw_projected_atlas(&mut raster, width, height, channels, app, atlas, sw, sh);
+                } else if atlas.wireframe {
                     draw_wireframe(&mut raster, width, height, channels, app, atlas, coords);
                 } else {
                     draw_atlas_edges(&mut raster, width, height, channels, app, atlas, sw, sh);
@@ -927,6 +959,43 @@ fn draw_atlas_edges(
     strokes.blend_into(rgb, channels, atlas.opacity, app.atlas_blur);
 }
 
+/// Outline of the projected binary solid atlas, not projected region IDs.
+fn draw_projected_atlas(
+    rgb: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    app: &App,
+    atlas: &crate::layers::Atlas,
+    sw: usize,
+    sh: usize,
+) {
+    let solid = if atlas.wireframe {
+        atlas.labels.as_ref()
+    } else {
+        Some(&atlas.vol)
+    };
+    let Some(solid) = solid else {
+        return;
+    };
+    let faces = app.projection_cache.silhouette(solid, app.axis);
+    let mut strokes = StrokeCanvas::new(width, height);
+    for &(p, q) in faces.iter() {
+        stroke_face(
+            &mut strokes,
+            app,
+            sw,
+            sh,
+            p,
+            q,
+            atlas.fallback,
+            atlas.width,
+            false,
+        );
+    }
+    strokes.blend_into(rgb, channels, atlas.opacity, app.atlas_blur);
+}
+
 fn draw_wireframe(
     rgb: &mut [u8],
     width: usize,
@@ -981,6 +1050,120 @@ mod layer_tests {
     };
     use ndarray::Array3;
     use std::collections::HashMap;
+    #[test]
+    fn projection_reuses_raw_plane_after_window_edit_and_visibility_changes() {
+        let base = Volume {
+            data: Array3::from_shape_fn((3, 1, 2), |(_, _, z)| [2., 8.][z]),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut layers = Layers {
+            overlays: vec![IntensityOverlay {
+                path: "overlay.nii.gz".into(),
+                name: "overlay".into(),
+                vol: Volume {
+                    data: Array3::from_elem((3, 1, 2), 6.),
+                    spacing: [1.; 3],
+                    sform: None,
+                    datatype: 16,
+                },
+                window: (0., 10.),
+                default_window: (0., 10.),
+                data_range: (6., 6.),
+                palette: crate::layers::Palette::Gray,
+                visible: false,
+                opacity: 1.,
+            }],
+            atlas: None,
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 10.), "base".into());
+        app.sync_layer_order(1);
+        let _ = composite_format(&base, &app, &layers, 3, 1, false);
+        assert!(app
+            .projection_cache
+            .get_plane(0, Axis::Z, ProjectionMode::Max)
+            .is_none());
+        app.projection = ProjectionMode::Max;
+        let first = composite_format(&base, &app, &layers, 3, 1, false);
+        assert_eq!(first, vec![204; 9]);
+        let cache = app
+            .projection_cache
+            .get_plane(0, Axis::Z, ProjectionMode::Max)
+            .unwrap();
+        app.window = (0., 16.);
+        assert_eq!(
+            composite_format(&base, &app, &layers, 3, 1, false),
+            vec![128; 9]
+        );
+        assert!(std::rc::Rc::ptr_eq(
+            &cache,
+            &app.projection_cache
+                .get_plane(0, Axis::Z, ProjectionMode::Max)
+                .unwrap()
+        ));
+        app.base_visible = false;
+        assert_eq!(
+            composite_format(&base, &app, &layers, 3, 1, false),
+            vec![0; 9]
+        );
+        layers.overlays[0].visible = true;
+        assert_eq!(
+            composite_format(&base, &app, &layers, 3, 1, false),
+            vec![153; 9]
+        );
+    }
+
+    #[test]
+    fn hidden_base_leaves_background_and_projected_atlas() {
+        let base = Volume {
+            data: Array3::from_elem((3, 3, 2), 10.),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let labels = Volume {
+            data: Array3::from_shape_fn((3, 3, 2), |(x, y, z)| {
+                if x == 1 && y == 1 && z == 1 {
+                    7.
+                } else {
+                    0.
+                }
+            }),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: labels,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 0, 0],
+                width: 1,
+                opacity: 1.,
+                regions: HashMap::new(),
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 10.), "base".into());
+        app.base_visible = false;
+        assert!(composite_format(&base, &app, &layers, 30, 30, false)
+            .iter()
+            .all(|&v| v == 0));
+        app.projection = ProjectionMode::Max;
+        let pixels = composite_format(&base, &app, &layers, 30, 30, false);
+        assert!(pixels.chunks_exact(3).any(|p| p == [255, 0, 0]));
+        assert_eq!(
+            &pixels[(15 * 30 + 15) * 3..(15 * 30 + 15) * 3 + 3],
+            &[0, 0, 0]
+        );
+        app.show_atlas = false;
+        assert!(composite_format(&base, &app, &layers, 30, 30, false)
+            .iter()
+            .all(|&v| v == 0));
+    }
+
     #[test]
     fn gaussian_blur_spreads_atlas_coverage_symmetrically() {
         let mut canvas = StrokeCanvas::new(9, 9);

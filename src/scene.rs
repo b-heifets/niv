@@ -228,7 +228,7 @@ impl SceneFile {
                         app.window,
                         app.base_opacity,
                         app.base_palette,
-                        true,
+                        app.base_visible,
                         "base",
                     )
                 } else {
@@ -408,6 +408,7 @@ impl SceneFile {
                 ids.push(0);
                 app.window = (img.window[0], img.window[1]);
                 app.base_opacity = img.opacity;
+                app.base_visible = img.visible;
                 app.base_palette = parse_palette(&img.palette)?;
             } else {
                 let overlay = layers
@@ -752,6 +753,7 @@ visible = false
         assert_eq!(app.window, (10.0, 100.0));
         assert_eq!(app.base_palette, Palette::Cool);
         assert_eq!(app.base_opacity, 0.75);
+        assert!(app.base_visible);
         assert_eq!(app.probe, Some((3, 4)));
         assert!(app.inspect_mode);
         assert!(!app.show_overlays);
@@ -762,10 +764,17 @@ visible = false
         // The scene file is ordered top-to-bottom; the renderer stores bottom-to-top.
         let mut reversed = scene.clone();
         reversed.layers.reverse();
+        reversed
+            .layers
+            .iter_mut()
+            .find(|l| l.role == "base")
+            .unwrap()
+            .visible = false;
         reversed.view.selected = 0;
         reversed.apply_to_loaded(&mut app, &mut layers).unwrap();
         assert_eq!(app.layer_order, vec![0, 1]);
         assert_eq!(app.selected_layer_id(), 1);
+        assert!(!app.base_visible);
     }
 
     #[test]

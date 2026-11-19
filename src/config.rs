@@ -115,6 +115,7 @@ NAVIGATION
   x / y / z                Slice axes; r / R rotate clockwise/counterclockwise
   f / v                    Flip horizontal / vertical; Tab image-only mode
   i                        Toggle keyboard voxel inspection
+  X / A                    Toggle max / average projection along current axis
   p                        Toggle paged montage (all image layers + atlas)
   In montage, ? opens a dedicated guide; P resets the 3×4 preset.
   B/E edit bounds; Z/F edit columns/rows; U interval (0 auto); D gap.
@@ -127,7 +128,7 @@ LAYERS
                            ↑↓ select · Tab complete/cycle · Space mark multiple
                            → browse directory · Enter load chosen images
   t                        Toggle layer list (top image first); Esc closes list
-                           Space show/hide selected overlay
+                           Space show/hide selected image (including base)
   e                        Edit selected layer display min,max
   m / M                    Edit only min / max; 0 reset to data min,max
   c                        Gray → warm → cool → categorical palette

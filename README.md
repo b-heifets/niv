@@ -41,6 +41,7 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | Control + direction | ×4 |
 | Option/Alt + direction | ×2 fallback for Command |
 | `[` / `]` | Decrease/increase base stride by one |
+| `X` / `A` | Toggle max / average projection along the current axis |
 | `p` | Toggle paged montage view (atlas and layers are retained) |
 | `B` / `E` | Edit montage start / stop |
 | `[` / `]` in montage | Decrease / increase slice spacing by one index |
@@ -59,7 +60,7 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `c` | Cycle gray → warm → cool → categorical integer-ID palette |
 | `t` | Show/hide layer list (top image first; Esc closes the list) |
-| Space | Toggle selected overlay visibility (original base image stays visible) |
+| Space | Toggle selected image visibility (including the original base) |
 | `i` | Keyboard inspection crosshair (arrows move probe) |
 | `x`,`y`,`z` | Change array slicing axis |
 | `r`,`R` | Rotate clockwise / counterclockwise |
@@ -241,3 +242,28 @@ may be supplied alongside `--scene`. Standard image-loading commands remain
 unchanged.
 
 Scene files may include local research paths, so review them before sharing.
+
+### Projection views and layer visibility
+
+Press `X` for maximum intensity projection or `A` for average intensity projection
+along the current axis. Press the same key again to return to the slice view.
+Projections use the full depth and the mean includes finite zeros; NaN and infinite
+values are excluded. Each visible image is reduced before applying its display
+window, palette, opacity and stacking order. Cached native-resolution 2D arrays
+are reused for contrast changes, zoom, rotation, reordering and repeat visits to
+the same axis and projection mode. No projection scans occur on ordinary startup.
+Hidden images are not fully projected until displayed; their probe values are
+computed individually if needed. The cache is in memory for this session only.
+
+The atlas silhouette is the outline of the union of all nonzero finite labels
+along the projection axis. It uses the configured single atlas outline color,
+width, opacity, AA and blur (not regional label colors). A solid atlas or companion
+solid label file is required. Toggle with `a`. Region-specific hover outlines are
+disabled in projection view; `*` in the probe coordinates represents the collapsed
+axis. Montage remains slice-based. Projection mode is not persisted in scenes.
+Categorical images are reduced numerically too, so overlapping cluster IDs or
+average IDs are not anatomically meaningful.
+
+Space toggles any selected image, including the original reference image; it
+remains loaded as the grid reference. With all images hidden, only the atlas
+and background remain. Scene files save and restore the visibility of every image.

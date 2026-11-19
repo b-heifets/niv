@@ -5,6 +5,7 @@ mod kitty;
 mod layers;
 mod montage;
 mod path_complete;
+mod projection;
 mod render;
 mod scene;
 mod volume;
@@ -254,7 +255,7 @@ fn selected_name<'a>(app: &'a App, layers: &'a Layers) -> &'a str {
 
 fn selected_visible(app: &App, layers: &Layers) -> bool {
     let id = app.selected_layer_id();
-    id == 0 || (app.show_overlays && layers.overlays[id - 1].visible)
+    app.layer_visible(layers, id)
 }
 
 fn draw_ui(
@@ -270,9 +271,10 @@ fn draw_ui(
     }
     let (cols, rows) = terminal::size()?;
     let x = view.x;
+    let footer_x = 0u16;
     // Row 1: the region itself and a tiny help indicator at the right edge.
     queue!(out, MoveTo(0, 0), Clear(ClearType::CurrentLine))?;
-    if layers.atlas.is_some() {
+    if layers.atlas.is_some() && app.projection == app::ProjectionMode::Slice {
         let (w, h, _) = vol.plane(app.axis);
         let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
         if let Some((label, color)) = layers.region_details(app.axis, app.index, vh, vv) {
@@ -290,6 +292,35 @@ fn draw_ui(
                 SetAttribute(Attribute::Reset)
             )?;
         }
+    } else if app.projection != app::ProjectionMode::Slice {
+        let outline = match &layers.atlas {
+            Some(atlas)
+                if app.show_atlas
+                    && atlas.opacity > 0.
+                    && (!atlas.wireframe || atlas.labels.is_some()) =>
+            {
+                " · atlas silhouette"
+            }
+            Some(atlas) if app.show_atlas && atlas.wireframe && atlas.labels.is_none() => {
+                " · solid atlas required for silhouette"
+            }
+            _ => "",
+        };
+        let label = format!(
+            "{} along {}{outline}",
+            app.projection.label(),
+            app.axis.label()
+        );
+        queue!(
+            out,
+            MoveTo(x, 0),
+            SetAttribute(Attribute::Bold),
+            Print(middle_ellipsis(
+                &label,
+                cols.saturating_sub(x + 19) as usize
+            )),
+            SetAttribute(Attribute::Reset)
+        )?;
     }
     let hint = "Press ? for help";
     if cols as usize >= hint.len() + 2 {
@@ -305,16 +336,22 @@ fn draw_ui(
     let (w, h, _) = vol.plane(app.axis);
     let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
     let [ix, iy, iz] = app.axis.xyz(app.index, vh, vv);
-    let mut inspect = format!("[{ix},{iy},{iz}]");
+    let mut inspect = if app.projection == app::ProjectionMode::Slice {
+        format!("[{ix},{iy},{iz}]")
+    } else {
+        match app.axis {
+            volume::Axis::X => format!("[*,{iy},{iz}]"),
+            volume::Axis::Y => format!("[{ix},*,{iz}]"),
+            volume::Axis::Z => format!("[{ix},{iy},*]"),
+        }
+    };
     // Number images by the same bottom-to-top order as the layer selector.
     for pos in 0..=layers.overlays.len() {
         let id = app.layer_at(pos);
         let value = if id == 0 {
-            vol.sample(app.axis, app.index, vh, vv)
+            render::display_value(vol, app, id, vh, vv)
         } else {
-            layers.overlays[id - 1]
-                .vol
-                .sample(app.axis, app.index, vh, vv)
+            render::display_value(&layers.overlays[id - 1].vol, app, id, vh, vv)
         };
         inspect.push_str(&format!("  |  {}: {}", pos + 1, intensity(value)));
     }
@@ -337,8 +374,8 @@ fn draw_ui(
         marker
     );
     let prefix = format!("{}: ", app.selected + 1);
-    let name_space =
-        (cols as usize).saturating_sub(x as usize + prefix.len() + settings.chars().count() + 1);
+    let name_space = (cols as usize)
+        .saturating_sub(footer_x as usize + prefix.len() + settings.chars().count() + 1);
     let name = middle_ellipsis(selected_name(app, layers), name_space);
     let summary = if app.montage.enabled {
         let reserved = if app.fullscreen {
@@ -378,7 +415,7 @@ fn draw_ui(
         } else {
             rgb_color(accent)
         },
-        x,
+        footer_x,
     )?;
 
     for k in 0..view.list_count {
@@ -394,10 +431,10 @@ fn draw_ui(
         } else {
             layers.overlays[id - 1].palette
         };
-        let visible = id == 0 || (app.show_overlays && layers.overlays[id - 1].visible);
+        let visible = app.layer_visible(layers, id);
         let mark = if idx == app.selected { ">" } else { " " };
         let prefix = format!("{} {}: ", mark, idx + 1);
-        let max_name = (cols as usize).saturating_sub(x as usize + prefix.len() + 7);
+        let max_name = (cols as usize).saturating_sub(footer_x as usize + prefix.len() + 7);
         let txt = format!(
             "{}{}{}",
             prefix,
@@ -414,7 +451,7 @@ fn draw_ui(
             } else {
                 Color::DarkGrey
             },
-            x,
+            footer_x,
         )?;
     }
     // No persistent bottom help row. Only transient prompts/errors/loading.
@@ -446,7 +483,7 @@ fn draw_ui(
                     .map(|m| m.status())
                     .unwrap_or_default()
             };
-            let cols_available = cols.saturating_sub(x) as usize;
+            let cols_available = cols.saturating_sub(footer_x) as usize;
             let hint = middle_ellipsis(&hint, (cols_available / 3).max(12));
             let overhead = what.chars().count() + err.chars().count() + hint.chars().count() + 24;
             let shown = middle_ellipsis(&edit.text, cols_available.saturating_sub(overhead).max(8));
@@ -461,10 +498,10 @@ fn draw_ui(
                 } else {
                     Color::Yellow
                 },
-                x,
+                footer_x,
             )?;
         } else if let Some(notice) = &app.notice {
-            line(out, bottom, notice, cols, Color::Yellow, x)?;
+            line(out, bottom, notice, cols, Color::Yellow, footer_x)?;
         }
     }
     out.flush()?;
@@ -628,11 +665,13 @@ fn draw_popup(
                     "  { / }  Lower / raise selected image (Shift+[ / ])",
                     "  Reload saved scene: niv --scene FILE.niv.toml",
                     "         Atlas always stays on top; t shows stack order",
-                    "  Space  Toggle selected overlay",
+                    "  Space  Toggle selected image",
                     "  e      Edit min,max     m / M   Edit just min / max",
                     "  0      Reset range      c       Cycle color map",
                     "  o      Image opacity    O       Atlas opacity",
-                    "  a      Atlas visible    g       Edge AA (optional)",
+                    "  a      Atlas visible    A       Average projection on/off",
+                    "  g      Edge AA (optional)    X   Max projection on/off",
+                    "  Projections: current axis, full depth; atlas silhouette only",
                     "  G      Atlas Gaussian blur (0 = off)",
                     "  b      Black / transparent",
                     "  t      Layer list      ?       Help",
@@ -663,6 +702,7 @@ fn draw_popup(
                     "  g   Edge AA    G   Atlas Gaussian blur (0..4 px)",
                     "  a   Atlas on/off    O   Atlas opacity",
                     "  1–9 select layer · e window · c palette · o opacity",
+                    "  Projection toggles are disabled in montage mode",
                     "  n   Load images    t   Layer list    s   Save scene",
                     "  I   Info   ? or Esc   Close help",
                 ]
@@ -705,7 +745,12 @@ fn draw_popup(
                 app.rotation,
                 app.stride
             ));
-            lines.push(format!("Opacity    {:.0}%", app.base_opacity * 100.0));
+            lines.push(format!(
+                "Opacity    {:.0}%{}",
+                app.base_opacity * 100.0,
+                if app.base_visible { "" } else { " · hidden" }
+            ));
+            lines.push(format!("Projection {}", app.projection.label()));
             lines.push(format!(
                 "Background {}",
                 if app.transparent_background {
@@ -1258,7 +1303,8 @@ fn run() -> Result<()> {
                         if matches!(action, Action::Redraw | Action::Layout) {
                             // Slice/axis change: update the region associated with
                             // the cursor; don't retain an outline from another slice.
-                            if app.montage.enabled
+                            if app.projection != app::ProjectionMode::Slice
+                                || app.montage.enabled
                                 || app.inspect_mode
                                 || app.probe.is_none()
                                 || !app.show_atlas
@@ -1410,7 +1456,8 @@ fn run() -> Result<()> {
                                 app.probe = next;
                                 pending_ui = true;
                             }
-                            if config.hover_delay_ms != 0
+                            if app.projection == app::ProjectionMode::Slice
+                                && config.hover_delay_ms != 0
                                 && app.show_atlas
                                 && layers.atlas.is_some()
                             {

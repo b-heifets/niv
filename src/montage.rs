@@ -189,7 +189,7 @@ fn cluster_labels(
     use std::collections::BTreeMap;
     let categorical = |id: usize| -> Option<(&Volume, (f32, f32))> {
         if id == 0 {
-            (app.base_palette == Palette::Random && app.base_opacity > 0.)
+            (app.base_visible && app.base_palette == Palette::Random && app.base_opacity > 0.)
                 .then_some((vol, app.window))
         } else {
             let o = layers.overlays.get(id - 1)?;
