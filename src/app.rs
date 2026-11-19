@@ -118,6 +118,7 @@ pub enum ProjectionMode {
     Slice,
     Max,
     Mean,
+    MinPositive,
 }
 
 impl ProjectionMode {
@@ -126,6 +127,7 @@ impl ProjectionMode {
             Self::Slice => "slice",
             Self::Max => "max projection",
             Self::Mean => "average projection",
+            Self::MinPositive => "minimum positive projection",
         }
     }
 }
@@ -138,6 +140,10 @@ pub struct App {
     pub pre_montage_slice: Option<(Axis, usize)>,
     pub atlas_blur: f32,
     pub projection: ProjectionMode,
+    /// 0 = detailed General_Region, 1 = broad, 2 = silhouette, 3 = none.
+    pub projected_atlas_detail: u8,
+    // Explicit choices keyed by stable image ID, not stack position.
+    pub layer_projections: Vec<(usize, ProjectionMode)>,
     pub projection_cache: std::rc::Rc<crate::projection::ProjectionCache>,
     pub axis: Axis,
     pub index: usize,
@@ -183,6 +189,7 @@ pub enum Action {
     Layout,
     LoadOverlays(Vec<PathBuf>),
     SaveScene(PathBuf),
+    CopyRegion,
     None,
 }
 
@@ -201,6 +208,8 @@ impl App {
             pre_montage_slice: None,
             atlas_blur: 0.,
             projection: ProjectionMode::Slice,
+            projected_atlas_detail: 0,
+            layer_projections: Vec::new(),
             projection_cache: Default::default(),
             axis,
             index,
@@ -361,20 +370,36 @@ impl App {
         Ok(())
     }
 
-    fn toggle_projection(&mut self, mode: ProjectionMode) -> Action {
+    /// Slice mode bypasses all overrides; unconfigured projected layers use max.
+    pub fn projection_for(&self, id: usize) -> ProjectionMode {
+        if self.projection == ProjectionMode::Slice {
+            return ProjectionMode::Slice;
+        }
+        self.layer_projections
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, mode)| *mode)
+            .unwrap_or(self.projection)
+    }
+
+    fn set_projection(&mut self, mode: ProjectionMode) -> Action {
         if self.montage.enabled {
             self.notice =
                 Some("Projection views are only available in the single-slice viewer".into());
             return Action::Ui;
         }
-        self.inspect_mode = false;
-        self.probe = None;
-        self.highlighted_region = None;
-        self.projection = if self.projection == mode {
-            ProjectionMode::Slice
+        if self.projection == ProjectionMode::Slice {
+            self.inspect_mode = false;
+            self.probe = None;
+            self.highlighted_region = None;
+            self.projection = ProjectionMode::Max;
+        }
+        let id = self.selected_layer_id();
+        if let Some((_, old)) = self.layer_projections.iter_mut().find(|(i, _)| *i == id) {
+            *old = mode;
         } else {
-            mode
-        };
+            self.layer_projections.push((id, mode));
+        }
         Action::Redraw
     }
 
@@ -398,6 +423,10 @@ impl App {
     /// The fallback also supports small unit fixtures made without loading.
     pub fn layer_at(&self, position: usize) -> usize {
         self.layer_order.get(position).copied().unwrap_or(position)
+    }
+
+    pub fn layer_number(&self, position: usize) -> usize {
+        self.layer_order.len().saturating_sub(position)
     }
 
     pub fn selected_layer_id(&self) -> usize {
@@ -485,6 +514,10 @@ impl App {
 
     fn set_axis(&mut self, vol: &Volume, axis: Axis) {
         if self.axis == axis {
+            if axis != Axis::Y {
+                self.flip_h = !self.flip_h;
+                self.probe = None;
+            }
             return;
         }
         let old_len = vol.depth(self.axis);
@@ -1053,6 +1086,14 @@ impl App {
                 }
                 Action::Layout
             }
+            KeyCode::Char('T') | KeyCode::Char('t')
+                if self.projection != ProjectionMode::Slice
+                    && (key.code == KeyCode::Char('T') || m.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.projected_atlas_detail = (self.projected_atlas_detail + 1) % 4;
+                self.show_atlas = true;
+                Action::Redraw
+            }
             KeyCode::Char('t') => {
                 self.show_layer_list = !self.show_layer_list;
                 if self.show_layer_list {
@@ -1061,9 +1102,9 @@ impl App {
                 Action::Layout
             }
             KeyCode::Char(c @ '1'..='9') => {
-                let selected = (c as u8 - b'1') as usize;
-                if selected <= layers.overlays.len() {
-                    self.selected = selected;
+                let number = (c as u8 - b'0') as usize;
+                if number <= self.layer_order.len() {
+                    self.selected = self.layer_order.len() - number;
                     if self.montage.enabled && self.montage.show_clusters {
                         Action::Redraw
                     } else {
@@ -1165,17 +1206,48 @@ impl App {
                 self.normalize_montage(vol);
                 Action::Layout
             }
-            KeyCode::Char('X') => self.toggle_projection(ProjectionMode::Max),
+            KeyCode::Char('X') => self.set_projection(ProjectionMode::Max),
             KeyCode::Char('x') if m.contains(KeyModifiers::SHIFT) => {
-                self.toggle_projection(ProjectionMode::Max)
+                self.set_projection(ProjectionMode::Max)
             }
-            KeyCode::Char('A') => self.toggle_projection(ProjectionMode::Mean),
+            KeyCode::Char('A') => self.set_projection(ProjectionMode::Mean),
             KeyCode::Char('a') if m.contains(KeyModifiers::SHIFT) => {
-                self.toggle_projection(ProjectionMode::Mean)
+                self.set_projection(ProjectionMode::Mean)
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('V') => {
+                if self.projection == ProjectionMode::Slice {
+                    Action::None
+                } else {
+                    self.projection = ProjectionMode::Slice;
+                    self.highlighted_region = None;
+                    Action::Redraw
+                }
+            }
+            KeyCode::Char('v') if m.contains(KeyModifiers::SHIFT) => {
+                if self.projection == ProjectionMode::Slice {
+                    Action::None
+                } else {
+                    self.projection = ProjectionMode::Slice;
+                    self.highlighted_region = None;
+                    Action::Redraw
+                }
+            }
+            KeyCode::Char('l') => {
                 self.cycle_palette(layers);
                 Action::Redraw
+            }
+            KeyCode::Char('w') => self.move_selected_layer(1),
+            KeyCode::Char('d') => self.move_selected_layer(-1),
+            KeyCode::Char('U') | KeyCode::Char('u')
+                if !self.montage.enabled
+                    && (key.code == KeyCode::Char('U') || m.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.set_projection(ProjectionMode::MinPositive)
+            }
+            KeyCode::Char('u')
+                if !self.montage.enabled && self.projection == ProjectionMode::Slice =>
+            {
+                Action::CopyRegion
             }
             KeyCode::Char(' ') => {
                 let id = self.selected_layer_id();
@@ -1206,7 +1278,7 @@ impl App {
                 }
                 Action::Redraw
             }
-            KeyCode::Char('y') => {
+            KeyCode::Char('y' | 'c') => {
                 self.set_axis(vol, Axis::Y);
                 if self.montage.enabled && self.montage_preset_pending {
                     self.montage_preset(vol, layers);
@@ -1363,12 +1435,12 @@ impl App {
             | KeyCode::Right
             | KeyCode::Left
             | KeyCode::Down
-            | KeyCode::Char('h' | 'j' | 'k' | 'l' | 'H' | 'J' | 'K' | 'L') => {
+            | KeyCode::Char('h' | 'j' | 'k' | 'H' | 'J' | 'K') => {
                 let multiplier =
-                    Self::multiplier(m, matches!(key.code, KeyCode::Char('H' | 'J' | 'K' | 'L')));
+                    Self::multiplier(m, matches!(key.code, KeyCode::Char('H' | 'J' | 'K')));
                 if self.inspect_mode {
                     let (dx, dy) = match key.code {
-                        KeyCode::Right | KeyCode::Char('l' | 'L') => (1, 0),
+                        KeyCode::Right => (1, 0),
                         KeyCode::Left | KeyCode::Char('h' | 'H') => (-1, 0),
                         KeyCode::Up | KeyCode::Char('k' | 'K') => (0, -1),
                         _ => (0, 1),
@@ -1384,7 +1456,7 @@ impl App {
                     self.move_slices(vol, delta * multiplier as isize);
                 } else {
                     let sign = match key.code {
-                        KeyCode::Up | KeyCode::Right | KeyCode::Char('k' | 'l' | 'K' | 'L') => 1,
+                        KeyCode::Up | KeyCode::Right | KeyCode::Char('k' | 'K') => 1,
                         _ => -1,
                     };
                     if !self.move_slices(vol, sign * (self.stride * multiplier) as isize)
@@ -1614,7 +1686,7 @@ mod tests {
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('2'),
+            KeyCode::Char('1'),
             KeyModifiers::NONE,
         );
         assert_eq!(app.selected, 1);
@@ -1645,7 +1717,7 @@ mod tests {
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('c'),
+            KeyCode::Char('l'),
             KeyModifiers::NONE,
         );
         assert_eq!(layers.overlays[0].palette, Palette::Gray);
@@ -2081,7 +2153,7 @@ mod tests {
                 &mut app,
                 &vol,
                 &mut layers,
-                KeyCode::Char('1'),
+                KeyCode::Char('3'),
                 KeyModifiers::NONE
             ),
             Action::Ui
@@ -2430,6 +2502,30 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert_eq!(app.projection, ProjectionMode::Max);
+        assert_eq!(app.projection_for(0), ProjectionMode::Max);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('a'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.projection_for(0), ProjectionMode::Mean);
+        assert_eq!(app.projection_for(1), ProjectionMode::Max);
+        // Select a second image by ID, then move it below the original base.
+        layers.overlays.push(crate::layers::IntensityOverlay {
+            path: "other.nii.gz".into(),
+            name: "other".into(),
+            vol: example(),
+            window: (0., 1.),
+            default_window: (0., 1.),
+            data_range: (0., 0.),
+            palette: Palette::Gray,
+            visible: true,
+            opacity: 1.,
+        });
+        app.sync_layer_order(1);
+        app.selected = 1;
         key(
             &mut app,
             &vol,
@@ -2437,15 +2533,28 @@ mod tests {
             KeyCode::Char('X'),
             KeyModifiers::NONE,
         );
-        assert_eq!(app.projection, ProjectionMode::Slice);
+        app.move_selected_layer(-1);
+        assert_eq!(app.selected_layer_id(), 1);
+        assert_eq!(app.projection_for(1), ProjectionMode::Max);
+        assert_eq!(app.projection_for(0), ProjectionMode::Mean);
         key(
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('A'),
+            KeyCode::Char('v'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.projection, ProjectionMode::Slice);
+        assert_eq!(app.projection_for(0), ProjectionMode::Slice);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('X'),
             KeyModifiers::NONE,
         );
-        assert_eq!(app.projection, ProjectionMode::Mean);
+        assert_eq!(app.projection_for(0), ProjectionMode::Mean);
+        app.projection = ProjectionMode::Slice;
         app.montage.enabled = true;
         let action = key(
             &mut app,
@@ -2455,7 +2564,64 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert_eq!(action, Action::Ui);
-        assert_eq!(app.projection, ProjectionMode::Mean);
+        assert_eq!(app.projection, ProjectionMode::Slice);
+    }
+
+    #[test]
+    fn top_numbering_and_new_shortcuts() {
+        let vol = example();
+        let mut layers = Layers::default();
+        layers.overlays.push(crate::layers::IntensityOverlay {
+            path: "template.nii.gz".into(),
+            name: "template".into(),
+            vol: example(),
+            window: (0., 1.),
+            default_window: (0., 1.),
+            data_range: (0., 0.),
+            palette: Palette::Gray,
+            visible: true,
+            opacity: 1.,
+        });
+        let mut app = App::new(Axis::X, 30, 1, 90, (0., 1.), "clusters".into());
+        app.sync_layer_order(1);
+        app.layer_order.reverse();
+        app.selected = 1;
+        let none = KeyModifiers::NONE;
+        assert_eq!(app.layer_number(app.selected), 1);
+        assert_eq!(app.selected_layer_id(), 0);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('2'), none);
+        assert_eq!(app.selected_layer_id(), 1);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('w'), none);
+        assert_eq!(app.layer_number(app.selected), 1);
+        assert_eq!(app.selected_layer_id(), 1);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('d'), none);
+        assert_eq!(app.layer_number(app.selected), 2);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('x'), none);
+        assert!(app.flip_h);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('x'), none);
+        assert!(!app.flip_h);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('c'), none);
+        assert_eq!(app.axis, Axis::Y);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('c'), none);
+        assert!(!app.flip_h);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('U'), none);
+        assert_eq!(app.projection_for(1), ProjectionMode::MinPositive);
+        for detail in [1, 2, 3, 0] {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('t'),
+                KeyModifiers::SHIFT,
+            );
+            assert_eq!(app.projected_atlas_detail, detail);
+            assert!(!app.show_layer_list);
+        }
+        key(&mut app, &vol, &mut layers, KeyCode::Char('V'), none);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('u'), none),
+            Action::CopyRegion
+        );
     }
 
     #[test]

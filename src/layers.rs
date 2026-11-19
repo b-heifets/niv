@@ -133,6 +133,7 @@ pub struct RegionInfo {
     pub color: [u8; 3],
     pub name: String,
     pub abbr: String,
+    pub general_region: String,
 }
 
 pub struct Atlas {
@@ -348,6 +349,7 @@ fn read_lut(path: &Path) -> Result<HashMap<i32, RegionInfo>> {
     let id_col = col("Region_ID")?;
     let name_col = col("Region")?;
     let abbr_col = col("Abbr")?;
+    let general_col = headers.iter().position(|s| s == "General_Region");
     let rgb_cols = [col("R")?, col("G")?, col("B")?];
     let mut lut = HashMap::new();
     for record in reader.records() {
@@ -373,6 +375,11 @@ fn read_lut(path: &Path) -> Result<HashMap<i32, RegionInfo>> {
                 name: r.get(name_col).unwrap_or("").to_owned(),
                 abbr: r.get(abbr_col).unwrap_or("").to_owned(),
                 color,
+                general_region: general_col
+                    .and_then(|i| r.get(i))
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned(),
             },
         );
     }
@@ -408,6 +415,7 @@ mod tests {
         let got = read_lut(&p).unwrap();
         assert_eq!(got[&51].name, "Nucleus, accumbens");
         assert_eq!(got[&51].color, [128, 205, 248]);
+        assert_eq!(got[&51].general_region, "Striatum");
         std::fs::remove_file(&p).unwrap();
     }
     #[test]
@@ -426,6 +434,7 @@ mod tests {
                 color: [128, 205, 248],
                 name: "Nucleus accumbens".into(),
                 abbr: "ACB".into(),
+                general_region: "Striatum__Ventral".into(),
             },
         );
         let layers = Layers {

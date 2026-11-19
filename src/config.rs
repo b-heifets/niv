@@ -44,17 +44,19 @@ pub struct Config {
 }
 
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
-Usage: niv FILE.nii.gz [-i FILE/GLOB ...] [--atlas FILE] [--lut FILE]
+Usage: niv FILE/GLOB ... [OPTIONS]
+       niv -i FILE/GLOB ... [OPTIONS]
        niv --scene FILE.niv.toml
 Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
-Keys: arrows/wheel slices · p montage · 1–9 select · n load · s scene · ? help
-Use --help for full options and controls.
+Press ? in the viewer for keyboard help.  -v shows version.
+Use --help for full CLI options.
 "#;
 
 const HELP: &str = r#"niv — keyboard-driven NIfTI viewer using Kitty graphics
 
 USAGE
-  niv FILE.nii[.gz] [-i IMAGE_OR_GLOB ...] [OPTIONS]
+  niv FILE/GLOB ... [OPTIONS]
+  niv -i FILE/GLOB ... [OPTIONS]
   niv --scene FILE.niv.toml [--pixel-budget N] [--fps N] [--profile]
 
 SCENES
@@ -86,7 +88,7 @@ VIEW
       --bench N          Benchmark N frames without a terminal
 
 LAYERS AND ATLAS
-  -i, --images FILE/GLOB ...      Load several additional NIfTI images at startup.
+  -i, --images FILE/GLOB ...      Load NIfTI images (no positional file required).
                                    Supports multiple space-separated files,
                                    quoted globs, and repeated -i groups.
                                    Matched files are sorted; all images are
@@ -107,44 +109,14 @@ LAYERS AND ATLAS
       --atlas-aa                  Optional subpixel antialiasing of solid-atlas outlines
                                   (NIV_ATLAS_AA=1; toggle with g; slower than exact)
 
-NAVIGATION
-  arrows/hjkl or mouse wheel  Move slices (in inspection mode, arrows move probe)
-  Cmd ×2 (if forwarded) · Shift ×3 · Ctrl ×4 · Alt/Option ×2 fallback
-  [ and ] change stride by one
-  PgUp / PgDn              Move ±25 slices; Home / End first / last
-  x / y / z                Slice axes; r / R rotate clockwise/counterclockwise
-  f / v                    Flip horizontal / vertical; Tab image-only mode
-  i                        Toggle keyboard voxel inspection
-  X / A                    Toggle max / average projection along current axis
-  p                        Toggle paged montage (all image layers + atlas)
-  In montage, ? opens a dedicated guide; P resets the 3×4 preset.
-  B/E edit bounds; Z/F edit columns/rows; U interval (0 auto); D gap.
-  +/- zoom; [/] interval; </> gap; N slice numbers; C cluster IDs.
-  ↑↓/wheel move one row; PgUp/PgDn move a screen. G edits atlas blur.
-
-LAYERS
-  1..9                     Select loaded layer; ; cycles selection
-  n                        Open filterable NIfTI picker (substring matches)
-                           ↑↓ select · Tab complete/cycle · Space mark multiple
-                           → browse directory · Enter load chosen images
-  t                        Toggle layer list (top image first)
-                           ↑↓ / jk select; Enter / q / Esc close, keeping selection
-                           Space show/hide selected image (including base)
-  e                        Edit selected layer display min,max
-  m / M                    Edit only min / max; 0 reset to data min,max
-  c                        Gray → warm → cool → categorical palette
-  o / O                    Type selected image / atlas opacity (0..1)
-  a                        Toggle atlas outlines; g antialias solid atlas (optional)
-  b                        Toggle black/transparent background
-  + / -                    Narrow / widen selected display range
-  , / .                    Shift selected display range down / up
-  ? or /                   Toggle help panel; Shift+I opens volume information
-  q                        Close menu, otherwise quit (Esc also closes)
-  Ctrl+C                   Quit from any interactive menu or editor
-                           In filename prompts q is typed; Esc cancels
+INTERACTIVE HELP
+  Press ? in the viewer for context-specific keyboard controls.
+  -v, -V, --version       Show version.
 
 EXAMPLES
   niv mean_IF.nii.gz
+  niv template.nii.gz clusters.nii.gz
+  niv -i template.nii.gz "*clusters*.nii.gz"
   ATLAS=/data/atlas.nii.gz ATLAS_LUT=/data/CCFv3-2020_regional_summary.csv niv mean_IF.nii.gz
   niv mean_IF.nii.gz -i 'stat*.nii.gz' '*clusters*.nii.gz'
   niv mean_IF.nii.gz -i layer1.nii.gz layer2.nii.gz --atlas atlas.nii.gz
@@ -156,7 +128,10 @@ work in both modes; transparent terminal background requires Kitty RGBA (f=32).
 "#;
 
 pub fn parse() -> Result<Option<Config>> {
-    let argv: Vec<String> = env::args().skip(1).collect();
+    parse_args(env::args().skip(1).collect())
+}
+
+fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
     // Help/version can be requested even when --scene is also on the command line.
     if argv.iter().any(|a| a == "--help") {
         print!("{HELP}");
@@ -166,7 +141,10 @@ pub fn parse() -> Result<Option<Config>> {
         print!("{SHORT_HELP}");
         return Ok(None);
     }
-    if argv.iter().any(|a| a == "--version" || a == "-V") {
+    if argv
+        .iter()
+        .any(|a| a == "--version" || a == "-V" || a == "-v")
+    {
         println!("niv {}", env!("CARGO_PKG_VERSION"));
         return Ok(None);
     }
@@ -237,7 +215,7 @@ pub fn parse() -> Result<Option<Config>> {
             print!("{HELP}");
             return Ok(None);
         }
-        if arg == "-V" || arg == "--version" {
+        if arg == "-V" || arg == "-v" || arg == "--version" {
             println!("niv {}", env!("CARGO_PKG_VERSION"));
             return Ok(None);
         }
@@ -276,15 +254,7 @@ pub fn parse() -> Result<Option<Config>> {
             }
             for pattern in patterns {
                 for found in expand_images(&pattern)? {
-                    if !overlays.iter().any(|s| s.path.as_path() == found.as_path()) {
-                        overlays.push(OverlaySpec {
-                            path: found,
-                            window: None,
-                            color: [255, 184, 77],
-                            grayscale: true,
-                            opacity: 1.0,
-                        });
-                    }
+                    append_image(&mut path, &mut overlays, found);
                 }
             }
             continue;
@@ -388,8 +358,10 @@ pub fn parse() -> Result<Option<Config>> {
             }
         } else if arg.starts_with('-') {
             bail!("Unknown option {arg:?}. See --help");
-        } else if path.replace(PathBuf::from(arg)).is_some() {
-            bail!("Supply exactly one NIfTI file");
+        } else {
+            for found in expand_images(&arg)? {
+                append_image(&mut path, &mut overlays, found);
+            }
         }
     }
     // Explicit --atlas/--atlas-wireframe takes precedence over environment defaults.
@@ -437,10 +409,31 @@ pub fn parse() -> Result<Option<Config>> {
     }))
 }
 
+/// First ordinary image is the reference; later ones are grayscale layers.
+fn append_image(base: &mut Option<PathBuf>, overlays: &mut Vec<OverlaySpec>, path: PathBuf) {
+    if base.is_none() {
+        *base = Some(path);
+        return;
+    }
+    if base.as_ref() == Some(&path) || overlays.iter().any(|s| s.path == path) {
+        return;
+    }
+    overlays.push(OverlaySpec {
+        path,
+        window: None,
+        color: [255, 184, 77],
+        grayscale: true,
+        opacity: 1.0,
+    });
+}
+
 /// Expand a shell-style glob without relying on the user's zsh glob settings.
 /// Non-glob paths are kept for the normal NIfTI loader to report any errors.
 fn expand_images(input: &str) -> Result<Vec<PathBuf>> {
     let input_path = crate::path_complete::resolve(input);
+    if input_path.is_file() {
+        return Ok(vec![input_path]);
+    }
     let pattern = input_path.to_string_lossy().into_owned();
     if !(pattern.contains('*') || pattern.contains('?') || pattern.contains('[')) {
         return Ok(vec![input_path]);
@@ -561,6 +554,24 @@ fn parse_window(s: &str) -> Result<(f32, f32)> {
 mod tests {
     use super::*;
     #[test]
+    fn positional_and_i_only_loading_preserve_order() {
+        for args in [
+            vec!["a.nii.gz", "b.nii.gz"],
+            vec!["-i", "a.nii.gz", "b.nii.gz"],
+            vec!["a.nii.gz", "-i", "b.nii.gz"],
+            vec!["-i", "a.nii.gz", "-i", "b.nii.gz", "a.nii.gz"],
+        ] {
+            let cfg = parse_args(args.into_iter().map(str::to_owned).collect())
+                .unwrap()
+                .unwrap();
+            assert_eq!(cfg.path, PathBuf::from("a.nii.gz"));
+            assert_eq!(cfg.overlays.len(), 1);
+            assert_eq!(cfg.overlays[0].path, PathBuf::from("b.nii.gz"));
+            assert!(cfg.overlays[0].grayscale);
+            assert_eq!(cfg.overlays[0].opacity, 1.0);
+        }
+    }
+    #[test]
     fn multiple_glob_patterns_expand_in_sorted_order() {
         use std::{
             fs,
@@ -587,6 +598,17 @@ mod tests {
                 .len(),
             1
         );
+        let cfg = parse_args(vec![
+            "-i".into(),
+            format!("{}/x_*.nii.gz", root.display()),
+            format!("{}/y_?.nii", root.display()),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(cfg.path.ends_with("x_a.nii.gz"));
+        assert_eq!(cfg.overlays.len(), 2);
+        assert!(cfg.overlays[0].path.ends_with("x_b.nii.gz"));
+        assert!(cfg.overlays[1].path.ends_with("y_1.nii"));
         assert!(expand_images(&format!("{}/z*.nii.gz", root.display())).is_err());
         fs::remove_dir_all(root).unwrap();
     }

@@ -84,7 +84,7 @@ pub fn display_value(vol: &Volume, app: &App, id: usize, h: usize, v: usize) -> 
         vol.sample(app.axis, app.index, h, v)
     } else {
         app.projection_cache
-            .value(id, vol, app.axis, app.projection, h, v)
+            .value(id, vol, app.axis, app.projection_for(id), h, v)
     }
 }
 
@@ -388,7 +388,7 @@ pub fn composite_with_map(
         } else {
             let plane = app
                 .projection_cache
-                .plane(id, source, app.axis, app.projection);
+                .plane(id, source, app.axis, app.projection_for(id));
             for (px, &(h, v)) in raster.chunks_exact_mut(channels).zip(coords.iter()) {
                 let value = plane[[h, v]];
                 if !value.is_finite() || value <= lo {
@@ -978,8 +978,11 @@ fn draw_projected_atlas(
     let Some(solid) = solid else {
         return;
     };
-    let faces = app.projection_cache.silhouette(solid, app.axis);
+    if app.projected_atlas_detail == 3 {
+        return;
+    }
     let mut strokes = StrokeCanvas::new(width, height);
+    let faces = app.projection_cache.silhouette(solid, app.axis);
     for &(p, q) in faces.iter() {
         stroke_face(
             &mut strokes,
@@ -992,6 +995,19 @@ fn draw_projected_atlas(
             atlas.width,
             false,
         );
+    }
+    if app.projected_atlas_detail < 2
+        && atlas.regions.values().any(|r| !r.general_region.is_empty())
+    {
+        let grouped = app.projection_cache.grouped_faces(
+            solid,
+            app.axis,
+            app.projected_atlas_detail,
+            &atlas.regions,
+        );
+        for &((p, q), color) in grouped.iter() {
+            stroke_face(&mut strokes, app, sw, sh, p, q, color, atlas.width, false);
+        }
     }
     strokes.blend_into(rgb, channels, atlas.opacity, app.atlas_blur);
 }
@@ -1112,6 +1128,76 @@ mod layer_tests {
             composite_format(&base, &app, &layers, 3, 1, false),
             vec![153; 9]
         );
+    }
+
+    #[test]
+    fn mixed_projections_composite_in_stack_order_and_reuse_cache() {
+        let base = Volume {
+            data: Array3::from_shape_fn((3, 1, 2), |(_, _, z)| [2., 8.][z]),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let overlay = Volume {
+            data: Array3::from_shape_fn(
+                (3, 1, 2),
+                |(x, _, z)| if x == 1 { [0., 6.][z] } else { 0. },
+            ),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let layers = Layers {
+            overlays: vec![IntensityOverlay {
+                path: "overlay.nii.gz".into(),
+                name: "overlay".into(),
+                vol: overlay,
+                window: (0., 10.),
+                default_window: (0., 10.),
+                data_range: (0., 6.),
+                palette: crate::layers::Palette::Gray,
+                visible: true,
+                opacity: 1.,
+            }],
+            atlas: None,
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 10.), "base".into());
+        app.sync_layer_order(1);
+        app.projection = ProjectionMode::Max;
+        app.layer_projections.push((0, ProjectionMode::Mean));
+        assert_eq!(
+            composite_format(&base, &app, &layers, 3, 1, false),
+            vec![128, 128, 128, 153, 153, 153, 128, 128, 128]
+        );
+        assert_eq!(display_value(&base, &app, 0, 1, 0), 5.);
+        assert_eq!(display_value(&layers.overlays[0].vol, &app, 1, 1, 0), 6.);
+        let avg = app
+            .projection_cache
+            .get_plane(0, Axis::Z, ProjectionMode::Mean)
+            .unwrap();
+        let max = app
+            .projection_cache
+            .get_plane(1, Axis::Z, ProjectionMode::Max)
+            .unwrap();
+        app.layer_order.swap(0, 1);
+        assert_eq!(
+            composite_format(&base, &app, &layers, 3, 1, false),
+            vec![128; 9]
+        );
+        assert!(std::rc::Rc::ptr_eq(
+            &avg,
+            &app.projection_cache
+                .get_plane(0, Axis::Z, ProjectionMode::Mean)
+                .unwrap()
+        ));
+        assert!(std::rc::Rc::ptr_eq(
+            &max,
+            &app.projection_cache
+                .get_plane(1, Axis::Z, ProjectionMode::Max)
+                .unwrap()
+        ));
+        app.projection = ProjectionMode::Slice;
+        assert_eq!(display_value(&base, &app, 0, 1, 0), 2.);
     }
 
     #[test]

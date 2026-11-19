@@ -259,7 +259,7 @@ fn line(out: &mut impl Write, row: u16, s: &str, cols: u16, fg: Color, x: u16) -
 }
 
 // A deterministic, smooth-looking rainbow for categorical filenames only.
-// Limit the number of terminal color escapes even for very long filenames.
+// Each displayed character receives its own interpolated RGB color.
 fn rainbow_runs(s: &str) -> Vec<(Color, String)> {
     const STOPS: [[u8; 3]; 7] = [
         [255, 115, 132],
@@ -274,18 +274,16 @@ fn rainbow_runs(s: &str) -> Vec<(Color, String)> {
     if chars.is_empty() {
         return Vec::new();
     }
-    let n = chars.len().min(12);
+    let n = chars.len();
     (0..n)
         .map(|i| {
-            let start = i * chars.len() / n;
-            let end = (i + 1) * chars.len() / n;
             let t = i as f32 * 6.0 / n.saturating_sub(1).max(1) as f32;
             let k = (t.floor() as usize).min(5);
             let f = t - k as f32;
             let rgb = std::array::from_fn(|c| {
                 (STOPS[k][c] as f32 * (1.0 - f) + STOPS[k + 1][c] as f32 * f).round() as u8
             });
-            (rgb_color(rgb), chars[start..end].iter().collect())
+            (rgb_color(rgb), chars[i].to_string())
         })
         .collect()
 }
@@ -320,6 +318,15 @@ fn rainbow_layer_line(
     }
     queue!(out, SetForegroundColor(fg), Print(suffix), ResetColor)?;
     Ok(())
+}
+
+fn projection_tag(app: &App, id: usize) -> &'static str {
+    match app.projection_for(id) {
+        app::ProjectionMode::Slice => "",
+        app::ProjectionMode::Max => " [MAX]",
+        app::ProjectionMode::Mean => " [AVG]",
+        app::ProjectionMode::MinPositive => " [MIN+]",
+    }
 }
 
 fn selected_name<'a>(app: &'a App, layers: &'a Layers) -> &'a str {
@@ -377,18 +384,22 @@ fn draw_ui(
                     && atlas.opacity > 0.
                     && (!atlas.wireframe || atlas.labels.is_some()) =>
             {
-                " · atlas silhouette"
+                match app.projected_atlas_detail {
+                    0 | 1 if !atlas.regions.values().any(|r| !r.general_region.is_empty()) => {
+                        " · atlas silhouette (no groups in LUT)"
+                    }
+                    0 => " · general region outlines",
+                    1 => " · broad region outlines",
+                    2 => " · atlas silhouette",
+                    _ => " · no outlines",
+                }
             }
             Some(atlas) if app.show_atlas && atlas.wireframe && atlas.labels.is_none() => {
                 " · solid atlas required for silhouette"
             }
             _ => "",
         };
-        let label = format!(
-            "{} along {}{outline}",
-            app.projection.label(),
-            app.axis.label()
-        );
+        let label = format!("Projection along {}{outline}", app.axis.label());
         queue!(
             out,
             MoveTo(x, 0),
@@ -423,15 +434,20 @@ fn draw_ui(
             volume::Axis::Z => format!("[{ix},{iy},*]"),
         }
     };
-    // Number images by the same bottom-to-top order as the layer selector.
-    for pos in 0..=layers.overlays.len() {
+    // Number images from top to bottom, matching the layer selector.
+    for pos in (0..=layers.overlays.len()).rev() {
         let id = app.layer_at(pos);
         let value = if id == 0 {
             render::display_value(vol, app, id, vh, vv)
         } else {
             render::display_value(&layers.overlays[id - 1].vol, app, id, vh, vv)
         };
-        inspect.push_str(&format!("  |  {}: {}", pos + 1, intensity(value)));
+        inspect.push_str(&format!(
+            "  |  {}{}: {}",
+            app.layer_number(pos),
+            projection_tag(app, id),
+            intensity(value)
+        ));
     }
     line(out, 1, &inspect, cols, Color::Grey, x)?;
 
@@ -445,13 +461,14 @@ fn draw_ui(
         " [off]"
     };
     let settings = format!(
-        "  |  min: {}  |  max: {}  |  α: {:.0}%{}",
+        "{}  |  min: {}  |  max: {}  |  α: {:.0}%{}",
+        projection_tag(app, app.selected_layer_id()),
         compact_number(lo),
         compact_number(hi),
         opacity * 100.0,
         marker
     );
-    let prefix = format!("{}: ", app.selected + 1);
+    let prefix = format!("{}: ", app.layer_number(app.selected));
     let name_space = (cols as usize)
         .saturating_sub(footer_x as usize + prefix.len() + settings.chars().count() + 1);
     let name = middle_ellipsis(selected_name(app, layers), name_space);
@@ -529,8 +546,14 @@ fn draw_ui(
         };
         let visible = app.layer_visible(layers, id);
         let mark = if idx == app.selected { ">" } else { " " };
-        let prefix = format!("{} {}: ", mark, idx + 1);
-        let max_name = (cols as usize).saturating_sub(footer_x as usize + prefix.len() + 7);
+        let prefix = format!("{} {}: ", mark, app.layer_number(idx));
+        let suffix = format!(
+            "{}{}",
+            projection_tag(app, id),
+            if visible { "" } else { " [off]" }
+        );
+        let max_name = (cols as usize)
+            .saturating_sub(footer_x as usize + prefix.len() + suffix.chars().count() + 1);
         let shown = middle_ellipsis(name, max_name);
         if visible && pal == layers::Palette::Random {
             rainbow_layer_line(
@@ -538,13 +561,13 @@ fn draw_ui(
                 view.footer + 1 + k as u16,
                 &prefix,
                 &shown,
-                "",
+                &suffix,
                 cols,
                 footer_x,
                 Color::Grey,
             )?;
         } else {
-            let txt = format!("{}{}{}", prefix, shown, if visible { "" } else { " [off]" });
+            let txt = format!("{}{}{}", prefix, shown, suffix);
             line(
                 out,
                 view.footer + 1 + k as u16,
@@ -763,13 +786,40 @@ fn draw_popup(
     queue!(out, Clear(ClearType::All))?;
     let mut lines: Vec<String> = Vec::new();
     match app.popup {
+        Some(Popup::Help) if app.projection != app::ProjectionMode::Slice => {
+            lines.extend(
+                [
+                    "PROJECTION · full depth, per image",
+                    "  X / A / U  Set selected layer MAX / AVG / MIN+",
+                    "  V         Return to normal slices",
+                    "  Other images default to MAX; choices follow image IDs.",
+                    "  1–9 / ;  Select image; t opens ordered layer list",
+                    "  In t: ↑↓ / jk select; X/A/U set method; Enter closes",
+                    "  Space     Hide/show selected image",
+                    "  d / w     Lower / raise selected image",
+                    "  x c z     Change axis; repeat x/z mirrors; r/R rotate",
+                    "  e/m/M/0  Edit/reset window; +/- contrast; ,/. brightness",
+                    "  l palette · o opacity · a atlas on/off · O atlas opacity",
+                    "  T cycle atlas: general / broad / silhouette / none",
+                    "  g edge AA · G atlas blur · b background · Tab fill",
+                    "  n load images · I info · p montage (returns to slices)",
+                    "  AVG includes zeros; nonfinite values are ignored.",
+                    "  MAX favors high IDs; MIN+ favors low positive IDs.",
+                    "  Overlapping labels cannot all occupy the same pixel.",
+                    "  Projections cached on demand; choices not saved in scenes.",
+                    "  q / Esc close help · Ctrl+C quit",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
         Some(Popup::Help) => {
             lines.extend(
                 [
                     "NAVIGATION",
-                    "  ↑↓←→ / hjkl      Slices; wheel / trackpad also scroll",
+                    "  ↑↓←→ / hjk      Slices; wheel / trackpad also scroll",
                     "  Cmd ×2 · Shift ×3 · Ctrl ×4 · Alt ×2 fallback",
-                    "  PgUp / PgDn      ±25 slices    x y z   choose axis",
+                    "  PgUp / PgDn      ±25 slices    x c z   choose axis; repeat x/z mirrors",
                     "  [ / ] stride   r / R rotate   f / v flip   Tab fill",
                     "  i      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
@@ -780,16 +830,16 @@ fn draw_popup(
                     "  n      File picker: filter filename by substring",
                     "  s      Save current scene (.niv.toml)",
                     "         ↑↓ select · Tab complete · Space mark · Enter load",
-                    "  { / }  Lower / raise selected image (Shift+[ / ])",
+                    "  d / w  Lower / raise selected image (braces also work)",
                     "  Reload saved scene: niv --scene FILE.niv.toml",
                     "         Atlas always stays on top; t shows stack order",
                     "  Space  Toggle selected image",
                     "  e      Edit min,max     m / M   Edit just min / max",
-                    "  0      Reset range      c       Cycle color map",
+                    "  0      Reset range      l       Cycle color map",
                     "  o      Image opacity    O       Atlas opacity",
-                    "  a      Atlas visible    A       Average projection on/off",
-                    "  g      Edge AA (optional)    X   Max projection on/off",
-                    "  Projections: current axis, full depth; atlas silhouette only",
+                    "  a      Atlas visible    X / A / U  Projection max/avg/min+",
+                    "  g      Edge AA (optional)    V   Return to slices",
+                    "  u or left click: copy hovered atlas region; OSC 52",
                     "  G      Atlas Gaussian blur (0 = off)",
                     "  b      Black / transparent",
                     "  t      Layer list: ↑↓ / jk select; Enter / q / Esc close",
@@ -820,7 +870,7 @@ fn draw_popup(
                     "  Tab   Image only (no UI text)",
                     "  g   Edge AA    G   Atlas Gaussian blur (0..4 px)",
                     "  a   Atlas on/off    O   Atlas opacity",
-                    "  1–9 select layer · e window · c palette · o opacity",
+                    "  1–9 select layer · e window · l palette · o opacity",
                     "  Projection toggles are disabled in montage mode",
                     "  n   Load images    t   Layer list    s   Save scene",
                     "  In layer list: ↑↓ / jk select; Enter / q / Esc close",
@@ -831,31 +881,45 @@ fn draw_popup(
             );
         }
         Some(Popup::Info) => {
-            lines.push(format!("Original base image  {}", app.path));
+            let id = app.selected_layer_id();
+            let (source, range) = if id == 0 {
+                (vol, base_range)
+            } else {
+                (
+                    &layers.overlays[id - 1].vol,
+                    layers.overlays[id - 1].data_range,
+                )
+            };
+            let (lo, hi) = app.selected_window(layers);
+            lines.push(format!(
+                "Selected image {}: {}",
+                app.layer_number(app.selected),
+                selected_name(app, layers)
+            ));
             lines.push(format!(
                 "Grid       {} × {} × {} voxels",
-                vol.dims()[0],
-                vol.dims()[1],
-                vol.dims()[2]
+                source.dims()[0],
+                source.dims()[1],
+                source.dims()[2]
             ));
             lines.push(format!(
                 "Spacing    {:.4} × {:.4} × {:.4}",
-                vol.spacing[0], vol.spacing[1], vol.spacing[2]
+                source.spacing[0], source.spacing[1], source.spacing[2]
             ));
             lines.push(format!(
                 "Stored     {} (NIfTI code {}) · decoded f32",
-                vol.datatype_name(),
-                vol.datatype
+                source.datatype_name(),
+                source.datatype
             ));
             lines.push(format!(
                 "Data       {} .. {}",
-                compact_number(base_range.0),
-                compact_number(base_range.1)
+                compact_number(range.0),
+                compact_number(range.1)
             ));
             lines.push(format!(
                 "Window     {} .. {}",
-                compact_number(app.window.0),
-                compact_number(app.window.1)
+                compact_number(lo),
+                compact_number(hi)
             ));
             lines.push(format!(
                 "Axis       {} slice {}/{}  · rotation {}° · stride {}",
@@ -866,11 +930,10 @@ fn draw_popup(
                 app.stride
             ));
             lines.push(format!(
-                "Opacity    {:.0}%{}",
-                app.base_opacity * 100.0,
-                if app.base_visible { "" } else { " · hidden" }
+                "Opacity    {:.0}%",
+                app.selected_opacity(layers) * 100.0
             ));
-            lines.push(format!("Projection {}", app.projection.label()));
+            lines.push(format!("Projection {}", app.projection_for(id).label()));
             lines.push(format!(
                 "Background {}",
                 if app.transparent_background {
@@ -918,8 +981,9 @@ fn draw_popup(
                 let id = app.layer_at(pos);
                 if id == 0 {
                     lines.push(format!(
-                        "  {} {}  {}  data {}..{}",
-                        pos + 1,
+                        "  {}{} {}  {}  data {}..{}",
+                        app.layer_number(pos),
+                        projection_tag(app, id),
                         app.path,
                         vol.datatype_name(),
                         compact_number(base_range.0),
@@ -928,8 +992,9 @@ fn draw_popup(
                 } else {
                     let layer = &layers.overlays[id - 1];
                     lines.push(format!(
-                        "  {} {}  {}  data {}..{}",
-                        pos + 1,
+                        "  {}{} {}  {}  data {}..{}",
+                        app.layer_number(pos),
+                        projection_tag(app, id),
                         layer.name,
                         layer.vol.datatype_name(),
                         compact_number(layer.data_range.0),
@@ -1286,7 +1351,7 @@ fn is_slice_key(key: &crossterm::event::KeyEvent) -> bool {
                 | KeyCode::Down
                 | KeyCode::Left
                 | KeyCode::Right
-                | KeyCode::Char('h' | 'j' | 'k' | 'l' | 'H' | 'J' | 'K' | 'L')
+                | KeyCode::Char('h' | 'j' | 'k' | 'H' | 'J' | 'K')
         )
 }
 fn same_navigation_key(a: &crossterm::event::KeyEvent, b: &crossterm::event::KeyEvent) -> bool {
@@ -1318,6 +1383,28 @@ fn drop_stale_key_repeats(
         }
     }
     Ok(dropped)
+}
+
+/// OSC 52 requests clipboard access at the viewing terminal (including SSH).
+fn copy_region(out: &mut impl Write, vol: &Volume, app: &App, layers: &Layers) -> Result<bool> {
+    if app.projection != app::ProjectionMode::Slice || app.montage.enabled {
+        return Ok(false);
+    }
+    let (w, h, _) = vol.plane(app.axis);
+    let (u, v) = app.probe.unwrap_or((w / 2, h / 2));
+    let Some(id) = layers.atlas_id_at(app.axis, app.index, u, v) else {
+        return Ok(false);
+    };
+    let Some(info) = layers.atlas.as_ref().and_then(|a| a.regions.get(&id)) else {
+        return Ok(false);
+    };
+    use base64::Engine;
+    let text = format!("{} — {}", info.abbr, info.name);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // Prefer OSC 52 for remote sessions; no shell subprocess needed.
+    write!(out, "\x1b]52;c;{}\x07", encoded)?;
+    out.flush()?;
+    Ok(true)
 }
 
 fn run() -> Result<()> {
@@ -1353,6 +1440,8 @@ fn run() -> Result<()> {
     app.default_window = vol.auto_window();
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     app.sync_layer_order(layers.overlays.len());
+    app.layer_order.reverse();
+    app.selected = app.layer_order.len() - 1;
     app.reset_montage(&vol);
     if let Some(scene) = config.scene.as_ref() {
         scene.apply_to_loaded(&mut app, &mut layers)?;
@@ -1458,6 +1547,19 @@ fn run() -> Result<()> {
                                     println!("{}", stats.report());
                                 }
                                 return Ok(());
+                            }
+                            Action::CopyRegion => {
+                                let copied = copy_region(&mut out, &vol, &app, &layers)?;
+                                app.notice = Some(
+                                    if copied {
+                                        "Region clipboard copy requested"
+                                    } else {
+                                        "No named atlas region at cursor"
+                                    }
+                                    .into(),
+                                );
+                                pending_layout = true;
+                                pending_frame = true;
                             }
                             Action::Redraw => pending_frame = true,
                             Action::Ui => {
@@ -1587,6 +1689,13 @@ fn run() -> Result<()> {
                                 app.probe = next;
                                 pending_ui = true;
                             }
+                            if next.is_some()
+                                && mouse.kind
+                                    == MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                                && app.projection == app::ProjectionMode::Slice
+                            {
+                                let _ = copy_region(&mut out, &vol, &app, &layers)?;
+                            }
                             if app.projection == app::ProjectionMode::Slice
                                 && config.hover_delay_ms != 0
                                 && app.show_atlas
@@ -1698,7 +1807,9 @@ mod mouse_tests {
                 .concat(),
             name
         );
-        assert_eq!(runs.len(), 12);
+        assert_eq!(runs.len(), name.chars().count());
+        assert!(runs.iter().all(|(_, s)| s.chars().count() == 1));
+        assert!(runs.windows(2).all(|p| p[0].0 != p[1].0));
         assert_ne!(runs.first().unwrap().0, runs.last().unwrap().0);
         assert!(rainbow_runs("").is_empty());
         assert_eq!(rainbow_runs("x").len(), 1);

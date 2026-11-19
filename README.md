@@ -1,4 +1,4 @@
-# niv v0.15
+# niv v0.19
 
 Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
@@ -6,11 +6,11 @@ Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics term
 
 ```bash
 cd ~/Documents/_GitHub/niv
-# Extract the v0.15 source-only update here, or apply its patch if it fits your checkout.
+# Extract the latest source-only update here.
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # v0.15.0
+niv --version       # 0.19.0
 ```
 
 Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP includes updated Rust source files, `Cargo.toml`, `README.md`, and an example scene, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
@@ -19,6 +19,8 @@ Both ZIP files contain paths relative to their extraction directory. The full pr
 
 ```bash
 niv brain.nii.gz                           # defaults to --axis x --rotate 90
+niv brain.nii.gz activation.nii.gz
+niv -i brain.nii.gz activation.nii.gz
 niv brain.nii.gz --overlay activation.nii.gz
 niv brain.nii.gz -i activation_a.nii.gz activation_b.nii.gz
 niv brain.nii.gz -i '*zstat*.nii.gz' '*clusters*.nii.gz'
@@ -35,13 +37,13 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 
 | Key | Function |
 | --- | --- |
-| `↑↓←→`, `hjkl`, mouse wheel | Scroll volume slices |
+| `↑↓←→`, `hjk`, mouse wheel | Scroll volume slices |
 | Command + direction | ×2 where Rex/terminal forwards Command |
 | Shift + direction | ×3 |
 | Control + direction | ×4 |
 | Option/Alt + direction | ×2 fallback for Command |
 | `[` / `]` | Decrease/increase base stride by one |
-| `X` / `A` | Toggle max / average projection along the current axis |
+| `X` / `A` | Enter projection; set selected image max / average (`V` returns to slices) |
 | `p` | Toggle paged montage view (atlas and layers are retained) |
 | `B` / `E` | Edit montage start / stop |
 | `[` / `]` in montage | Decrease / increase slice spacing by one index |
@@ -53,16 +55,16 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `?` or `/` | Popup keyboard help |
 | `I` (Shift+I) | Metadata and full layer names; works with Kitty enhanced Shift+i |
 | `n` | Open a searchable file picker; type any filename substring (case-insensitive); ↑↓ select, Tab complete/cycle, → enter directory, Space mark multiple, Enter load |
-| `1`–`9`; `;` | Select image by current stack position (1 = bottom); cycle beyond nine layers |
-| `{` / `}` (Shift+`[` / Shift+`]`) | Move selected image down / up one position in the stack |
+| `1`–`9`; `;` | Select image by current stack position (1 = top); cycle beyond nine layers |
+| `d` / `w` (or `{` / `}`) | Move selected image down / up one position in the stack |
 | `e`, `m`, `M` | Edit selected-layer range / only min / only max |
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
-| `c` | Cycle gray → warm → cool → categorical integer-ID palette |
+| `l` | Cycle gray → warm → cool → categorical integer-ID palette |
 | `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter / q / Esc closes and retains the selection |
 | Space | Toggle selected image visibility (including the original base) |
 | `i` | Keyboard inspection crosshair (arrows move probe) |
-| `x`,`y`,`z` | Change array slicing axis |
+| `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat x/z to mirror horizontally |
 | `r`,`R` | Rotate clockwise / counterclockwise |
 | `f`,`v` | Flip horizontally / vertically |
 | Tab | Hide/show viewer text, fill terminal |
@@ -127,7 +129,7 @@ settings; older scenes remain readable (new fields default to off or 3 rows).
 
 ### Loading many images
 
-The first positional file is the reference volume. Use **`-i` / `--images`** to append any number of aligned intensity layers, including multiple distinct glob patterns. These are expanded by `niv` even when quoted (recommended in zsh to avoid shell `nomatch`); each pattern's matches are sorted and overlapping matches are deduplicated.
+The first ordinary image (positional or supplied with **`-i` / `--images`**) is the reference volume. Further images from either form become aligned intensity layers; multiple distinct glob patterns are supported. These are expanded by `niv` even when quoted (recommended in zsh to avoid shell `nomatch`); each pattern's matches are sorted and overlapping matches are deduplicated.
 
 ```bash
 niv mean_IF.nii.gz -i 'stats/*_tstat*.nii.gz' 'stats/*_fstat*.nii.gz'
@@ -201,7 +203,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 ### Reordering image layers
 
-Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; a further Esc exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`d`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; a further Esc exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
 ## Save and reload scenes (v0.15)
 
@@ -247,7 +249,9 @@ Scene files may include local research paths, so review them before sharing.
 ### Projection views and layer visibility
 
 Press `X` for maximum intensity projection or `A` for average intensity projection
-along the current axis. Press the same key again to return to the slice view.
+along the current axis for the selected image. Other images default to MAX. Select
+any layer and press X, A or U to change its own method; V returns to slice view.
+Choices stay with the image when reordered and are retained during the session.
 Projections use the full depth and the mean includes finite zeros; NaN and infinite
 values are excluded. Each visible image is reduced before applying its display
 window, palette, opacity and stacking order. Cached native-resolution 2D arrays
@@ -257,8 +261,9 @@ Hidden images are not fully projected until displayed; their probe values are
 computed individually if needed. The cache is in memory for this session only.
 
 The atlas silhouette is the outline of the union of all nonzero finite labels
-along the projection axis. It uses the configured single atlas outline color,
-width, opacity, AA and blur (not regional label colors). A solid atlas or companion
+along the projection axis. In v0.20 it is one of the choices under `T`; grouped
+contours are the default when General_Region is available. The silhouette uses
+the configured single atlas outline color, width, opacity, AA and blur. A solid atlas or companion
 solid label file is required. Toggle with `a`. Region-specific hover outlines are
 disabled in projection view; `*` in the probe coordinates represents the collapsed
 axis. Montage remains slice-based. Projection mode is not persisted in scenes.
@@ -288,3 +293,27 @@ can quit the viewer. In file-search and scene-filename editors, `q` remains
 a literal character; use Esc to cancel. Ctrl+C bypasses modal key handlers
 and quits when the event loop can process it. Synchronous file loading may
 need to finish first. Reported q repeat events are ignored outside text fields.
+
+### v0.19: multi-image startup and per-image projection
+
+`niv template.nii.gz clusters.nii.gz` and `niv -i template.nii.gz clusters.nii.gz`
+are equivalent. The first image is the reference and top image (under the atlas); additional startup images are stacked below it in argument order. Quoted glob patterns expand in sorted order per
+pattern; multiple patterns or repeated `-i` groups are accepted.
+
+Select a layer and press X (maximum), A (average), or U (minimum positive). All visible images project
+along the same axis, each using its own method, with MAX as the default for
+other images. The layer list and selected-layer footer show [MAX], [AVG] or [MIN+].
+V returns to slices. The dedicated projection help is available with ?.
+Projection choices are retained in memory, but are not saved in scenes.
+Categorical filenames now use one interpolated RGB color per character.
+
+### v0.20: top-first startup order, projection outlines and shortcuts
+
+- `niv -v` prints the version; CLI `--help` lists options, and `?` opens mode-specific keyboard help.
+- Startup image arguments are top-to-bottom: layer 1 is the first image, under the fixed atlas. The original reference volume still defines the voxel grid. Reordering renumbers layers top-to-bottom and selection follows the moved image; `w` raises and `d` lowers. Newly loaded runtime images remain topmost beneath the atlas. Existing scenes retain their stored stack.
+- `x`, `c` (or `y`), `z` select X, Y, Z axes. Repeating x/z mirrors the displayed image horizontally; max/mean/min projections are depth-order invariant, so this is not a different depth projection. `l` cycles the color map (no longer vim-right; use the right arrow).
+- `u` or left click over a named atlas region requests clipboard copy of its abbreviation and name (OSC 52, subject to client permissions). Available in slice view only.
+- `I` describes the selected image.
+- `U` chooses the smallest finite positive intensity along a ray; an empty ray becomes zero. For positive size-ranked cluster IDs (1 = largest), MAX favors smaller clusters; MIN+ favors larger clusters. Neither resolves all overlaps: use multiple axes or montage to view all clusters.
+- In projection mode `T` cycles detailed General_Region, broad group (prefix before `__`), brain silhouette, and none. The default is detailed groups. Every group is projected as an independent binary mask and its voxel-face outline cached on demand. Groups may overlap; coincident strokes use deterministic draw priority. Group color is the LUT color of its lowest-ID member, not a newly defined Allen group color. If General_Region is missing, the brain silhouette is used; if the atlas is only a wireframe, companion solid labels are required. Normal slices and startup perform no grouped projection work.
+- Projection methods and outline detail are session-only; old scene files still load and maintain stored stack order.

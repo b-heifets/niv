@@ -1,4 +1,4 @@
-//! Lazy, native-resolution intensity projections and binary atlas silhouettes.
+//! Lazy, native-resolution intensity projections and grouped atlas outlines.
 //! Only display modes that are actually requested allocate projected planes.
 use crate::{
     app::ProjectionMode,
@@ -10,11 +10,14 @@ use std::{cell::RefCell, rc::Rc};
 pub type Face = ((usize, usize), (usize, usize));
 type PlaneEntry = (usize, Axis, ProjectionMode, Rc<Array2<f32>>);
 type SilhouetteEntry = (Axis, Rc<Vec<Face>>);
+pub type ColoredFace = (Face, [u8; 3]);
+type GroupEntry = (Axis, u8, Rc<Vec<ColoredFace>>);
 
 #[derive(Default)]
 pub struct ProjectionCache {
     planes: RefCell<Vec<PlaneEntry>>,
     silhouettes: RefCell<Vec<SilhouetteEntry>>,
+    grouped: RefCell<Vec<GroupEntry>>,
 }
 
 fn reduce(ray: ArrayView1<'_, f32>, mode: ProjectionMode) -> f32 {
@@ -25,6 +28,12 @@ fn reduce(ray: ArrayView1<'_, f32>, mode: ProjectionMode) -> f32 {
             .filter(|v| v.is_finite())
             .reduce(f32::max)
             .unwrap_or(f32::NAN),
+        ProjectionMode::MinPositive => ray
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.)
+            .reduce(f32::min)
+            .unwrap_or(0.),
         ProjectionMode::Mean => {
             let (sum, count) = ray
                 .iter()
@@ -97,6 +106,80 @@ impl ProjectionCache {
             Axis::Z => volume.data.slice(s![h, v, ..]),
         };
         reduce(ray, mode)
+    }
+
+    /// Project each anatomical group independently: a ray can belong to
+    /// several groups. Cache native voxel-face contours (not display pixels).
+    pub fn grouped_faces(
+        &self,
+        solid: &Volume,
+        axis: Axis,
+        detail: u8,
+        regions: &std::collections::HashMap<i32, crate::layers::RegionInfo>,
+    ) -> Rc<Vec<ColoredFace>> {
+        if let Some((_, _, faces)) = self
+            .grouped
+            .borrow()
+            .iter()
+            .find(|(a, d, _)| *a == axis && *d == detail)
+        {
+            return Rc::clone(faces);
+        }
+        use std::collections::{BTreeMap, HashMap};
+        let mut groups: BTreeMap<String, (usize, [u8; 3])> = BTreeMap::new();
+        let mut ids: Vec<_> = regions.keys().copied().collect();
+        ids.sort_unstable();
+        let mut lookup = HashMap::new();
+        let mut colors = Vec::new();
+        for id in ids {
+            let r = &regions[&id];
+            if r.general_region.is_empty() {
+                continue;
+            }
+            let name = if detail == 1 {
+                r.general_region.split("__").next().unwrap_or("")
+            } else {
+                r.general_region.as_str()
+            };
+            let entry = groups.entry(name.to_owned()).or_insert_with(|| {
+                let i = colors.len();
+                colors.push(r.color);
+                (i, r.color)
+            });
+            lookup.insert(id, entry.0);
+        }
+        let (w, h, _) = solid.plane(axis);
+        let mut masks = vec![vec![false; w * h]; colors.len()];
+        let (a, b) = axis.plane_axes();
+        for ((x, y, z), &value) in solid.data.indexed_iter() {
+            if let Some(&i) = lookup.get(&crate::layers::label_id(value)) {
+                let xyz = [x, y, z];
+                masks[i][xyz[b] * w + xyz[a]] = true;
+            }
+        }
+        let mut faces = Vec::new();
+        for (mask, color) in masks.iter().zip(colors) {
+            let at = |x: usize, y: usize| mask[y * w + x];
+            for y in 0..h {
+                for x in 0..=w {
+                    if (x > 0 && at(x - 1, y)) != (x < w && at(x, y)) {
+                        faces.push((((x, y), (x, y + 1)), color));
+                    }
+                }
+            }
+            for y in 0..=h {
+                for x in 0..w {
+                    if (y > 0 && at(x, y - 1)) != (y < h && at(x, y)) {
+                        faces.push((((x, y), (x + 1, y)), color));
+                    }
+                }
+            }
+        }
+        let faces = Rc::new(faces);
+        self.grouped
+            .borrow_mut()
+            .push((axis, detail, Rc::clone(&faces)));
+        faces
     }
 
     /// Union of all nonzero finite atlas labels over the chosen depth axis.
@@ -198,6 +281,61 @@ mod tests {
         assert_eq!(mean[[0, 0]], 3.);
         assert!(mean[[1, 0]].is_nan());
         assert_eq!(c.plane(0, &vol, Axis::Z, ProjectionMode::Max)[[0, 0]], 6.);
+    }
+    #[test]
+    fn minimum_positive_ignores_zero_negative_and_nonfinite() {
+        let vol = volume(
+            Array3::from_shape_vec((2, 1, 4), vec![0., 8., 2., f32::NAN, 0., -1., f32::NAN, 0.])
+                .unwrap(),
+        );
+        let cache = ProjectionCache::default();
+        let p = cache.plane(0, &vol, Axis::Z, ProjectionMode::MinPositive);
+        assert_eq!(p[[0, 0]], 2.);
+        assert_eq!(p[[1, 0]], 0.);
+        assert_eq!(
+            cache.plane(0, &vol, Axis::Z, ProjectionMode::Max)[[0, 0]],
+            8.
+        );
+    }
+    #[test]
+    fn projected_groups_keep_overlaps_and_merge_subgroups_at_broad_level() {
+        use crate::layers::RegionInfo;
+        use std::collections::HashMap;
+        let vol = volume(Array3::from_shape_fn((2, 1, 2), |(x, _, z)| {
+            if x == 0 && z == 0 {
+                1.
+            } else if z == 1 {
+                2.
+            } else {
+                0.
+            }
+        }));
+        let mut regions = HashMap::new();
+        for (id, group, color) in [
+            (1, "Striatum__Dorsal", [255, 0, 0]),
+            (2, "Striatum__Ventral", [0, 255, 0]),
+        ] {
+            regions.insert(
+                id,
+                RegionInfo {
+                    color,
+                    name: group.into(),
+                    abbr: group.into(),
+                    general_region: group.into(),
+                },
+            );
+        }
+        let cache = ProjectionCache::default();
+        let detailed = cache.grouped_faces(&vol, Axis::Z, 0, &regions);
+        assert!(detailed.contains(&(((1, 0), (1, 1)), [255, 0, 0])));
+        assert!(detailed.iter().any(|(_, color)| *color == [0, 255, 0]));
+        let broad = cache.grouped_faces(&vol, Axis::Z, 1, &regions);
+        assert_eq!(broad.len(), 6);
+        assert!(!broad.iter().any(|(face, _)| *face == ((1, 0), (1, 1))));
+        assert!(Rc::ptr_eq(
+            &broad,
+            &cache.grouped_faces(&vol, Axis::Z, 1, &regions)
+        ));
     }
     #[test]
     fn binary_union_outline_has_no_internal_region_boundary() {
