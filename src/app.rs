@@ -134,6 +134,8 @@ impl ProjectionMode {
 pub struct App {
     pub montage: MontageState,
     pub montage_preset_pending: bool,
+    // Session-only slice position before entering montage.
+    pub pre_montage_slice: Option<(Axis, usize)>,
     pub atlas_blur: f32,
     pub projection: ProjectionMode,
     pub projection_cache: std::rc::Rc<crate::projection::ProjectionCache>,
@@ -196,6 +198,7 @@ impl App {
         Self {
             montage: MontageState::default(),
             montage_preset_pending: true,
+            pre_montage_slice: None,
             atlas_blur: 0.,
             projection: ProjectionMode::Slice,
             projection_cache: Default::default(),
@@ -634,8 +637,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if !editor.checked.is_empty() {
-                    let paths = std::mem::take(&mut editor.checked);
-                    self.edit = None;
+                    let paths = editor.checked.clone();
                     return Action::LoadOverlays(paths);
                 }
                 let candidate = editor.completion.as_ref().and_then(|m| m.selected());
@@ -664,7 +666,7 @@ impl App {
                     ));
                     return Action::Layout;
                 }
-                self.edit = None;
+                editor.checked.push(path.clone());
                 Action::LoadOverlays(vec![path])
             }
             KeyCode::Backspace => {
@@ -869,9 +871,35 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
-        self.sync_layer_order(layers.overlays.len());
         let m = key.modifiers;
-        if self.edit.is_some() {
+        // Global emergency exit must precede all modal input handlers.
+        if m.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C' | '\x03'))
+        {
+            return Action::Quit;
+        }
+        if key.code == KeyCode::Char('\x03') {
+            return Action::Quit;
+        }
+        // Holding q must not close a menu and then quit on a key-repeat event.
+        if key.kind == KeyEventKind::Repeat
+            && key.code == KeyCode::Char('q')
+            && !self
+                .edit
+                .as_ref()
+                .is_some_and(|e| matches!(e.field, EditField::AddPath | EditField::SaveScene))
+        {
+            return Action::None;
+        }
+        self.sync_layer_order(layers.overlays.len());
+        if let Some(editor) = &self.edit {
+            // Filename fields accept literal q. Numeric fields do not need it.
+            if key.code == KeyCode::Char('q')
+                && !matches!(editor.field, EditField::AddPath | EditField::SaveScene)
+            {
+                self.edit = None;
+                return Action::Layout;
+            }
             return self.edit_key(vol, layers, key.code, m);
         }
         if let Some(popup) = self.popup {
@@ -912,7 +940,7 @@ impl App {
         // stack position. Modal editors/popups take precedence over this list.
         if self.show_layer_list && !self.fullscreen {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_layer_list = false;
                     return Action::Layout;
                 }
@@ -938,10 +966,7 @@ impl App {
                 _ => {}
             }
         }
-        if key.code == KeyCode::Esc
-            || key.code == KeyCode::Char('q')
-            || (key.code == KeyCode::Char('c') && m.contains(KeyModifiers::CONTROL))
-        {
+        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
             return Action::Quit;
         }
         match key.code {
@@ -1121,12 +1146,21 @@ impl App {
             KeyCode::Char('p') => {
                 self.montage.enabled = !self.montage.enabled;
                 if self.montage.enabled {
+                    self.pre_montage_slice = Some((self.axis, self.index));
                     self.projection = ProjectionMode::Slice;
                     self.inspect_mode = false;
                     if self.montage_preset_pending {
                         self.montage_preset(vol, layers);
                     }
                     self.index = self.montage.start;
+                } else {
+                    let depth = vol.depth(self.axis);
+                    self.index = match self.pre_montage_slice.take() {
+                        Some((axis, index)) if axis == self.axis => index.min(depth - 1),
+                        _ => depth / 2,
+                    };
+                    self.probe = None;
+                    self.highlighted_region = None;
                 }
                 self.normalize_montage(vol);
                 Action::Layout
@@ -1803,7 +1837,24 @@ mod tests {
             Action::LoadOverlays(paths) => assert_eq!(paths.len(), 2),
             other => panic!("{other:?}"),
         }
-        assert!(app.edit.is_none());
+        // Keep the marks visible until the main loop finishes loading.
+        assert_eq!(app.edit.as_ref().unwrap().checked.len(), 2);
+        // With no explicit marks, Enter marks the highlighted file.
+        app.edit.as_mut().unwrap().checked.clear();
+        let result = key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        match result {
+            Action::LoadOverlays(paths) => {
+                assert_eq!(paths.len(), 1);
+                assert_eq!(app.edit.as_ref().unwrap().checked, paths);
+            }
+            other => panic!("{other:?}"),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2188,6 +2239,74 @@ mod tests {
     }
 
     #[test]
+    fn q_closes_menus_and_numeric_editors_before_quitting() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
+        let none = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('?'), none);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('q'), none),
+            Action::Layout
+        );
+        assert!(app.popup.is_none() && app.show_layer_list);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('q'), none),
+            Action::Layout
+        );
+        assert!(!app.show_layer_list);
+        let repeat = KeyEvent::new_with_kind(KeyCode::Char('q'), none, KeyEventKind::Repeat);
+        assert_eq!(app.key(&vol, &mut layers, repeat), Action::None);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('m'), none);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('q'), none),
+            Action::Layout
+        );
+        assert!(app.edit.is_none());
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('q'), none),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_in_every_input_context_and_q_remains_typable() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let none = KeyModifiers::NONE;
+        for mode in [
+            None,
+            Some('t'),
+            Some('?'),
+            Some('I'),
+            Some('m'),
+            Some('n'),
+            Some('s'),
+        ] {
+            let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
+            if let Some(c) = mode {
+                key(&mut app, &vol, &mut layers, KeyCode::Char(c), none);
+            }
+            if matches!(mode, Some('n' | 's')) {
+                let before = app.edit.as_ref().unwrap().text.clone();
+                key(&mut app, &vol, &mut layers, KeyCode::Char('q'), none);
+                assert_eq!(app.edit.as_ref().unwrap().text, format!("{before}q"));
+            }
+            assert_eq!(
+                key(
+                    &mut app,
+                    &vol,
+                    &mut layers,
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL
+                ),
+                Action::Quit
+            );
+        }
+    }
+
+    #[test]
     fn layer_list_does_not_capture_keys_when_hidden_by_fullscreen() {
         let vol = example();
         let mut layers = Layers::default();
@@ -2337,6 +2456,118 @@ mod tests {
         );
         assert_eq!(action, Action::Ui);
         assert_eq!(app.projection, ProjectionMode::Mean);
+    }
+
+    #[test]
+    fn range_editor_preserves_seven_decimal_input() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 30, 1, 0, (0., 1.), "test".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+        );
+        for c in "0.9999001".chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('M'),
+            KeyModifiers::SHIFT,
+        );
+        for c in "0.9999407".chars() {
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            );
+        }
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.window, (0.9999001_f32, 0.9999407_f32));
+        assert_ne!(app.window.0, 0.99990_f32);
+        assert_ne!(app.window.1, 0.99994_f32);
+    }
+
+    #[test]
+    fn montage_exit_restores_slice_or_new_axis_midpoint() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 37, 1, 0, (0., 1.), "test".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        app.move_slices(&vol, 4);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.index, 37);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.index, vol.depth(Axis::X) / 2);
+        // A montage restored from a scene has no session-only return point.
+        app.montage.enabled = true;
+        app.index = 0;
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.index, vol.depth(Axis::X) / 2);
     }
 
     #[test]

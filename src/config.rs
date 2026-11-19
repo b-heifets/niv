@@ -128,7 +128,7 @@ LAYERS
                            ↑↓ select · Tab complete/cycle · Space mark multiple
                            → browse directory · Enter load chosen images
   t                        Toggle layer list (top image first)
-                           ↑↓ / jk select; Enter or Esc close, keeping selection
+                           ↑↓ / jk select; Enter / q / Esc close, keeping selection
                            Space show/hide selected image (including base)
   e                        Edit selected layer display min,max
   m / M                    Edit only min / max; 0 reset to data min,max
@@ -139,7 +139,9 @@ LAYERS
   + / -                    Narrow / widen selected display range
   , / .                    Shift selected display range down / up
   ? or /                   Toggle help panel; Shift+I opens volume information
-  q                        Quit (Esc closes a popup/list first, then quits)
+  q                        Close menu, otherwise quit (Esc also closes)
+  Ctrl+C                   Quit from any interactive menu or editor
+                           In filename prompts q is typed; Esc cancels
 
 EXAMPLES
   niv mean_IF.nii.gz

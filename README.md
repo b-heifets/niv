@@ -59,14 +59,15 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `c` | Cycle gray → warm → cool → categorical integer-ID palette |
-| `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter or Esc closes and retains the selection |
+| `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter / q / Esc closes and retains the selection |
 | Space | Toggle selected image visibility (including the original base) |
 | `i` | Keyboard inspection crosshair (arrows move probe) |
 | `x`,`y`,`z` | Change array slicing axis |
 | `r`,`R` | Rotate clockwise / counterclockwise |
 | `f`,`v` | Flip horizontally / vertically |
 | Tab | Hide/show viewer text, fill terminal |
-| `q` | Quit (Esc dismisses popup/editor) |
+| `q` | Close menu or numeric editor; quit in normal viewer |
+| Ctrl+C | Quit from any interactive menu or editor |
 
 **Important:** Command/Super may be reserved by Ghostty, Rex, or the OS and not arrive as a terminal key modifier. Option/Alt has the same ×2 mapping as a fallback. Shift/Ctrl/Option support likewise depends on which input sequences your Rex client forwards.
 
@@ -200,7 +201,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 ### Reordering image layers
 
-Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter or Esc to close the list, retaining the selected image; a further Esc exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+Select an image with its current stack number (`1` is bottom), or cycle with `;`. Press **`}`** (Shift+`]`) to raise the selected image one position, or **`{`** (Shift+`[`) to lower it. The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; a further Esc exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
 ## Save and reload scenes (v0.15)
 
@@ -267,3 +268,23 @@ average IDs are not anatomically meaningful.
 Space toggles any selected image, including the original reference image; it
 remains loaded as the grid reference. With all images hidden, only the atlas
 and background remain. Scene files save and restore the visibility of every image.
+
+### v0.18.2 viewer refinements
+
+- Leaving montage (`p`) restores the previously viewed slice if the axis is unchanged, or the middle slice otherwise (including a montage opened from a scene).
+- The `n` file picker checks the highlighted file on Enter when nothing else is marked, and keeps its selection and loading progress visible until loading finishes.
+- Hidden image entries and the selected-image footer are dimmed and retain the `[off]` marker.
+- Display windows remain compact (five decimal places); `m`, `M`, and `e` accept higher-precision values and show the stored value(s) while editing. Values are stored as f32.
+- Layout changes clear the previous footer even after a range or opacity edit that requested only a raster redraw.
+
+### v0.18.3: categorical status and safe quit
+
+Visible categorical (random LUT) filenames use a stable rainbow gradient in the
+footer and layer list; numerical display settings remain neutral. Hidden
+layers retain the dimmed text and `[off]` marker. This is text styling only.
+
+`q` closes the active help/info popup, layer list or numeric editor before it
+can quit the viewer. In file-search and scene-filename editors, `q` remains
+a literal character; use Esc to cancel. Ctrl+C bypasses modal key handlers
+and quits when the event loop can process it. Synchronous file loading may
+need to finish first. Reported q repeat events are ignored outside text fields.

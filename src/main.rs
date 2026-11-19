@@ -183,6 +183,20 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
     }
 }
 
+// A change in reserved UI rows or image placement must clear the old text
+// even when the originating action was a simple raster redraw. The list's
+// scroll offset is purely textual and does not invalidate the image.
+fn layout_changed(old: ViewLayout, new: ViewLayout) -> bool {
+    old.x != new.x
+        || old.y != new.y
+        || old.footer != new.footer
+        || old.list_count != new.list_count
+        || old.geom.cols != new.geom.cols
+        || old.geom.rows != new.geom.rows
+        || old.geom.width != new.geom.width
+        || old.geom.height != new.geom.height
+}
+
 /// Map a visible list row to its bottom-based stack index. The image at
 /// the top of the stack must also appear at the top of the layer list.
 fn top_first_position(start: usize, count: usize, row: usize) -> usize {
@@ -241,6 +255,70 @@ fn line(out: &mut impl Write, row: u16, s: &str, cols: u16, fg: Color, x: u16) -
         Print(crop(s, cols.saturating_sub(x) as usize)),
         ResetColor
     )?;
+    Ok(())
+}
+
+// A deterministic, smooth-looking rainbow for categorical filenames only.
+// Limit the number of terminal color escapes even for very long filenames.
+fn rainbow_runs(s: &str) -> Vec<(Color, String)> {
+    const STOPS: [[u8; 3]; 7] = [
+        [255, 115, 132],
+        [255, 179, 92],
+        [237, 221, 100],
+        [126, 220, 139],
+        [96, 213, 224],
+        [132, 168, 255],
+        [232, 129, 255],
+    ];
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let n = chars.len().min(12);
+    (0..n)
+        .map(|i| {
+            let start = i * chars.len() / n;
+            let end = (i + 1) * chars.len() / n;
+            let t = i as f32 * 6.0 / n.saturating_sub(1).max(1) as f32;
+            let k = (t.floor() as usize).min(5);
+            let f = t - k as f32;
+            let rgb = std::array::from_fn(|c| {
+                (STOPS[k][c] as f32 * (1.0 - f) + STOPS[k + 1][c] as f32 * f).round() as u8
+            });
+            (rgb_color(rgb), chars[start..end].iter().collect())
+        })
+        .collect()
+}
+
+fn rainbow_layer_line(
+    out: &mut impl Write,
+    row: u16,
+    prefix: &str,
+    name: &str,
+    suffix: &str,
+    cols: u16,
+    x: u16,
+    fg: Color,
+) -> Result<()> {
+    let available = cols.saturating_sub(x) as usize;
+    let prefix = crop(prefix, available);
+    let name = crop(name, available.saturating_sub(prefix.chars().count()));
+    let suffix = crop(
+        suffix,
+        available.saturating_sub(prefix.chars().count() + name.chars().count()),
+    );
+    queue!(
+        out,
+        MoveTo(0, row),
+        Clear(ClearType::CurrentLine),
+        MoveTo(x, row),
+        SetForegroundColor(fg),
+        Print(prefix)
+    )?;
+    for (color, run) in rainbow_runs(&name) {
+        queue!(out, SetForegroundColor(color), Print(run))?;
+    }
+    queue!(out, SetForegroundColor(fg), Print(suffix), ResetColor)?;
     Ok(())
 }
 
@@ -405,18 +483,36 @@ fn draw_ui(
     } else {
         format!("{prefix}{name}{settings}")
     };
-    line(
-        out,
-        view.footer,
-        &summary,
-        cols,
-        if app.montage.enabled {
-            Color::Grey
-        } else {
-            rgb_color(accent)
-        },
-        footer_x,
-    )?;
+    if !app.montage.enabled
+        && selected_visible(app, layers)
+        && app.selected_palette(layers) == layers::Palette::Random
+    {
+        rainbow_layer_line(
+            out,
+            view.footer,
+            &prefix,
+            &name,
+            &settings,
+            cols,
+            footer_x,
+            Color::Grey,
+        )?;
+    } else {
+        line(
+            out,
+            view.footer,
+            &summary,
+            cols,
+            if app.montage.enabled {
+                Color::Grey
+            } else if !selected_visible(app, layers) {
+                Color::DarkGrey
+            } else {
+                rgb_color(accent)
+            },
+            footer_x,
+        )?;
+    }
 
     for k in 0..view.list_count {
         let idx = top_first_position(view.list_start, view.list_count, k);
@@ -435,24 +531,35 @@ fn draw_ui(
         let mark = if idx == app.selected { ">" } else { " " };
         let prefix = format!("{} {}: ", mark, idx + 1);
         let max_name = (cols as usize).saturating_sub(footer_x as usize + prefix.len() + 7);
-        let txt = format!(
-            "{}{}{}",
-            prefix,
-            middle_ellipsis(name, max_name),
-            if visible { "" } else { " [off]" }
-        );
-        line(
-            out,
-            view.footer + 1 + k as u16,
-            &txt,
-            cols,
-            if idx == app.selected {
-                rgb_color(pal.accent(id))
-            } else {
-                Color::DarkGrey
-            },
-            footer_x,
-        )?;
+        let shown = middle_ellipsis(name, max_name);
+        if visible && pal == layers::Palette::Random {
+            rainbow_layer_line(
+                out,
+                view.footer + 1 + k as u16,
+                &prefix,
+                &shown,
+                "",
+                cols,
+                footer_x,
+                Color::Grey,
+            )?;
+        } else {
+            let txt = format!("{}{}{}", prefix, shown, if visible { "" } else { " [off]" });
+            line(
+                out,
+                view.footer + 1 + k as u16,
+                &txt,
+                cols,
+                if !visible {
+                    Color::DarkGrey
+                } else if idx == app.selected {
+                    rgb_color(pal.accent(id))
+                } else {
+                    Color::Grey
+                },
+                footer_x,
+            )?;
+        }
     }
     // No persistent bottom help row. Only transient prompts/errors/loading.
     if app.edit.is_some() || app.notice.is_some() {
@@ -478,10 +585,17 @@ fn draw_ui(
             let hint = if let Some(v) = app.numeric_montage_value(edit.field) {
                 format!("current: {v} · ↑↓ adjust")
             } else {
-                edit.completion
-                    .as_ref()
-                    .map(|m| m.status())
-                    .unwrap_or_default()
+                // Display the shortest round-trippable f32, not the five-decimal footer.
+                match edit.field {
+                    EditField::Minimum => format!("current: {lo}"),
+                    EditField::Maximum => format!("current: {hi}"),
+                    EditField::Both => format!("current: {lo},{hi}"),
+                    _ => edit
+                        .completion
+                        .as_ref()
+                        .map(|m| m.status())
+                        .unwrap_or_default(),
+                }
             };
             let cols_available = cols.saturating_sub(footer_x) as usize;
             let hint = middle_ellipsis(&hint, (cols_available / 3).max(12));
@@ -606,7 +720,9 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         )?;
     }
     if rows >= 4 {
-        if let Some(e) = &editor.error {
+        if let Some(notice) = &app.notice {
+            line(out, rows - 3, notice, cols, Color::Yellow, x)?;
+        } else if let Some(e) = &editor.error {
             line(out, rows - 3, &format!("Error: {e}"), cols, Color::Red, x)?;
         } else {
             line(
@@ -618,14 +734,16 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
                 x,
             )?;
         }
-        line(
-            out,
-            rows - 2,
-            "Enter load selected/marked · Esc cancel · PgUp/PgDn page",
-            cols,
-            Color::DarkGrey,
-            x,
-        )?;
+        if app.notice.is_none() {
+            line(
+                out,
+                rows - 2,
+                "Enter load selected/marked · Esc cancel · PgUp/PgDn page",
+                cols,
+                Color::DarkGrey,
+                x,
+            )?;
+        }
     }
     out.flush()?;
     Ok(())
@@ -674,10 +792,11 @@ fn draw_popup(
                     "  Projections: current axis, full depth; atlas silhouette only",
                     "  G      Atlas Gaussian blur (0 = off)",
                     "  b      Black / transparent",
-                    "  t      Layer list: ↑↓ / jk select; Enter or Esc close",
+                    "  t      Layer list: ↑↓ / jk select; Enter / q / Esc close",
                     "  + / -  Contrast         , / .   Brightness",
+                    "  In filename prompts q is typed; Esc cancels",
                     "",
-                    "? or /  help     Shift+I  info     q  quit     Esc  close",
+                    "? /  help · Shift+I info · q close/quit · Ctrl+C quit",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -704,8 +823,8 @@ fn draw_popup(
                     "  1–9 select layer · e window · c palette · o opacity",
                     "  Projection toggles are disabled in montage mode",
                     "  n   Load images    t   Layer list    s   Save scene",
-                    "  In layer list: ↑↓ / jk select; Enter or Esc close",
-                    "  I   Info   ? or Esc   Close help",
+                    "  In layer list: ↑↓ / jk select; Enter / q / Esc close",
+                    "  I   Info   q / ? / Esc close help · Ctrl+C quit",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -819,7 +938,7 @@ fn draw_popup(
                 }
             }
             lines.push(String::new());
-            lines.push("Esc / I / ?  close".into());
+            lines.push("q / Esc / I / ?  close · Ctrl+C quit".into());
         }
         None => return Ok(()),
     }
@@ -839,9 +958,9 @@ fn draw_popup(
     let fg = Color::Grey;
     let border_color = Color::DarkGrey;
     let title = match app.popup {
-        Some(Popup::Help) => " Help · ↑↓ scroll · Esc close ",
-        Some(Popup::MontageHelp) => " Montage help · ↑↓ scroll · Esc close ",
-        _ => " Image information · ↑↓ scroll · Esc close ",
+        Some(Popup::Help) => " Help · ↑↓ scroll · q/Esc close ",
+        Some(Popup::MontageHelp) => " Montage help · ↑↓ scroll · q/Esc close ",
+        _ => " Image information · ↑↓ scroll · q/Esc close ",
     };
     let bar = "─".repeat(width.saturating_sub(2));
     queue!(
@@ -917,6 +1036,7 @@ fn draw(
     frames: &mut FrameState,
     cache: &mut Option<render::SamplingMap>,
     stats: &mut FrameStats,
+    previous: Option<ViewLayout>,
 ) -> Result<ViewLayout> {
     let (cols, rows) = terminal::size()?;
     if app.popup.is_some() {
@@ -957,6 +1077,10 @@ fn draw(
         });
     }
     let view = layout(vol, app, layers, cols, rows);
+    if previous.is_some_and(|old| layout_changed(old, view)) {
+        frames.clear(out)?;
+        queue!(out, Clear(ClearType::All))?;
+    }
     let t = Instant::now();
     let pixels = if app.montage.enabled {
         let extra = usize::from(app.edit.is_some() || app.notice.is_some());
@@ -1255,6 +1379,7 @@ fn run() -> Result<()> {
         &mut frames,
         &mut cache,
         &mut stats,
+        None,
     )?;
     let frame_interval = Duration::from_secs_f64(1.0 / config.max_fps as f64);
     let mut last_draw = Instant::now();
@@ -1338,11 +1463,7 @@ fn run() -> Result<()> {
                             Action::Ui => {
                                 let (cols, rows) = terminal::size()?;
                                 let updated = layout(&vol, &app, &layers, cols, rows);
-                                if updated.footer != view.footer
-                                    || updated.y != view.y
-                                    || updated.geom.width != view.geom.width
-                                    || updated.geom.height != view.geom.height
-                                {
+                                if layout_changed(view, updated) {
                                     pending_layout = true;
                                     pending_frame = true;
                                 } else {
@@ -1371,9 +1492,17 @@ fn run() -> Result<()> {
                             Action::LoadOverlays(paths) => {
                                 let mut loaded = 0usize;
                                 let mut failed = Vec::new();
-                                for path in paths {
-                                    app.notice = Some(format!("Loading {} ...", path.display()));
-                                    draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
+                                frames.clear(&mut out)?;
+                                let total = paths.len();
+                                for (i, path) in paths.into_iter().enumerate() {
+                                    app.notice = Some(format!(
+                                        "Loading {}/{}: {} ...",
+                                        i + 1,
+                                        total,
+                                        path.display()
+                                    ));
+                                    // Enter leaves the picker and its marks available until I/O completes.
+                                    draw_picker(&mut out, &app)?;
                                     match layers.add_overlay(&path, &vol) {
                                         Ok(_) => {
                                             loaded += 1;
@@ -1383,6 +1512,7 @@ fn run() -> Result<()> {
                                         }
                                     }
                                 }
+                                app.edit = None;
                                 app.sync_layer_order(layers.overlays.len());
                                 if loaded > 0 {
                                     app.selected = app.layer_order.len() - 1;
@@ -1497,6 +1627,7 @@ fn run() -> Result<()> {
                 queue!(out, Clear(ClearType::All))?;
             }
             if pending_frame {
+                let previous = if pending_layout { None } else { Some(view) };
                 view = draw(
                     &mut out,
                     &vol,
@@ -1506,11 +1637,27 @@ fn run() -> Result<()> {
                     &mut frames,
                     &mut cache,
                     &mut stats,
+                    previous,
                 )?;
             } else if pending_ui {
                 let (cols, rows) = terminal::size()?;
-                view = layout(&vol, &app, &layers, cols, rows);
-                draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
+                let updated = layout(&vol, &app, &layers, cols, rows);
+                if layout_changed(view, updated) {
+                    view = draw(
+                        &mut out,
+                        &vol,
+                        &layers,
+                        &app,
+                        base_range,
+                        &mut frames,
+                        &mut cache,
+                        &mut stats,
+                        Some(view),
+                    )?;
+                } else {
+                    view = updated;
+                    draw_ui(&mut out, &vol, &layers, &app, base_range, view)?;
+                }
             }
             pending_frame = false;
             pending_ui = false;
@@ -1539,6 +1686,24 @@ mod mouse_tests {
             modifiers: KeyModifiers::NONE,
         }
     }
+    #[test]
+    fn categorical_filename_gradient_is_deterministic_and_bounded() {
+        let name = "entactogen_cluster_é_index_0123456789";
+        let runs = rainbow_runs(name);
+        assert_eq!(runs, rainbow_runs(name));
+        assert_eq!(
+            runs.iter()
+                .map(|(_, s)| s.as_str())
+                .collect::<Vec<_>>()
+                .concat(),
+            name
+        );
+        assert_eq!(runs.len(), 12);
+        assert_ne!(runs.first().unwrap().0, runs.last().unwrap().0);
+        assert!(rainbow_runs("").is_empty());
+        assert_eq!(rainbow_runs("x").len(), 1);
+    }
+
     #[test]
     fn identifies_only_slice_navigation_as_repeatable() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1614,5 +1779,39 @@ mod layer_list_order_tests {
                 .collect::<Vec<_>>(),
             vec![7, 6, 5]
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_invalidation_tests {
+    use super::*;
+    #[test]
+    fn footer_row_changes_invalidate_previous_frame() {
+        let old = ViewLayout {
+            geom: render::Geometry {
+                cols: 10,
+                rows: 5,
+                width: 80,
+                height: 80,
+            },
+            x: 2,
+            y: 3,
+            footer: 15,
+            list_start: 0,
+            list_count: 0,
+        };
+        let mut new = old;
+        new.footer += 1; // editor closed; previous footer is now inside viewer area
+        assert!(layout_changed(old, new));
+        new = old;
+        new.geom.rows += 1;
+        assert!(layout_changed(old, new));
+        new = old;
+        new.x += 1;
+        assert!(layout_changed(old, new));
+        new = old;
+        new.list_start += 1;
+        assert!(!layout_changed(old, new)); // scrolling the text-only list
+        assert!(!layout_changed(old, old)); // regular slice redraw
     }
 }
