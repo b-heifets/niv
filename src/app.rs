@@ -140,7 +140,7 @@ pub struct App {
     pub pre_montage_slice: Option<(Axis, usize)>,
     pub atlas_blur: f32,
     pub projection: ProjectionMode,
-    /// 0 = detailed General_Region, 1 = broad, 2 = silhouette, 3 = none.
+    /// 0 = major divisions, 1 = broad, 2 = silhouette, 3 = none.
     pub projected_atlas_detail: u8,
     // Explicit choices keyed by stable image ID, not stack position.
     pub layer_projections: Vec<(usize, ProjectionMode)>,
@@ -149,6 +149,9 @@ pub struct App {
     pub index: usize,
     pub stride: usize,
     pub rotation: u16,
+    // Axis-specific screen transforms, saved when leaving an axis.
+    pub axis_transforms: [(u16, bool, bool); 3],
+    pub cut_layer: Option<usize>,
     pub window: (f32, f32),
     pub default_window: (f32, f32),
     pub base_palette: Palette,
@@ -190,6 +193,9 @@ pub enum Action {
     LoadOverlays(Vec<PathBuf>),
     SaveScene(PathBuf),
     CopyRegion,
+    YankLayer,
+    PasteLayer(bool),
+    UnloadLayer,
     None,
 }
 
@@ -215,6 +221,8 @@ impl App {
             index,
             stride,
             rotation,
+            axis_transforms: [(rotation, false, false); 3],
+            cut_layer: None,
             window,
             default_window: window,
             base_palette: Palette::Gray,
@@ -527,7 +535,9 @@ impl App {
         } else {
             0.5
         };
+        self.axis_transforms[self.axis.index()] = (self.rotation, self.flip_h, self.flip_v);
         self.axis = axis;
+        (self.rotation, self.flip_h, self.flip_v) = self.axis_transforms[axis.index()];
         self.probe = None;
         self.index = (fraction * (new_len - 1) as f64).round() as usize;
         self.reset_montage(vol);
@@ -924,6 +934,15 @@ impl App {
         {
             return Action::None;
         }
+        // Destructive or duplicating commands should not auto-repeat outside text entry.
+        if key.kind == KeyEventKind::Repeat
+            && self.edit.is_none()
+            && self.popup.is_none()
+            && (key.code == KeyCode::Char('d') && !m.contains(KeyModifiers::SHIFT)
+                || self.show_layer_list && matches!(key.code, KeyCode::Char('p' | 'P' | 'X' | 'Y')))
+        {
+            return Action::None;
+        }
         self.sync_layer_order(layers.overlays.len());
         if let Some(editor) = &self.edit {
             // Filename fields accept literal q. Numeric fields do not need it.
@@ -958,11 +977,7 @@ impl App {
                     self.popup_scroll = self.popup_scroll.saturating_add(10);
                     Action::Layout
                 }
-                KeyCode::Char('I') if popup == Popup::Info => {
-                    self.popup = None;
-                    Action::Layout
-                }
-                KeyCode::Char('i') if popup == Popup::Info && m.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Char('i') if popup == Popup::Info && !m.contains(KeyModifiers::SHIFT) => {
                     self.popup = None;
                     Action::Layout
                 }
@@ -975,7 +990,33 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_layer_list = false;
+                    self.cut_layer = None;
                     return Action::Layout;
+                }
+                KeyCode::Char('X') | KeyCode::Char('x')
+                    if key.code == KeyCode::Char('X') || m.contains(KeyModifiers::SHIFT) =>
+                {
+                    self.cut_layer = Some(self.selected_layer_id());
+                    return Action::Ui;
+                }
+                KeyCode::Char('p' | 'P') => {
+                    let above = key.code == KeyCode::Char('P') || m.contains(KeyModifiers::SHIFT);
+                    if let Some(id) = self.cut_layer.take() {
+                        let target = self.selected_layer_id();
+                        if id == target {
+                            return Action::Ui;
+                        }
+                        if let Some(old) = self.layer_order.iter().position(|&i| i == id) {
+                            self.layer_order.remove(old);
+                            let pos = self.layer_order.iter().position(|&i| i == target).unwrap()
+                                + usize::from(above);
+                            self.layer_order.insert(pos, id);
+                            self.selected = pos;
+                            return Action::Redraw;
+                        }
+                        return Action::Ui;
+                    }
+                    return Action::PasteLayer(above);
                 }
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
                     let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
@@ -1012,12 +1053,7 @@ impl App {
                 self.popup_scroll = 0;
                 Action::Layout
             }
-            KeyCode::Char('I') => {
-                self.popup = Some(Popup::Info);
-                self.popup_scroll = 0;
-                Action::Layout
-            }
-            KeyCode::Char('i') if m.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Char('i') if !m.contains(KeyModifiers::SHIFT) => {
                 self.popup = Some(Popup::Info);
                 self.popup_scroll = 0;
                 Action::Layout
@@ -1083,6 +1119,7 @@ impl App {
                 self.fullscreen = !self.fullscreen;
                 if self.fullscreen {
                     self.show_layer_list = false;
+                    self.cut_layer = None;
                 }
                 Action::Layout
             }
@@ -1098,6 +1135,8 @@ impl App {
                 self.show_layer_list = !self.show_layer_list;
                 if self.show_layer_list {
                     self.fullscreen = false;
+                } else {
+                    self.cut_layer = None;
                 }
                 Action::Layout
             }
@@ -1237,7 +1276,22 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('w') => self.move_selected_layer(1),
-            KeyCode::Char('d') => self.move_selected_layer(-1),
+            KeyCode::Char('d') => {
+                if self.layer_order.len() > 1 {
+                    Action::UnloadLayer
+                } else {
+                    self.notice = Some("Keep at least one reference image; Space hides it".into());
+                    Action::Ui
+                }
+            }
+            KeyCode::Char('Y') => {
+                self.cut_layer = None;
+                Action::YankLayer
+            }
+            KeyCode::Char('y') if m.contains(KeyModifiers::SHIFT) => {
+                self.cut_layer = None;
+                Action::YankLayer
+            }
             KeyCode::Char('U') | KeyCode::Char('u')
                 if !self.montage.enabled
                     && (key.code == KeyCode::Char('U') || m.contains(KeyModifiers::SHIFT)) =>
@@ -1308,8 +1362,12 @@ impl App {
                 self.flip_v = !self.flip_v;
                 Action::Redraw
             }
-            KeyCode::Char('i') if self.montage.enabled => Action::None,
-            KeyCode::Char('i') => {
+            KeyCode::Char('I' | 'i')
+                if self.montage.enabled || self.projection != ProjectionMode::Slice =>
+            {
+                Action::None
+            }
+            KeyCode::Char('I' | 'i') => {
                 self.inspect_mode = !self.inspect_mode;
                 if self.inspect_mode && self.probe.is_none() {
                     let (w, h, _) = vol.plane(self.axis);
@@ -1650,7 +1708,7 @@ mod tests {
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('i'),
+            KeyCode::Char('I'),
             KeyModifiers::NONE,
         );
         key(
@@ -1794,7 +1852,7 @@ mod tests {
         assert!(app.edit.as_ref().unwrap().completion.is_some());
     }
     #[test]
-    fn shifted_i_opens_and_closes_info_but_lowercase_i_inspects() {
+    fn lowercase_i_opens_and_closes_info_but_shifted_i_inspects() {
         let vol = example();
         let mut layers = Layers::default();
         let mut app = App::new(Axis::Z, 10, 1, 0, (0., 100.), "test".into());
@@ -1804,7 +1862,7 @@ mod tests {
                 &vol,
                 &mut layers,
                 KeyCode::Char('i'),
-                KeyModifiers::SHIFT
+                KeyModifiers::NONE
             ),
             Action::Layout
         );
@@ -1815,7 +1873,7 @@ mod tests {
                 &vol,
                 &mut layers,
                 KeyCode::Char('i'),
-                KeyModifiers::SHIFT
+                KeyModifiers::NONE
             ),
             Action::Layout
         );
@@ -1825,7 +1883,7 @@ mod tests {
             &vol,
             &mut layers,
             KeyCode::Char('i'),
-            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
         );
         assert!(app.inspect_mode);
     }
@@ -2568,6 +2626,41 @@ mod tests {
     }
 
     #[test]
+    fn each_axis_retains_orientation_and_cut_paste_preserves_identity() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 30, 1, 90, (0., 1.), "test".into());
+        let n = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('r'), n);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('f'), n);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('x'), n);
+        assert_eq!((app.rotation, app.flip_h), (90, false));
+        key(&mut app, &vol, &mut layers, KeyCode::Char('z'), n);
+        assert_eq!((app.rotation, app.flip_h), (180, true));
+        layers.overlays.push(crate::layers::IntensityOverlay {
+            path: "other.nii.gz".into(),
+            name: "other".into(),
+            vol: example(),
+            window: (0., 1.),
+            default_window: (0., 1.),
+            data_range: (0., 0.),
+            palette: Palette::Gray,
+            visible: true,
+            opacity: 1.,
+        });
+        app.sync_layer_order(1);
+        app.selected = 1;
+        app.show_layer_list = true;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('X'), n);
+        assert_eq!(app.cut_layer, Some(1));
+        key(&mut app, &vol, &mut layers, KeyCode::Down, n);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('p'), n);
+        assert_eq!(app.layer_order, vec![1, 0]);
+        assert_eq!(app.selected_layer_id(), 1);
+        assert_eq!(app.cut_layer, None);
+    }
+
+    #[test]
     fn top_numbering_and_new_shortcuts() {
         let vol = example();
         let mut layers = Layers::default();
@@ -2594,7 +2687,11 @@ mod tests {
         key(&mut app, &vol, &mut layers, KeyCode::Char('w'), none);
         assert_eq!(app.layer_number(app.selected), 1);
         assert_eq!(app.selected_layer_id(), 1);
-        key(&mut app, &vol, &mut layers, KeyCode::Char('d'), none);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('d'), none),
+            Action::UnloadLayer
+        );
+        key(&mut app, &vol, &mut layers, KeyCode::Char('{'), none);
         assert_eq!(app.layer_number(app.selected), 2);
         key(&mut app, &vol, &mut layers, KeyCode::Char('x'), none);
         assert!(app.flip_h);

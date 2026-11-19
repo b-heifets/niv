@@ -49,7 +49,124 @@ fn reduce(ray: ArrayView1<'_, f32>, mode: ProjectionMode) -> f32 {
     }
 }
 
+/// Coarse CCF grouping for uncluttered projection figures. Other group names
+/// remain available in broad mode; neither mode draws ventricular/fiber masks.
+fn group_name(region: &str, detail: u8) -> Option<&str> {
+    let top = region.split("__").next().unwrap_or("");
+    if top.is_empty()
+        || top.eq_ignore_ascii_case("Ventricular")
+        || top.starts_with("Fiber_tract")
+        || top.eq_ignore_ascii_case("root")
+    {
+        return None;
+    }
+    if top.starts_with("Cerebell") {
+        return Some("Cerebellum");
+    }
+    if detail == 0 {
+        match top {
+            "Isocortex" | "Cortical_subplate" => Some("Cortex"),
+            "Hippocampal" | "Retrohippocampal" => Some("Hippocampal formation"),
+            "Striatum" | "Pallidum" => Some("Striatum / pallidum"),
+            "Striatum-like" => Some("Striatum-like regions"),
+            "Midbrain" | "Pons" | "Medulla" => Some("Brainstem"),
+            "Thalamus" | "Hypothalamus" => Some(top),
+            _ if top.starts_with("Olfactory") => Some("Olfactory areas"),
+            _ if top.starts_with("Pallidum") => Some("Striatum / pallidum"),
+            _ => None,
+        }
+    } else {
+        Some(top)
+    }
+}
+
+/// Fill enclosed background holes, retaining the exact exterior boundary.
+/// This is a display-only simplification, not a modification of atlas labels.
+fn fill_holes(mask: &mut [bool], w: usize, h: usize) {
+    use std::collections::VecDeque;
+    let mut exterior = vec![false; mask.len()];
+    let mut queue = VecDeque::new();
+    let enqueue = |idx: usize, exterior: &mut [bool], queue: &mut VecDeque<usize>| {
+        if !mask[idx] && !exterior[idx] {
+            exterior[idx] = true;
+            queue.push_back(idx);
+        }
+    };
+    for x in 0..w {
+        enqueue(x, &mut exterior, &mut queue);
+        enqueue((h - 1) * w + x, &mut exterior, &mut queue);
+    }
+    for y in 0..h {
+        enqueue(y * w, &mut exterior, &mut queue);
+        enqueue(y * w + w - 1, &mut exterior, &mut queue);
+    }
+    while let Some(i) = queue.pop_front() {
+        let x = i % w;
+        let y = i / w;
+        if x > 0 {
+            enqueue(i - 1, &mut exterior, &mut queue);
+        }
+        if x + 1 < w {
+            enqueue(i + 1, &mut exterior, &mut queue);
+        }
+        if y > 0 {
+            enqueue(i - w, &mut exterior, &mut queue);
+        }
+        if y + 1 < h {
+            enqueue(i + w, &mut exterior, &mut queue);
+        }
+    }
+    for (m, e) in mask.iter_mut().zip(exterior) {
+        if !e {
+            *m = true;
+        }
+    }
+}
+
+/// Merge contiguous collinear faces: fewer stroke calls, same geometry.
+fn exterior_faces(mask: &[bool], w: usize, h: usize) -> Vec<Face> {
+    let at = |x: usize, y: usize| mask[y * w + x];
+    let mut faces = Vec::new();
+    for x in 0..=w {
+        let mut start = None;
+        for y in 0..=h {
+            let edge = y < h && ((x > 0 && at(x - 1, y)) != (x < w && at(x, y)));
+            if edge {
+                if start.is_none() {
+                    start = Some(y);
+                }
+            } else if let Some(y0) = start.take() {
+                faces.push(((x, y0), (x, y)));
+            }
+        }
+    }
+    for y in 0..=h {
+        let mut start = None;
+        for x in 0..=w {
+            let edge = x < w && ((y > 0 && at(x, y - 1)) != (y < h && at(x, y)));
+            if edge {
+                if start.is_none() {
+                    start = Some(x);
+                }
+            } else if let Some(x0) = start.take() {
+                faces.push(((x0, y), (x, y)));
+            }
+        }
+    }
+    faces
+}
+
 impl ProjectionCache {
+    pub fn remap_images(&self, remap: impl Fn(usize) -> Option<usize>) {
+        self.planes.borrow_mut().retain_mut(|(id, _, _, _)| {
+            if let Some(new) = remap(*id) {
+                *id = new;
+                true
+            } else {
+                false
+            }
+        });
+    }
     pub fn get_plane(
         &self,
         id: usize,
@@ -63,8 +180,7 @@ impl ProjectionCache {
             .map(|(_, _, _, p)| Rc::clone(p))
     }
 
-    /// Image IDs are stable for the lifetime of the viewer: loading only appends
-    /// new IDs, and reordering changes display positions, not image identities.
+    /// Layer moves do not change IDs; unload remaps cached IDs explicitly.
     pub fn plane(
         &self,
         id: usize,
@@ -133,47 +249,60 @@ impl ProjectionCache {
         let mut colors = Vec::new();
         for id in ids {
             let r = &regions[&id];
-            if r.general_region.is_empty() {
+            let Some(name) = group_name(&r.general_region, detail) else {
                 continue;
-            }
-            let name = if detail == 1 {
-                r.general_region.split("__").next().unwrap_or("")
+            };
+            let rgb = if name == "Cerebellum" {
+                [255, 235, 110]
             } else {
-                r.general_region.as_str()
+                r.color
             };
             let entry = groups.entry(name.to_owned()).or_insert_with(|| {
                 let i = colors.len();
-                colors.push(r.color);
-                (i, r.color)
+                colors.push(rgb);
+                (i, rgb)
             });
             lookup.insert(id, entry.0);
         }
         let (w, h, _) = solid.plane(axis);
         let mut masks = vec![vec![false; w * h]; colors.len()];
         let (a, b) = axis.plane_axes();
+        // Compact atlases can use a direct lookup instead of hashing 45M voxels.
+        let max_id = lookup.keys().copied().max().unwrap_or(0);
+        let dense = if (0..=1_000_000).contains(&max_id) {
+            let mut table = vec![usize::MAX; max_id as usize + 1];
+            for (&id, &group) in &lookup {
+                if id > 0 {
+                    table[id as usize] = group;
+                }
+            }
+            Some(table)
+        } else {
+            None
+        };
         for ((x, y, z), &value) in solid.data.indexed_iter() {
-            if let Some(&i) = lookup.get(&crate::layers::label_id(value)) {
+            let id = crate::layers::label_id(value);
+            if id <= 0 {
+                continue;
+            }
+            let i = if let Some(table) = &dense {
+                table.get(id as usize).copied().filter(|&i| i != usize::MAX)
+            } else {
+                lookup.get(&id).copied()
+            };
+            if let Some(i) = i {
                 let xyz = [x, y, z];
                 masks[i][xyz[b] * w + xyz[a]] = true;
             }
         }
         let mut faces = Vec::new();
-        for (mask, color) in masks.iter().zip(colors) {
-            let at = |x: usize, y: usize| mask[y * w + x];
-            for y in 0..h {
-                for x in 0..=w {
-                    if (x > 0 && at(x - 1, y)) != (x < w && at(x, y)) {
-                        faces.push((((x, y), (x, y + 1)), color));
-                    }
-                }
-            }
-            for y in 0..=h {
-                for x in 0..w {
-                    if (y > 0 && at(x, y - 1)) != (y < h && at(x, y)) {
-                        faces.push((((x, y), (x + 1, y)), color));
-                    }
-                }
-            }
+        for (mut mask, color) in masks.into_iter().zip(colors) {
+            fill_holes(&mut mask, w, h);
+            faces.extend(
+                exterior_faces(&mask, w, h)
+                    .into_iter()
+                    .map(|face| (face, color)),
+            );
         }
         let faces = Rc::new(faces);
         self.grouped
@@ -192,11 +321,17 @@ impl ProjectionCache {
             ray.iter().any(|v| v.is_finite() && *v != 0.0)
         });
         let (w, h) = mask.dim();
+        let mut flat = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| mask[[x, y]])
+            .collect::<Vec<_>>();
+        fill_holes(&mut flat, w, h);
+        let mask = |x: usize, y: usize| flat[y * w + x];
         let mut faces = Vec::new();
         for y in 0..h {
             for x in 0..=w {
-                let left = x > 0 && mask[[x - 1, y]];
-                let right = x < w && mask[[x, y]];
+                let left = x > 0 && mask(x - 1, y);
+                let right = x < w && mask(x, y);
                 if left != right {
                     faces.push(((x, y), (x, y + 1)));
                 }
@@ -204,8 +339,8 @@ impl ProjectionCache {
         }
         for y in 0..=h {
             for x in 0..w {
-                let low = y > 0 && mask[[x, y - 1]];
-                let high = y < h && mask[[x, y]];
+                let low = y > 0 && mask(x, y - 1);
+                let high = y < h && mask(x, y);
                 if low != high {
                     faces.push(((x, y), (x + 1, y)));
                 }
@@ -298,27 +433,20 @@ mod tests {
         );
     }
     #[test]
-    fn projected_groups_keep_overlaps_and_merge_subgroups_at_broad_level() {
+    fn projected_groups_merge_cerebellum_and_omit_ventricles() {
         use crate::layers::RegionInfo;
         use std::collections::HashMap;
-        let vol = volume(Array3::from_shape_fn((2, 1, 2), |(x, _, z)| {
-            if x == 0 && z == 0 {
-                1.
-            } else if z == 1 {
-                2.
-            } else {
-                0.
-            }
-        }));
+        let vol = volume(Array3::from_shape_fn((3, 1, 2), |(x, _, _)| (x + 1) as f32));
         let mut regions = HashMap::new();
-        for (id, group, color) in [
-            (1, "Striatum__Dorsal", [255, 0, 0]),
-            (2, "Striatum__Ventral", [0, 255, 0]),
+        for (id, group) in [
+            (1, "Cerebellar_cortex__Vermis"),
+            (2, "Cerebellar_nuclei"),
+            (3, "Ventricular"),
         ] {
             regions.insert(
                 id,
                 RegionInfo {
-                    color,
+                    color: [255, 0, 0],
                     name: group.into(),
                     abbr: group.into(),
                     general_region: group.into(),
@@ -326,16 +454,34 @@ mod tests {
             );
         }
         let cache = ProjectionCache::default();
-        let detailed = cache.grouped_faces(&vol, Axis::Z, 0, &regions);
-        assert!(detailed.contains(&(((1, 0), (1, 1)), [255, 0, 0])));
-        assert!(detailed.iter().any(|(_, color)| *color == [0, 255, 0]));
-        let broad = cache.grouped_faces(&vol, Axis::Z, 1, &regions);
-        assert_eq!(broad.len(), 6);
-        assert!(!broad.iter().any(|(face, _)| *face == ((1, 0), (1, 1))));
+        for detail in [0, 1] {
+            let faces = cache.grouped_faces(&vol, Axis::Z, detail, &regions);
+            assert_eq!(faces.len(), 4);
+            assert!(faces.iter().all(|(_, color)| *color == [255, 235, 110]));
+            assert!(!faces.iter().any(|(face, _)| *face == ((1, 0), (1, 1))));
+            assert!(Rc::ptr_eq(
+                &faces,
+                &cache.grouped_faces(&vol, Axis::Z, detail, &regions)
+            ));
+        }
+        let mut ring = vec![true, true, true, true, false, true, true, true, true];
+        fill_holes(&mut ring, 3, 3);
+        assert!(ring.iter().all(|&x| x));
+        assert_eq!(exterior_faces(&ring, 3, 3).len(), 4);
+    }
+    #[test]
+    fn projection_cache_remaps_ids_after_unload() {
+        let vol = volume(Array3::from_elem((2, 2, 2), 3.));
+        let cache = ProjectionCache::default();
+        let removed = cache.plane(0, &vol, Axis::Z, ProjectionMode::Max);
+        let retained = cache.plane(1, &vol, Axis::Z, ProjectionMode::Max);
+        cache.remap_images(|id| if id == 0 { None } else { Some(0) });
         assert!(Rc::ptr_eq(
-            &broad,
-            &cache.grouped_faces(&vol, Axis::Z, 1, &regions)
+            &retained,
+            &cache.get_plane(0, Axis::Z, ProjectionMode::Max).unwrap()
         ));
+        assert!(!Rc::ptr_eq(&removed, &retained));
+        assert!(cache.get_plane(1, Axis::Z, ProjectionMode::Max).is_none());
     }
     #[test]
     fn binary_union_outline_has_no_internal_region_boundary() {

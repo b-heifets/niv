@@ -388,7 +388,7 @@ fn draw_ui(
                     0 | 1 if !atlas.regions.values().any(|r| !r.general_region.is_empty()) => {
                         " · atlas silhouette (no groups in LUT)"
                     }
-                    0 => " · general region outlines",
+                    0 => " · major region outlines",
                     1 => " · broad region outlines",
                     2 => " · atlas silhouette",
                     _ => " · no outlines",
@@ -548,9 +548,14 @@ fn draw_ui(
         let mark = if idx == app.selected { ">" } else { " " };
         let prefix = format!("{} {}: ", mark, app.layer_number(idx));
         let suffix = format!(
-            "{}{}",
+            "{}{}{}",
             projection_tag(app, id),
-            if visible { "" } else { " [off]" }
+            if visible { "" } else { " [off]" },
+            if app.cut_layer == Some(id) {
+                " [cut]"
+            } else {
+                ""
+            }
         );
         let max_name = (cols as usize)
             .saturating_sub(footer_x as usize + prefix.len() + suffix.chars().count() + 1);
@@ -794,15 +799,16 @@ fn draw_popup(
                     "  V         Return to normal slices",
                     "  Other images default to MAX; choices follow image IDs.",
                     "  1–9 / ;  Select image; t opens ordered layer list",
-                    "  In t: ↑↓ / jk select; X/A/U set method; Enter closes",
+                    "  In t: ↑↓ / jk select; A/U set method; Enter closes",
                     "  Space     Hide/show selected image",
-                    "  d / w     Lower / raise selected image",
+                    "  In t: Y copy · X cut · p/P paste below/above",
+                    "  d unload · w raise · { lower · Y yank",
                     "  x c z     Change axis; repeat x/z mirrors; r/R rotate",
                     "  e/m/M/0  Edit/reset window; +/- contrast; ,/. brightness",
                     "  l palette · o opacity · a atlas on/off · O atlas opacity",
-                    "  T cycle atlas: general / broad / silhouette / none",
+                    "  T cycle atlas: major / broad / silhouette / none",
                     "  g edge AA · G atlas blur · b background · Tab fill",
-                    "  n load images · I info · p montage (returns to slices)",
+                    "  n load images · i info · p montage (returns to slices)",
                     "  AVG includes zeros; nonfinite values are ignored.",
                     "  MAX favors high IDs; MIN+ favors low positive IDs.",
                     "  Overlapping labels cannot all occupy the same pixel.",
@@ -821,7 +827,7 @@ fn draw_popup(
                     "  Cmd ×2 · Shift ×3 · Ctrl ×4 · Alt ×2 fallback",
                     "  PgUp / PgDn      ±25 slices    x c z   choose axis; repeat x/z mirrors",
                     "  [ / ] stride   r / R rotate   f / v flip   Tab fill",
-                    "  i      Keyboard probe (arrows move probe; PgUp/Dn slices)",
+                    "  I      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
                     "  p      Montage mode (press ? there for controls)",
                     "",
@@ -830,10 +836,11 @@ fn draw_popup(
                     "  n      File picker: filter filename by substring",
                     "  s      Save current scene (.niv.toml)",
                     "         ↑↓ select · Tab complete · Space mark · Enter load",
-                    "  d / w  Lower / raise selected image (braces also work)",
+                    "  d unload · w raise · { lower · Y yank path",
                     "  Reload saved scene: niv --scene FILE.niv.toml",
                     "         Atlas always stays on top; t shows stack order",
                     "  Space  Toggle selected image",
+                    "  In t: X cut (move); p/P paste below/above; Y copy",
                     "  e      Edit min,max     m / M   Edit just min / max",
                     "  0      Reset range      l       Cycle color map",
                     "  o      Image opacity    O       Atlas opacity",
@@ -846,7 +853,7 @@ fn draw_popup(
                     "  + / -  Contrast         , / .   Brightness",
                     "  In filename prompts q is typed; Esc cancels",
                     "",
-                    "? /  help · Shift+I info · q close/quit · Ctrl+C quit",
+                    "? /  help · i info · q close/quit · Ctrl+C quit",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -874,7 +881,8 @@ fn draw_popup(
                     "  Projection toggles are disabled in montage mode",
                     "  n   Load images    t   Layer list    s   Save scene",
                     "  In layer list: ↑↓ / jk select; Enter / q / Esc close",
-                    "  I   Info   q / ? / Esc close help · Ctrl+C quit",
+                    "  In t: Y copy · X cut · p/P paste · d unload",
+                    "  i   Info   q / ? / Esc close help · Ctrl+C quit",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -1003,7 +1011,7 @@ fn draw_popup(
                 }
             }
             lines.push(String::new());
-            lines.push("q / Esc / I / ?  close · Ctrl+C quit".into());
+            lines.push("q / Esc / i / ?  close · Ctrl+C quit".into());
         }
         None => return Ok(()),
     }
@@ -1407,11 +1415,110 @@ fn copy_region(out: &mut impl Write, vol: &Volume, app: &App, layers: &Layers) -
     Ok(true)
 }
 
+/// Copy the settings, not the voxel array. Paste reloads the file only on demand.
+#[derive(Clone)]
+struct YankedImage {
+    path: std::path::PathBuf,
+    window: (f32, f32),
+    opacity: f32,
+    palette: layers::Palette,
+    visible: bool,
+    projection: app::ProjectionMode,
+}
+impl YankedImage {
+    fn capture(config: &config::Config, app: &App, layers: &Layers) -> Self {
+        let id = app.selected_layer_id();
+        let source = if id == 0 {
+            &config.path
+        } else {
+            &layers.overlays[id - 1].path
+        };
+        Self {
+            path: source.clone(),
+            window: app.selected_window(layers),
+            opacity: app.selected_opacity(layers),
+            palette: app.selected_palette(layers),
+            visible: if id == 0 {
+                app.base_visible
+            } else {
+                layers.overlays[id - 1].visible
+            },
+            projection: app
+                .layer_projections
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, m)| *m)
+                .unwrap_or(app::ProjectionMode::Max),
+        }
+    }
+    fn paste(&self, app: &mut App, layers: &mut Layers, vol: &Volume, above: bool) -> Result<()> {
+        let id = layers.add_overlay(&self.path, vol)?;
+        let copy = &mut layers.overlays[id - 1];
+        copy.window = self.window;
+        copy.opacity = self.opacity;
+        copy.palette = self.palette;
+        copy.visible = self.visible;
+        let pos = app.selected + usize::from(above);
+        app.layer_order.insert(pos, id);
+        app.selected = pos;
+        app.layer_projections.push((id, self.projection));
+        Ok(())
+    }
+}
+
+/// Remove a layer, promoting an existing aligned image if ID zero is removed.
+/// All ID-indexed settings and cached planes must follow the same remapping.
+fn unload_selected(
+    vol: &mut Volume,
+    base_range: &mut (f32, f32),
+    config: &mut config::Config,
+    app: &mut App,
+    layers: &mut Layers,
+) {
+    if layers.overlays.is_empty() {
+        return;
+    }
+    let removed = app.selected_layer_id();
+    let last = layers.overlays.len();
+    let remap = |id: usize| -> Option<usize> {
+        if id == removed {
+            None
+        } else if removed == 0 {
+            Some(if id == last { 0 } else { id })
+        } else {
+            Some(if id > removed { id - 1 } else { id })
+        }
+    };
+    if removed == 0 {
+        let promoted = layers.overlays.pop().expect("another image exists");
+        *vol = promoted.vol;
+        *base_range = promoted.data_range;
+        config.path = promoted.path;
+        app.path = promoted.name;
+        app.window = promoted.window;
+        app.default_window = promoted.default_window;
+        app.base_palette = promoted.palette;
+        app.base_opacity = promoted.opacity;
+        app.base_visible = promoted.visible && app.show_overlays;
+    } else {
+        layers.overlays.remove(removed - 1);
+    }
+    app.layer_order = app.layer_order.iter().filter_map(|&id| remap(id)).collect();
+    app.layer_projections = app
+        .layer_projections
+        .iter()
+        .filter_map(|&(id, mode)| remap(id).map(|i| (i, mode)))
+        .collect();
+    app.cut_layer = app.cut_layer.and_then(remap);
+    app.projection_cache.remap_images(remap);
+    app.selected = app.selected.min(app.layer_order.len() - 1);
+}
+
 fn run() -> Result<()> {
-    let Some(config) = config::parse()? else {
+    let Some(mut config) = config::parse()? else {
         return Ok(());
     };
-    let vol = Volume::load(&config.path)?;
+    let mut vol = Volume::load(&config.path)?;
     let index = config.initial_slice.unwrap_or(vol.depth(config.axis) / 2);
     if index >= vol.depth(config.axis) {
         bail!(
@@ -1420,7 +1527,7 @@ fn run() -> Result<()> {
             vol.depth(config.axis) - 1
         );
     }
-    let base_range = vol.data_range();
+    let mut base_range = vol.data_range();
     let window = config.window.unwrap_or_else(|| vol.auto_window());
     let mut layers = Layers::load(&config, &vol)?;
     let name = layers::short_name(&config.path);
@@ -1472,6 +1579,7 @@ fn run() -> Result<()> {
     )?;
     let frame_interval = Duration::from_secs_f64(1.0 / config.max_fps as f64);
     let mut last_draw = Instant::now();
+    let mut yanked: Option<YankedImage> = None;
     let mut pending_frame = false;
     let mut pending_ui = false;
     let mut pending_layout = false;
@@ -1557,6 +1665,48 @@ fn run() -> Result<()> {
                                         "No named atlas region at cursor"
                                     }
                                     .into(),
+                                );
+                                pending_layout = true;
+                                pending_frame = true;
+                            }
+                            Action::YankLayer => {
+                                let image = YankedImage::capture(&config, &app, &layers);
+                                let cwd = std::env::current_dir().ok();
+                                let path = cwd
+                                    .as_deref()
+                                    .and_then(|dir| image.path.strip_prefix(dir).ok())
+                                    .unwrap_or(&image.path);
+                                use base64::Engine;
+                                let encoded = base64::engine::general_purpose::STANDARD
+                                    .encode(path.to_string_lossy().as_bytes());
+                                write!(out, "\x1b]52;c;{}\x07", encoded)?;
+                                out.flush()?;
+                                yanked = Some(image);
+                                app.notice = Some("Image yanked · p/P in t to duplicate".into());
+                                pending_layout = true;
+                                pending_frame = true;
+                            }
+                            Action::PasteLayer(above) => {
+                                if let Some(image) = &yanked {
+                                    let notice =
+                                        match image.paste(&mut app, &mut layers, &vol, above) {
+                                            Ok(()) => "Image duplicated".into(),
+                                            Err(err) => format!("Paste failed: {err:#}"),
+                                        };
+                                    app.notice = Some(notice);
+                                } else {
+                                    app.notice = Some("Nothing yanked; press Y first".into());
+                                }
+                                pending_layout = true;
+                                pending_frame = true;
+                            }
+                            Action::UnloadLayer => {
+                                unload_selected(
+                                    &mut vol,
+                                    &mut base_range,
+                                    &mut config,
+                                    &mut app,
+                                    &mut layers,
                                 );
                                 pending_layout = true;
                                 pending_frame = true;

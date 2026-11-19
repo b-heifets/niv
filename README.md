@@ -31,7 +31,7 @@ niv brain.nii.gz --atlas-aa                 # optional smoother atlas edges
 niv brain.nii.gz --fps 20 --profile        # if Rex still queues images after key release
 ```
 
-The screen has a colored region name at the upper left, `Press ? for help` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers in **top-to-bottom order**, while `I` (Shift+I) shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
+The screen has a colored region name at the upper left, `Press ? for help` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers in **top-to-bottom order**, while `i` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
 
 ### Keys
 
@@ -53,17 +53,21 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `a` | Toggle atlas outlines |
 | `g` | Toggle optional antialiasing for **solid-label atlas** contours (off by default) |
 | `?` or `/` | Popup keyboard help |
-| `I` (Shift+I) | Metadata and full layer names; works with Kitty enhanced Shift+i |
+| `i` | Metadata and full layer names |
 | `n` | Open a searchable file picker; type any filename substring (case-insensitive); ↑↓ select, Tab complete/cycle, → enter directory, Space mark multiple, Enter load |
 | `1`–`9`; `;` | Select image by current stack position (1 = top); cycle beyond nine layers |
-| `d` / `w` (or `{` / `}`) | Move selected image down / up one position in the stack |
+| `w` / `{` (or `{` / `}`) | Raise / lower selected image |
+| `d` | Unload selected image (keep at least one reference image) |
+| `Y` | Copy selected image path to clipboard and yank display settings |
+| `X` in `t` | Mark selected image for a move |
+| `p` / `P` in `t` | Paste below / above selected image (move if cut; duplicate if yanked) |
 | `e`, `m`, `M` | Edit selected-layer range / only min / only max |
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `l` | Cycle gray → warm → cool → categorical integer-ID palette |
 | `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter / q / Esc closes and retains the selection |
 | Space | Toggle selected image visibility (including the original base) |
-| `i` | Keyboard inspection crosshair (arrows move probe) |
+| `I` (Shift+i) | Toggle keyboard inspection crosshair / pointer hover |
 | `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat x/z to mirror horizontally |
 | `r`,`R` | Rotate clockwise / counterclockwise |
 | `f`,`v` | Flip horizontally / vertically |
@@ -153,7 +157,7 @@ When already viewing an image, press **`n`** to open the file picker. Type any s
 
 The feature is enabled by default with a 20ms delay. When enabled, with a **solid** atlas, entering a labeled region starts a short delay. If the pointer remains in that region past the delay, its contours are drawn thicker (3px) while other regions retain their usual outline thickness. When enabled, hover events *before* the delay only update the text line; they do not re-transmit the image. Moving between voxels of the same region does not restart the timer.
 
-Use `NIV_HOVER_DELAY_MS=20` (default) or `--hover-delay-ms 150` to tune, 0–2000 ms; `0` disables the highlight. The thicker outline needs one full redraw when the region changes. Its antialiasing now follows `g`, and the atlas strokes are composited once per pixel to prevent bright intersections. For precomputed wireframe outlines, thickening requires companion solid labels (`--atlas-labels`); without them, the outline is unchanged. A keyboard probe remains available with `i` if iOS Rex does not forward mouse-move events.
+Use `NIV_HOVER_DELAY_MS=20` (default) or `--hover-delay-ms 150` to tune, 0–2000 ms; `0` disables the highlight. The thicker outline needs one full redraw when the region changes. Its antialiasing now follows `g`, and the atlas strokes are composited once per pixel to prevent bright intersections. For precomputed wireframe outlines, thickening requires companion solid labels (`--atlas-labels`); without them, the outline is unchanged. A keyboard probe remains available with `I` if iOS Rex does not forward mouse-move events.
 
 ### Environment variables
 
@@ -310,10 +314,19 @@ Categorical filenames now use one interpolated RGB color per character.
 ### v0.20: top-first startup order, projection outlines and shortcuts
 
 - `niv -v` prints the version; CLI `--help` lists options, and `?` opens mode-specific keyboard help.
-- Startup image arguments are top-to-bottom: layer 1 is the first image, under the fixed atlas. The original reference volume still defines the voxel grid. Reordering renumbers layers top-to-bottom and selection follows the moved image; `w` raises and `d` lowers. Newly loaded runtime images remain topmost beneath the atlas. Existing scenes retain their stored stack.
+- Startup image arguments are top-to-bottom: layer 1 is the first image, under the fixed atlas. The original reference volume still defines the voxel grid. Reordering renumbers layers top-to-bottom and selection follows the moved image; `w` raises and `{` lowers. Newly loaded runtime images remain topmost beneath the atlas. Existing scenes retain their stored stack.
 - `x`, `c` (or `y`), `z` select X, Y, Z axes. Repeating x/z mirrors the displayed image horizontally; max/mean/min projections are depth-order invariant, so this is not a different depth projection. `l` cycles the color map (no longer vim-right; use the right arrow).
 - `u` or left click over a named atlas region requests clipboard copy of its abbreviation and name (OSC 52, subject to client permissions). Available in slice view only.
-- `I` describes the selected image.
+- `i` describes the selected image.
 - `U` chooses the smallest finite positive intensity along a ray; an empty ray becomes zero. For positive size-ranked cluster IDs (1 = largest), MAX favors smaller clusters; MIN+ favors larger clusters. Neither resolves all overlaps: use multiple axes or montage to view all clusters.
-- In projection mode `T` cycles detailed General_Region, broad group (prefix before `__`), brain silhouette, and none. The default is detailed groups. Every group is projected as an independent binary mask and its voxel-face outline cached on demand. Groups may overlap; coincident strokes use deterministic draw priority. Group color is the LUT color of its lowest-ID member, not a newly defined Allen group color. If General_Region is missing, the brain silhouette is used; if the atlas is only a wireframe, companion solid labels are required. Normal slices and startup perform no grouped projection work.
+- In projection mode `T` cycles major divisions (default), broad group, brain silhouette, and none. Every group is projected as an independent binary mask and its voxel-face outline cached on demand. Groups may overlap; coincident strokes use deterministic draw priority. Group color is the LUT color of its lowest-ID member, except cerebellum uses a single pale yellow. These are display groups, not new Allen labels. If General_Region is missing, the brain silhouette is used; if the atlas is only a wireframe, companion solid labels are required. Normal slices and startup perform no grouped projection work.
 - Projection methods and outline detail are session-only; old scene files still load and maintain stored stack order.
+
+### v0.21: image registers, independent orientation and simpler outlines
+
+- `i` opens/closes information; `I` toggles keyboard probe vs mouse hover in slice mode.
+- `Y` copies the selected relative path where possible via OSC 52 and remembers its window, palette, opacity, visibility and projection method. Open `t`, select an insertion point, and use `p` below or `P` above. A yank paste reloads the image as an independent layer; no file is copied or modified on disk.
+- `X` in `t` marks a layer `[cut]` without unloading it. Navigate to the target and paste below/above; this moves the existing layer with no voxel copy. Closing the list cancels the pending move. Outside `t`, `X` still sets MAX. `A` and `U` still set projection methods in the list.
+- `d` unloads the selected image. If the original reference is unloaded, another aligned image becomes the reference, retaining all layer settings and projection cache identity. The last image cannot be unloaded; Space can hide it for an atlas-only view.
+- Each axis remembers its own rotation and flips for the current session. Scenes still store only the active axis transform.
+- `T` in projection mode cycles major divisions, broad regions, whole-brain silhouette, none. Major mode combines selected anatomical divisions; both grouped modes merge all cerebellar cortex/nuclei and omit ventricular and fiber-tract outlines. Enclosed holes in projected masks are filled before drawing their exterior faces. Disconnected components and overlapping groups can still have distinct outlines. This is a presentation-only simplification, not a modification of the atlas or a surface rendering. Contiguous collinear edges are merged to reduce stroke work, and masks use a direct lookup for compact label IDs. Group preparation is lazy and cached by axis and detail.
