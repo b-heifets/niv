@@ -199,10 +199,10 @@ fn pack_header(parts: &[String], widths: &[usize]) -> (Vec<String>, usize) {
 
 fn header_widths(first: usize, head: u16, cols: u16, x: u16, image_rows: u16) -> Vec<usize> {
     let mut widths = vec![first];
-    // The final header row is a small breathing-space gap above the image.
+    // Extra rows are allocated only when the readout cannot fit the gutter.
     widths.extend(std::iter::repeat_n(
         cols as usize,
-        head.saturating_sub(2) as usize,
+        head.saturating_sub(1) as usize,
     ));
     widths.extend(std::iter::repeat_n(
         x.saturating_sub(1) as usize,
@@ -260,7 +260,7 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
     } else {
         3 + layer_list_rows(list_count) as u16 + extra as u16
     };
-    let mut head = if app.fullscreen { 0u16 } else { 2 };
+    let mut head = if app.fullscreen { 0u16 } else { 1 };
     let estimate = if app.fullscreen {
         Vec::new()
     } else {
@@ -657,7 +657,7 @@ fn draw_ui(
         Print(hint),
         ResetColor
     )?;
-    let full_rows = view.head.saturating_sub(2) as usize;
+    let full_rows = view.head.saturating_sub(1) as usize;
     for i in 0..full_rows {
         queue!(
             out,
@@ -1329,10 +1329,11 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
     } else if let Some(matches) = &editor.completion {
         panel.title(
             out,
-            if app.recursive_files.is_some() {
-                "fd · Find NIfTI images recursively"
-            } else {
-                "Load NIfTI images"
+            match (app.picker_atlas, app.recursive_files.is_some()) {
+                (true, true) => "fd · Find atlas",
+                (true, false) => "Load solid label atlas",
+                (false, true) => "fd · Find NIfTI images recursively",
+                (false, false) => "Load NIfTI images",
             },
         )?;
         panel.search(
@@ -1346,7 +1347,19 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         } else {
             &matches.directory
         };
-        let prefix = format!("{} · {} marked · ", matches.status(), editor.checked.len());
+        let prefix = if app.picker_atlas {
+            format!(
+                "{} · LUT: {} · ",
+                matches.status(),
+                if app.picker_atlas_lut {
+                    "configured"
+                } else {
+                    "auto / IDs"
+                }
+            )
+        } else {
+            format!("{} · {} marked · ", matches.status(), editor.checked.len())
+        };
         panel.row(
             out,
             panel.top + 6,
@@ -1414,13 +1427,17 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         let selected_path = matches.selected().map(|m| m.path.as_str()).unwrap_or("");
         panel.divider(out, bottom - 4)?;
         selected_path_line(out, panel.left + 2, bottom - 3, w, selected_path)?;
-        let status = app.notice.as_deref().or(editor.error.as_deref()).unwrap_or(
-            if app.recursive_files.is_some() {
-                "↑↓ / Tab select · Space mark · Ctrl+Space query space · Ctrl+Y copy"
-            } else {
-                "↑↓ choose · Tab complete · ←→ parent/child · Space mark"
-            },
-        );
+        let status =
+            app.notice
+                .as_deref()
+                .or(editor.error.as_deref())
+                .unwrap_or(if app.picker_atlas {
+                    "↑↓ choose · Ctrl+L toggle configured LUT · one atlas only"
+                } else if app.recursive_files.is_some() {
+                    "↑↓ / Tab select · Space mark · Ctrl+Space query space · Ctrl+Y copy"
+                } else {
+                    "↑↓ choose · Tab complete · ←→ parent/child · Space mark"
+                });
         panel.row(
             out,
             bottom - 2,
@@ -1438,7 +1455,11 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         panel.row(
             out,
             bottom - 1,
-            "Enter load · Esc back · Ctrl+Z zoxide · Ctrl+R fd · Ctrl+Y copy",
+            if app.picker_atlas {
+                "Enter load atlas · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
+            } else {
+                "Enter load · Esc back · Ctrl+Z zoxide · Ctrl+R fd · Ctrl+Y copy"
+            },
             PICKER_MUTED,
             false,
             false,
@@ -1634,7 +1655,18 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
     if rows == 0 {
         return Ok(());
     }
-    line(out, 0, "Load NIfTI images", cols, Color::White, x)?;
+    line(
+        out,
+        0,
+        if app.picker_atlas {
+            "Load solid label atlas"
+        } else {
+            "Load NIfTI images"
+        },
+        cols,
+        Color::White,
+        x,
+    )?;
     if rows > 1 {
         let filter = if editor.text.is_empty() {
             "▏(type any substring)".into()
@@ -1652,12 +1684,25 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
         line(
             out,
             2,
-            &format!(
-                "{} · marked {} · in {}",
-                matches.status(),
-                editor.checked.len(),
-                directory
-            ),
+            &if app.picker_atlas {
+                format!(
+                    "{} · LUT: {} · in {}",
+                    matches.status(),
+                    if app.picker_atlas_lut {
+                        "configured"
+                    } else {
+                        "auto / IDs"
+                    },
+                    directory
+                )
+            } else {
+                format!(
+                    "{} · marked {} · in {}",
+                    matches.status(),
+                    editor.checked.len(),
+                    directory
+                )
+            },
             cols,
             Color::DarkGrey,
             x,
@@ -1723,7 +1768,11 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
             line(
                 out,
                 rows - 2,
-                "Enter load · Esc cancel · Ctrl+Z zoxide browser · PgUp/PgDn page",
+                if app.picker_atlas {
+                    "Enter atlas · Ctrl+L LUT · Ctrl+Z zoxide · Ctrl+R fd"
+                } else {
+                    "Enter load · Esc cancel · Ctrl+Z zoxide browser · PgUp/PgDn page"
+                },
                 cols,
                 Color::DarkGrey,
                 x,
@@ -1807,7 +1856,9 @@ fn draw_popup(
                     "  l palette · o opacity",
                     "",
                     "ATLAS & APPEARANCE",
-                    "  a atlas on/off · O atlas opacity",
+                    "  a load/toggle atlas · O atlas opacity",
+                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L LUT)",
+                    "  Ctrl+T  Load/reveal configured template below images",
                     "  T enable/cycle major / broad / silhouette; a hide/show",
                     "  g edge AA · G atlas blur · b background · f fill",
                     "  n load images · Z zoxide · F fd · i info · p montage",
@@ -1854,7 +1905,9 @@ fn draw_popup(
                     "  o      Image opacity    O       Atlas opacity",
                     "",
                     "ATLAS & PROJECTION",
-                    "  a      Atlas visible    X / A / U  Projection max/avg/min+",
+                    "  a      Load/toggle atlas    X / A / U  Projection max/avg/min+",
+                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L LUT)",
+                    "  Ctrl+T  Load/reveal configured template below images",
                     "  g      Edge AA (optional)    V   Return to slices",
                     "  u or left click: copy hovered atlas region; OSC 52",
                     "  G      Atlas Gaussian blur (0 = off)",
@@ -1891,7 +1944,9 @@ fn draw_popup(
                     "  C   Toggle IDs for a visible categorical layer",
                     "  f     Image only (no UI text) · Q montage pixel budget",
                     "  g   Edge AA    G   Atlas Gaussian blur (0..4 px)",
-                    "  a   Atlas on/off    O   Atlas opacity",
+                    "  a   Load/toggle atlas    O   Atlas opacity",
+                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L LUT)",
+                    "  Ctrl+T  Load/reveal configured template below images",
                     "",
                     "LAYERS",
                     "  1–9 select layer · e window · l palette · o opacity",
@@ -2535,6 +2590,108 @@ fn unload_selected(
     app.selected = app.selected.min(app.layer_order.len() - 1);
 }
 
+fn env_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
+/// Load only the requested atlas. Commit state after validation; on failure
+/// keep the existing atlas, paths and cached projections intact.
+fn replace_atlas(
+    path: &std::path::Path,
+    use_lut: bool,
+    vol: &Volume,
+    config: &mut config::Config,
+    app: &mut App,
+    layers: &mut Layers,
+) -> Result<()> {
+    let lut = if use_lut {
+        env_path("ATLAS_LUT").or_else(|| config.lut_path.clone())
+    } else {
+        None
+    };
+    let atlas = layers::load_atlas(
+        path,
+        vol,
+        false,
+        None,
+        lut.as_deref(),
+        config.atlas_color,
+        config.atlas_width,
+        config.atlas_opacity,
+    )?;
+    config.atlas_path = Some(path.to_path_buf());
+    config.atlas_wireframe = false;
+    config.atlas_labels_path = None;
+    config.lut_path = lut;
+    app.atlas_name = Some(layers::short_name(path));
+    layers.atlas = Some(atlas);
+    app.projection_cache.clear_atlas();
+    app.highlighted_region = None;
+    app.show_atlas = true;
+    if app.projection != app::ProjectionMode::Slice {
+        app.show_projected_atlas = true;
+    }
+    Ok(())
+}
+
+/// Reuse an already loaded template rather than decoding it a second time.
+/// Keep its display settings and the current selection; place it at the bottom.
+fn reveal_template(
+    path: &std::path::Path,
+    vol: &Volume,
+    base_path: &std::path::Path,
+    app: &mut App,
+    layers: &mut Layers,
+) -> Result<()> {
+    let selected = app.selected_layer_id();
+    let id = if same_file(path, base_path) {
+        0
+    } else if let Some(index) = layers
+        .overlays
+        .iter()
+        .position(|l| same_file(path, &l.path))
+    {
+        index + 1
+    } else {
+        let id = layers.add_overlay(path, vol)?;
+        layers.overlays[id - 1].palette = layers::Palette::Gray;
+        app.layer_projections.push((id, app::ProjectionMode::Mean));
+        id
+    };
+    app.sync_layer_order(layers.overlays.len());
+    app.layer_order.retain(|&i| i != id);
+    app.layer_order.insert(0, id);
+    app.selected = app
+        .layer_order
+        .iter()
+        .position(|&i| i == selected)
+        .unwrap_or(0);
+    if id == 0 {
+        app.base_visible = true;
+        if app.base_opacity == 0. {
+            app.base_opacity = 1.;
+        }
+    } else {
+        app.show_overlays = true;
+        let layer = &mut layers.overlays[id - 1];
+        layer.visible = true;
+        if layer.opacity == 0. {
+            layer.opacity = 1.;
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let Some(mut config) = config::parse()? else {
         return Ok(());
@@ -2560,6 +2717,7 @@ fn run() -> Result<()> {
         window,
         name,
     );
+    app.base_palette = layers::default_palette(&config.path);
     app.pixel_budget = config.pixel_budget;
     if let Ok(value) = std::env::var("NIV_MONTAGE_PIXEL_BUDGET") {
         app.montage_pixel_budget = value
@@ -2782,6 +2940,78 @@ fn run() -> Result<()> {
                                     }
                                 }
                                 pending_ui = true;
+                            }
+                            Action::LoadAtlas(chosen) => {
+                                let default = env_path("ATLAS");
+                                let from_picker = chosen.is_some();
+                                let use_lut = !from_picker
+                                    || app.picker_atlas_lut
+                                    || chosen
+                                        .as_ref()
+                                        .zip(default.as_ref())
+                                        .is_some_and(|(a, b)| same_file(a, b));
+                                let path = chosen.or(default);
+                                let result = if let Some(path) = path {
+                                    app.notice =
+                                        Some(format!("Loading atlas: {} ...", path.display()));
+                                    if from_picker {
+                                        draw_picker(&mut out, &app)?;
+                                    }
+                                    replace_atlas(
+                                        &path,
+                                        use_lut,
+                                        &vol,
+                                        &mut config,
+                                        &mut app,
+                                        &mut layers,
+                                    )
+                                } else {
+                                    Err(anyhow::anyhow!(
+                                        "ATLAS is not set; Ctrl+A opens atlas picker"
+                                    ))
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        app.edit = None;
+                                        app.recursive_files = None;
+                                        app.directory_picker = None;
+                                        app.picker_atlas = false;
+                                        app.notice = Some("Atlas loaded".into());
+                                        hover_candidate = None;
+                                        hover_deadline = None;
+                                    }
+                                    Err(err) => {
+                                        let msg = format!("Atlas load failed: {err:#}");
+                                        if let Some(editor) = app.edit.as_mut() {
+                                            editor.error = Some(msg);
+                                            editor.checked.clear();
+                                            app.notice = None;
+                                        } else {
+                                            app.notice = Some(msg);
+                                        }
+                                    }
+                                }
+                                pending_layout = true;
+                                pending_frame = true;
+                            }
+                            Action::LoadTemplate => {
+                                let result = env_path("TEMPLATE")
+                                    .ok_or_else(|| anyhow::anyhow!("TEMPLATE is not set"))
+                                    .and_then(|path| {
+                                        reveal_template(
+                                            &path,
+                                            &vol,
+                                            &config.path,
+                                            &mut app,
+                                            &mut layers,
+                                        )
+                                    });
+                                app.notice = Some(match result {
+                                    Ok(()) => "Template visible at bottom".into(),
+                                    Err(err) => format!("Template load failed: {err:#}"),
+                                });
+                                pending_layout = true;
+                                pending_frame = true;
                             }
                             Action::LoadOverlays(paths) => {
                                 let mut loaded = 0usize;
@@ -3121,14 +3351,14 @@ mod layout_invalidation_tests {
         ]
         .map(str::to_owned);
         // Wide pane, no image shift: keep overflow in the left gutter.
-        let widths = header_widths(31, 2, 140, 26, 30);
+        let widths = header_widths(31, 1, 140, 26, 30);
         assert_eq!(widths, vec![31, 25, 25, 25]);
         let (lines, used) = pack_header(&parts, &widths);
         assert_eq!(used, parts.len());
         assert_eq!(lines[0], "[139,133,190] | 1: 0 | 2: 608");
         assert_eq!(lines[1], "| 3: 0.1234567 | 4: 40");
         // Narrow pane: allocate one full row above the image instead.
-        let narrow = header_widths(22, 3, 60, 0, 20);
+        let narrow = header_widths(22, 2, 60, 0, 20);
         let (lines, used) = pack_header(&parts, &narrow);
         assert_eq!(used, parts.len());
         assert_eq!(lines[0], "[139,133,190] | 1: 0");
@@ -3286,5 +3516,79 @@ mod picker_style_tests {
         let ansi = String::from_utf8(out).unwrap();
         assert!(ansi.contains("❯ brain.nii.gz"));
         assert!(ansi.contains("48;2;49;50;68"));
+    }
+}
+
+#[cfg(test)]
+mod runtime_reference_tests {
+    use super::*;
+    use std::path::Path;
+    fn volume() -> Volume {
+        Volume {
+            data: ndarray::Array3::zeros((2, 2, 2)),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        }
+    }
+    #[test]
+    fn revealing_existing_template_moves_it_to_bottom_without_reload() {
+        let vol = volume();
+        let mut app = App::new(volume::Axis::X, 0, 1, 90, (0., 1.), "base".into());
+        let mut layers = Layers::default();
+        layers.overlays.push(layers::IntensityOverlay {
+            path: "template.nii.gz".into(),
+            name: "template".into(),
+            vol: volume(),
+            window: (0., 10.),
+            default_window: (0., 10.),
+            data_range: (0., 10.),
+            palette: layers::Palette::Gray,
+            visible: false,
+            opacity: 0.6,
+        });
+        app.sync_layer_order(1);
+        assert_eq!(app.layer_order, vec![0, 1]);
+        reveal_template(
+            Path::new("template.nii.gz"),
+            &vol,
+            Path::new("base.nii.gz"),
+            &mut app,
+            &mut layers,
+        )
+        .unwrap();
+        assert_eq!(app.layer_order, vec![1, 0]);
+        assert_eq!(app.selected_layer_id(), 0);
+        assert!(layers.overlays[0].visible);
+        assert_eq!(layers.overlays[0].opacity, 0.6);
+        reveal_template(
+            Path::new("template.nii.gz"),
+            &vol,
+            Path::new("base.nii.gz"),
+            &mut app,
+            &mut layers,
+        )
+        .unwrap();
+        assert_eq!(layers.overlays.len(), 1);
+    }
+    #[test]
+    fn failed_template_load_keeps_the_stack() {
+        let vol = volume();
+        let mut app = App::new(volume::Axis::X, 0, 1, 90, (0., 1.), "base".into());
+        let mut layers = Layers::default();
+        let missing = std::env::temp_dir().join(format!(
+            "niv-missing-template-{}.nii.gz",
+            std::process::id()
+        ));
+        assert!(reveal_template(
+            &missing,
+            &vol,
+            Path::new("base.nii.gz"),
+            &mut app,
+            &mut layers
+        )
+        .is_err());
+        assert_eq!(app.layer_order, vec![0]);
+        assert!(layers.overlays.is_empty());
     }
 }

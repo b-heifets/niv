@@ -157,6 +157,11 @@ fn exterior_faces(mask: &[bool], w: usize, h: usize) -> Vec<Face> {
 }
 
 impl ProjectionCache {
+    /// Atlas changes do not invalidate cached intensity projections.
+    pub fn clear_atlas(&self) {
+        self.silhouettes.borrow_mut().clear();
+        self.grouped.borrow_mut().clear();
+    }
     pub fn remap_images(&self, remap: impl Fn(usize) -> Option<usize>) {
         self.planes.borrow_mut().retain_mut(|(id, _, _, _)| {
             if let Some(new) = remap(*id) {
@@ -365,6 +370,21 @@ mod tests {
             sform: None,
             datatype: 16,
         }
+    }
+    #[test]
+    fn atlas_replacement_keeps_intensity_cache_but_drops_old_contours() {
+        let vol = volume(Array3::from_elem((3, 3, 2), 1.));
+        let empty = volume(Array3::zeros((3, 3, 2)));
+        let cache = ProjectionCache::default();
+        let plane = cache.plane(0, &vol, Axis::Z, ProjectionMode::Mean);
+        assert!(!cache.silhouette(&vol, Axis::Z).is_empty());
+        cache.clear_atlas();
+        assert!(cache.grouped.borrow().is_empty());
+        assert!(cache.silhouette(&empty, Axis::Z).is_empty());
+        assert!(Rc::ptr_eq(
+            &plane,
+            &cache.plane(0, &vol, Axis::Z, ProjectionMode::Mean)
+        ));
     }
     #[test]
     fn planes_are_lazy_and_reused_by_axis_mode_and_id() {

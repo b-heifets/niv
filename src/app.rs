@@ -184,6 +184,8 @@ pub struct App {
     pub picker_jump_from: Option<String>,
     pub directory_picker: Option<DirectoryPicker>,
     pub picker_cursor: Option<usize>,
+    pub picker_atlas: bool,
+    pub picker_atlas_lut: bool,
     pub recursive_files: Option<path_complete::RecursiveFiles>,
     pub popup: Option<Popup>,
     pub popup_scroll: usize,
@@ -199,6 +201,8 @@ pub enum Action {
     Ui,
     Layout,
     LoadOverlays(Vec<PathBuf>),
+    LoadAtlas(Option<PathBuf>),
+    LoadTemplate,
     SaveScene(PathBuf),
     CopyRegion,
     CopyPath(PathBuf),
@@ -259,6 +263,8 @@ impl App {
             picker_jump_from: None,
             directory_picker: None,
             picker_cursor: None,
+            picker_atlas: false,
+            picker_atlas_lut: false,
             recursive_files: None,
             popup: None,
             popup_scroll: 0,
@@ -655,6 +661,8 @@ impl App {
     }
 
     fn open_picker(&mut self) -> Action {
+        self.picker_atlas = false;
+        self.picker_atlas_lut = false;
         self.picker_jump_from = None;
         self.directory_picker = None;
         self.picker_cursor = None;
@@ -690,6 +698,13 @@ impl App {
     }
     fn picker_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Action {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        if self.picker_atlas
+            && self.picker_jump_from.is_none()
+            && (key == KeyCode::Char('\x0c') || ctrl && matches!(key, KeyCode::Char('l' | 'L')))
+        {
+            self.picker_atlas_lut = !self.picker_atlas_lut;
+            return Action::Layout;
+        }
         if key == KeyCode::Char('\x19') || ctrl && matches!(key, KeyCode::Char('y' | 'Y')) {
             if let Some(dir) = self
                 .directory_picker
@@ -910,6 +925,9 @@ impl App {
                 Action::Layout
             }
             KeyCode::Char(' ') => {
+                if self.picker_atlas {
+                    return Action::None;
+                }
                 if let Some(m) = editor.completion.as_ref().and_then(|m| m.selected()) {
                     if !m.is_dir {
                         let path = path_complete::resolve(&m.path);
@@ -923,7 +941,7 @@ impl App {
                 Action::Layout
             }
             KeyCode::Enter => {
-                if !editor.checked.is_empty() {
+                if !self.picker_atlas && !editor.checked.is_empty() {
                     let paths = editor.checked.clone();
                     return Action::LoadOverlays(paths);
                 }
@@ -959,7 +977,11 @@ impl App {
                     return Action::Layout;
                 }
                 editor.checked.push(path.clone());
-                Action::LoadOverlays(vec![path])
+                if self.picker_atlas {
+                    Action::LoadAtlas(Some(path))
+                } else {
+                    Action::LoadOverlays(vec![path])
+                }
             }
             _ => Action::None,
         }
@@ -1217,6 +1239,26 @@ impl App {
                 }
                 _ => Action::None,
             };
+        }
+        if m.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('a' | 'A' | '\x01') => {
+                    if key.kind == KeyEventKind::Repeat {
+                        return Action::None;
+                    }
+                    self.open_picker();
+                    self.picker_atlas = true;
+                    return Action::Layout;
+                }
+                KeyCode::Char('t' | 'T' | '\x14') => {
+                    return if key.kind == KeyEventKind::Repeat {
+                        Action::None
+                    } else {
+                        Action::LoadTemplate
+                    };
+                }
+                _ => {}
+            }
         }
         // The layer list is top-first, whereas selected is a bottom-based
         // stack position. Modal editors/popups take precedence over this list.
@@ -1585,6 +1627,13 @@ impl App {
                 }
                 Action::Redraw
             }
+            KeyCode::Char('a') if layers.atlas.is_none() => {
+                if key.kind == KeyEventKind::Repeat {
+                    Action::None
+                } else {
+                    Action::LoadAtlas(None)
+                }
+            }
             KeyCode::Char('a') => {
                 if self.projection == ProjectionMode::Slice {
                     self.show_atlas = !self.show_atlas;
@@ -1858,9 +1907,108 @@ mod tests {
         app.key(vol, layers, KeyEvent::new(code, mods))
     }
     #[test]
+    fn runtime_reference_shortcuts_are_distinct_from_projection_and_text_input() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::X, 0, 1, 90, (0., 1.), "test".into());
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('a'),
+                KeyModifiers::NONE
+            ),
+            Action::LoadAtlas(None)
+        );
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL
+            ),
+            Action::LoadTemplate
+        );
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL
+            ),
+            Action::Layout
+        );
+        assert!(app.picker_atlas);
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::AddPath);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(app.picker_atlas_lut);
+        let root = std::env::temp_dir().join(format!("niv-atlas-picker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let atlas = root.join("labels.nii.gz");
+        std::fs::write(&atlas, b"").unwrap();
+        let text = atlas.to_string_lossy().into_owned();
+        let editor = app.edit.as_mut().unwrap();
+        editor.text = text.clone();
+        editor.completion = Some(path_complete::search(&text));
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        assert!(app.edit.as_ref().unwrap().checked.is_empty());
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ),
+            Action::LoadAtlas(Some(atlas))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        );
+        assert!(!app.picker_atlas);
+        assert!(!app.picker_atlas_lut);
+    }
+    #[test]
     fn modifiers_stride_and_new_atlas_toggle() {
         let vol = example();
         let mut layers = Layers::default();
+        layers.atlas = Some(crate::layers::Atlas {
+            vol: example(),
+            wireframe: false,
+            labels: None,
+            fallback: [255; 3],
+            width: 1,
+            opacity: 1.,
+            regions: Default::default(),
+        });
+
         let mut app = App::new(Axis::Z, 50, 1, 0, (0., 100.), "test".into());
         key(
             &mut app,
@@ -3098,6 +3246,16 @@ mod tests {
     fn top_numbering_and_new_shortcuts() {
         let vol = example();
         let mut layers = Layers::default();
+        layers.atlas = Some(crate::layers::Atlas {
+            vol: example(),
+            wireframe: false,
+            labels: None,
+            fallback: [255; 3],
+            width: 1,
+            opacity: 1.,
+            regions: Default::default(),
+        });
+
         layers.overlays.push(crate::layers::IntensityOverlay {
             path: "template.nii.gz".into(),
             name: "template".into(),

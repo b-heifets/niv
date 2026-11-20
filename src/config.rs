@@ -93,7 +93,7 @@ LAYERS AND ATLAS
                                    Supports multiple space-separated files,
                                    quoted globs, and repeated -i groups.
                                    Matched files are sorted; all images are
-                                   aligned to the base volume. Default grayscale.
+                                   aligned to the base volume. Cluster/CI filenames use categorical colors.
   -t, --template [FILE]           Append FILE or $TEMPLATE as bottom layer
       --overlay FILE              Additional image with fixed warm tint; repeatable
       --overlay-window MIN,MAX    Most recently supplied overlay range

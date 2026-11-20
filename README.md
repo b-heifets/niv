@@ -418,3 +418,13 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
   or set `NIV_KEYS` to a different file. Separate `[viewer]`, `[layers]`,
   `[montage]`, `[projection]` tables map physical keys to built-in keys. They
   do not alter text editors or the reserved Esc/Ctrl+C. Help shows default keys.
+
+
+### v0.26: reference images on demand
+
+- `a`: load `$ATLAS` if no atlas is loaded; afterward toggle its visibility (independent in projection mode).
+- `Ctrl+A`: choose a solid atlas, using the same picker as images. `Ctrl+Z` opens zoxide, `Ctrl+R` opens recursive fd. Enter loads a single atlas; Space multi-marking is disabled. Custom atlases use numeric labels without a LUT by default; `Ctrl+L` enables the configured LUT (`$ATLAS_LUT` or current LUT). Selecting the configured atlas automatically uses its configured LUT. Only use a LUT whose IDs match the atlas.
+- `Ctrl+T`: load/reveal `$TEMPLATE` below other layers, without duplicating an already loaded file. New templates use grayscale and AVG when projecting.
+- All volumes must be aligned to the original voxel grid. A failed atlas replacement leaves the existing atlas intact. Runtime atlas paths/settings are included in saved scenes. No atlas/template is read at startup unless requested with `-a`/`-t` or a scene.
+- Filenames containing `cluster` (case-insensitive) or a separate `ci` token default to the categorical palette. Explicit overlay tint and scene palette take precedence. Change palettes with `l`.
+- The header uses one row in the common case, reclaiming a terminal row for the image. Additional rows are allocated for overflow; the footer remains at the last terminal row.

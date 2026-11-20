@@ -105,6 +105,20 @@ fn hsv_to_rgb(h: f64, s: f64, v: f64) -> [u8; 3] {
     ]
 }
 
+/// Only inspect the filename, not its parent path. CI is a separate token.
+pub fn default_palette(path: &Path) -> Palette {
+    let name = short_name(path).to_ascii_lowercase();
+    if name.contains("cluster")
+        || name
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == "ci")
+    {
+        Palette::Random
+    } else {
+        Palette::Gray
+    }
+}
+
 pub fn short_name(path: &Path) -> String {
     let name = path
         .file_name()
@@ -187,7 +201,7 @@ impl Layers {
                 default_window,
                 data_range,
                 palette: if spec.grayscale {
-                    Palette::Gray
+                    default_palette(&spec.path)
                 } else {
                     Palette::Solid(spec.color)
                 },
@@ -197,39 +211,16 @@ impl Layers {
             });
         }
         let atlas = if let Some(path) = &config.atlas_path {
-            let vol =
-                Volume::load(path).with_context(|| format!("Loading atlas {}", path.display()))?;
-            reference
-                .validate_grid(&vol)
-                .with_context(|| format!("Atlas {} is not voxel-aligned", path.display()))?;
-            let labels = if let Some(label_path) = &config.atlas_labels_path {
-                let solid = Volume::load(label_path).with_context(|| {
-                    format!("Loading solid atlas labels {}", label_path.display())
-                })?;
-                reference.validate_grid(&solid).with_context(|| {
-                    format!(
-                        "Atlas labels {} are not voxel-aligned",
-                        label_path.display()
-                    )
-                })?;
-                Some(solid)
-            } else {
-                None
-            };
-            let regions = if let Some(csv_path) = &config.lut_path {
-                read_lut(csv_path)?
-            } else {
-                HashMap::new()
-            };
-            Some(Atlas {
-                vol,
-                wireframe: config.atlas_wireframe,
-                labels,
-                fallback: config.atlas_color,
-                width: config.atlas_width,
-                opacity: config.atlas_opacity,
-                regions,
-            })
+            Some(load_atlas(
+                path,
+                reference,
+                config.atlas_wireframe,
+                config.atlas_labels_path.as_deref(),
+                config.lut_path.as_deref(),
+                config.atlas_color,
+                config.atlas_width,
+                config.atlas_opacity,
+            )?)
         } else {
             if config.lut_path.is_some() {
                 bail!("--lut requires --atlas or --atlas-wireframe");
@@ -258,7 +249,7 @@ impl Layers {
             window,
             default_window: window,
             data_range,
-            palette: Palette::Gray,
+            palette: default_palette(path),
             visible: true,
             opacity: 1.0,
         });
@@ -327,6 +318,50 @@ impl Layers {
             Some((format!("Region ID {id}"), Some(atlas.fallback)))
         }
     }
+}
+
+/// Load and validate a new atlas before replacing the current one.
+pub fn load_atlas(
+    path: &Path,
+    reference: &Volume,
+    wireframe: bool,
+    labels_path: Option<&Path>,
+    lut_path: Option<&Path>,
+    fallback: [u8; 3],
+    width: usize,
+    opacity: f32,
+) -> Result<Atlas> {
+    let vol = Volume::load(path).with_context(|| format!("Loading atlas {}", path.display()))?;
+    reference
+        .validate_grid(&vol)
+        .with_context(|| format!("Atlas {} is not voxel-aligned", path.display()))?;
+    let labels = if let Some(label_path) = labels_path {
+        let solid = Volume::load(label_path)
+            .with_context(|| format!("Loading solid atlas labels {}", label_path.display()))?;
+        reference.validate_grid(&solid).with_context(|| {
+            format!(
+                "Atlas labels {} are not voxel-aligned",
+                label_path.display()
+            )
+        })?;
+        Some(solid)
+    } else {
+        None
+    };
+    let regions = if let Some(csv_path) = lut_path {
+        read_lut(csv_path)?
+    } else {
+        HashMap::new()
+    };
+    Ok(Atlas {
+        vol,
+        wireframe: wireframe,
+        labels,
+        fallback: fallback,
+        width: width,
+        opacity: opacity,
+        regions,
+    })
 }
 
 /// Read the UNRAVEL CCFv3-2020 CSV, including a possible UTF-8 BOM.
@@ -478,5 +513,28 @@ mod palette_tests {
         );
         assert_eq!(Palette::Warm.next(), Palette::Cool);
         assert_eq!(short_name(Path::new("/tmp/image.nii.gz")), "image");
+    }
+}
+
+#[cfg(test)]
+mod default_palette_tests {
+    use super::*;
+    #[test]
+    fn recognizes_cluster_and_ci_filenames_only() {
+        for p in [
+            "cluster_index.nii.gz",
+            "rev_CLUSTER.nii",
+            "ci.nii.gz",
+            "map_CI-LH.nii.gz",
+        ] {
+            assert_eq!(default_palette(Path::new(p)), Palette::Random);
+        }
+        for p in [
+            "cingulate.nii.gz",
+            "precision.nii.gz",
+            "cluster_results/template.nii.gz",
+        ] {
+            assert_eq!(default_palette(Path::new(p)), Palette::Gray);
+        }
     }
 }
