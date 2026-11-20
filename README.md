@@ -1,4 +1,4 @@
-# niv v0.19
+# niv v0.23.1
 
 Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
 
@@ -10,7 +10,7 @@ cd ~/Documents/_GitHub/niv
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # 0.22.0
+niv --version       # 0.23.1
 ```
 
 Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP includes updated Rust source files, `Cargo.toml`, `README.md`, and an example scene, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
@@ -355,3 +355,13 @@ survive directory jumps. The preview lists visible entries from the selected
 directory only, up to 256 entries, with no NIfTI decoding or recursive scans.
 A plus sign in the entry count indicates a truncated preview. Zoxide is required
 on the host running niv; fzf is not required. The browser does not modify cwd.
+
+### v0.23.1: styled image and zoxide pickers
+
+Both pickers use a centered rounded terminal panel, a bordered search field,
+truecolor selection highlights with a `❯` marker, and separate status/help
+rows. The zoxide preview has a divider and color-coded directory names.
+Long paths preserve their ending with a leading ellipsis; Unicode cell widths
+are measured for alignment. Very small terminal panes retain the compact
+layout. Search, marking, directory jumps, preview scrolling, and keybindings
+are unchanged. The small `unicode-width` dependency is used only for text layout.

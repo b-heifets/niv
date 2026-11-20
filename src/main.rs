@@ -683,7 +683,474 @@ fn safe_terminal_text(text: &str) -> String {
         .collect()
 }
 
+// Use terminal cell widths, not UTF-8 byte counts, for borders and padding.
+// This also keeps filenames containing wide Unicode characters inside the panel.
+fn picker_clip(text: &str, width: usize, keep_end: bool) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let safe = safe_terminal_text(text);
+    if safe.width() <= width {
+        return safe;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let limit = width - 1;
+    let mut used = 0;
+    let mut result = String::new();
+    if keep_end {
+        let mut tail = Vec::new();
+        for ch in safe.chars().rev() {
+            let n = ch.width().unwrap_or(0);
+            if used + n > limit {
+                break;
+            }
+            used += n;
+            tail.push(ch);
+        }
+        result.push('…');
+        result.extend(tail.into_iter().rev());
+    } else {
+        for ch in safe.chars() {
+            let n = ch.width().unwrap_or(0);
+            if used + n > limit {
+                break;
+            }
+            used += n;
+            result.push(ch);
+        }
+        result.push('…');
+    }
+    result
+}
+
+const PICKER_BORDER: Color = Color::Rgb {
+    r: 88,
+    g: 91,
+    b: 112,
+};
+const PICKER_FG: Color = Color::Rgb {
+    r: 205,
+    g: 214,
+    b: 244,
+};
+const PICKER_MUTED: Color = Color::Rgb {
+    r: 147,
+    g: 153,
+    b: 178,
+};
+const PICKER_ACCENT: Color = Color::Rgb {
+    r: 137,
+    g: 220,
+    b: 235,
+};
+const PICKER_DIR: Color = Color::Rgb {
+    r: 148,
+    g: 226,
+    b: 213,
+};
+const PICKER_HIGHLIGHT: Color = Color::Rgb {
+    r: 49,
+    g: 50,
+    b: 68,
+};
+const PICKER_SEARCH: Color = Color::Rgb {
+    r: 249,
+    g: 226,
+    b: 175,
+};
+
+#[derive(Clone, Copy)]
+struct PickerPanel {
+    left: u16,
+    top: u16,
+    width: u16,
+    height: u16,
+}
+impl PickerPanel {
+    fn new(cols: u16, rows: u16) -> Self {
+        let width = cols.saturating_sub(if cols >= 80 { 4 } else { 2 }).min(156);
+        let height = rows.saturating_sub(2).min(44);
+        Self {
+            left: (cols - width) / 2,
+            top: (rows - height) / 2,
+            width,
+            height,
+        }
+    }
+    fn inner(self) -> usize {
+        self.width.saturating_sub(4) as usize
+    }
+    fn bottom(self) -> u16 {
+        self.top + self.height - 1
+    }
+    fn frame(self, out: &mut impl Write) -> Result<()> {
+        let rule = "─".repeat(self.width.saturating_sub(2) as usize);
+        queue!(
+            out,
+            MoveTo(self.left, self.top),
+            SetForegroundColor(PICKER_BORDER),
+            Print(format!("╭{rule}╮"))
+        )?;
+        for y in self.top + 1..self.bottom() {
+            queue!(
+                out,
+                MoveTo(self.left, y),
+                Print("│"),
+                MoveTo(self.left + self.width - 1, y),
+                Print("│")
+            )?;
+        }
+        queue!(
+            out,
+            MoveTo(self.left, self.bottom()),
+            Print(format!("╰{rule}╯")),
+            ResetColor
+        )?;
+        Ok(())
+    }
+    fn row(
+        self,
+        out: &mut impl Write,
+        y: u16,
+        text: &str,
+        fg: Color,
+        active: bool,
+        keep_end: bool,
+    ) -> Result<()> {
+        use unicode_width::UnicodeWidthStr;
+        let text = picker_clip(text, self.inner(), keep_end);
+        let padding = self.inner().saturating_sub(text.width());
+        queue!(out, MoveTo(self.left + 2, y), SetForegroundColor(fg))?;
+        if active {
+            queue!(out, SetBackgroundColor(PICKER_HIGHLIGHT))?;
+        }
+        queue!(out, Print(text), Print(" ".repeat(padding)), ResetColor)?;
+        Ok(())
+    }
+    fn divider(self, out: &mut impl Write, y: u16) -> Result<()> {
+        queue!(
+            out,
+            MoveTo(self.left + 2, y),
+            SetForegroundColor(PICKER_BORDER),
+            Print("─".repeat(self.inner())),
+            ResetColor
+        )?;
+        Ok(())
+    }
+    fn title(self, out: &mut impl Write, title: &str) -> Result<()> {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+        self.row(out, self.top + 1, title, PICKER_FG, false, false)?;
+        queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+        Ok(())
+    }
+    fn search(self, out: &mut impl Write, query: &str, placeholder: &str) -> Result<()> {
+        use unicode_width::UnicodeWidthStr;
+        let y = self.top + 3;
+        let left = self.left + 2;
+        let width = self.inner();
+        let rule = "─".repeat(width.saturating_sub(2));
+        queue!(
+            out,
+            MoveTo(left, y),
+            SetForegroundColor(PICKER_BORDER),
+            Print(format!("╭{rule}╮")),
+            MoveTo(left, y + 1),
+            Print("│"),
+            MoveTo(left + width as u16 - 1, y + 1),
+            Print("│"),
+            MoveTo(left, y + 2),
+            Print(format!("╰{rule}╯")),
+            ResetColor
+        )?;
+        let capacity = width.saturating_sub(4);
+        let prefix = "Filter: ";
+        let content = if query.is_empty() { placeholder } else { query };
+        let text = picker_clip(
+            content,
+            capacity.saturating_sub(prefix.width() + 1),
+            !query.is_empty(),
+        );
+        queue!(
+            out,
+            MoveTo(left + 2, y + 1),
+            SetForegroundColor(PICKER_SEARCH),
+            Print(prefix),
+            SetForegroundColor(if query.is_empty() {
+                PICKER_MUTED
+            } else {
+                PICKER_SEARCH
+            }),
+            Print(text),
+            SetForegroundColor(PICKER_SEARCH),
+            Print("▏"),
+            ResetColor
+        )?;
+        Ok(())
+    }
+}
+
+// Keep the score/selection marker visible while truncating the directory path.
+fn picker_prefixed(prefix: &str, path: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    format!(
+        "{prefix}{}",
+        picker_clip(path, width.saturating_sub(prefix.width()), true)
+    )
+}
+
 fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    // Leave a compact fallback for small Rex/iOS terminal panes.
+    if cols < 42 || rows < 22 {
+        return draw_picker_plain(out, app);
+    }
+    queue!(out, Clear(ClearType::All))?;
+    let Some(editor) = &app.edit else {
+        return Ok(());
+    };
+    let panel = PickerPanel::new(cols, rows);
+    let w = panel.inner();
+    let bottom = panel.bottom();
+    panel.frame(out)?;
+    if let Some(picker) = &app.directory_picker {
+        panel.title(out, "Zoxide navigation · choose directory")?;
+        panel.search(out, &editor.text, "type directory keywords")?;
+        panel.row(
+            out,
+            panel.top + 6,
+            &format!(
+                "{} / {} directories · {} marked images",
+                picker.len(),
+                picker.total(),
+                editor.checked.len()
+            ),
+            PICKER_MUTED,
+            false,
+            false,
+        )?;
+        // The list and preview share the available rows; spare list rows are
+        // reused by the preview when the filter has only a few matches.
+        let available = panel.height as usize - 14;
+        let list_rows = (available - available / 3).min(picker.len().max(1));
+        let preview_rows = available - list_rows;
+        let start = picker
+            .selected
+            .saturating_sub(list_rows.saturating_sub(1))
+            .min(picker.len().saturating_sub(list_rows));
+        for offset in 0..list_rows {
+            let index = start + offset;
+            let Some(dir) = picker.get(index) else {
+                break;
+            };
+            let active = index == picker.selected;
+            let prefix = format!("{} {:>7.1}  ", if active { "❯" } else { " " }, dir.score);
+            let text = picker_prefixed(&prefix, &dir.path.to_string_lossy(), w);
+            panel.row(
+                out,
+                panel.top + 7 + offset as u16,
+                &text,
+                if active { PICKER_ACCENT } else { PICKER_FG },
+                active,
+                false,
+            )?;
+        }
+        if picker.len() == 0 {
+            panel.row(
+                out,
+                panel.top + 7,
+                picker
+                    .source_error
+                    .as_deref()
+                    .unwrap_or("No matching directories"),
+                PICKER_MUTED,
+                false,
+                false,
+            )?;
+        }
+        let divider = panel.top + 7 + list_rows as u16;
+        panel.divider(out, divider)?;
+        let heading = picker
+            .selected_dir()
+            .map(|d| picker_prefixed("Directory contents · ", &d.path.to_string_lossy(), w))
+            .unwrap_or_else(|| "Directory contents".into());
+        panel.row(out, divider + 1, &heading, PICKER_MUTED, false, false)?;
+        if let Some(err) = &picker.preview_error {
+            panel.row(out, divider + 2, err, PICKER_SEARCH, false, false)?;
+        } else if picker.preview.is_empty() && picker.selected_dir().is_some() {
+            panel.row(
+                out,
+                divider + 2,
+                "(No visible entries)",
+                PICKER_MUTED,
+                false,
+                false,
+            )?;
+        } else {
+            let first = picker
+                .preview_offset
+                .min(picker.preview.len().saturating_sub(preview_rows));
+            for (offset, entry) in picker
+                .preview
+                .iter()
+                .skip(first)
+                .take(preview_rows)
+                .enumerate()
+            {
+                let label = format!("  {}{}", entry.name, if entry.is_dir { "/" } else { "" });
+                panel.row(
+                    out,
+                    divider + 2 + offset as u16,
+                    &label,
+                    if entry.is_dir { PICKER_DIR } else { PICKER_FG },
+                    false,
+                    false,
+                )?;
+            }
+        }
+        let first = picker
+            .preview_offset
+            .min(picker.preview.len().saturating_sub(preview_rows));
+        let last = (first + preview_rows).min(picker.preview.len());
+        let status = format!(
+            "{}–{} of {}{} entries · Ctrl+↑↓ scroll preview",
+            if last == 0 { 0 } else { first + 1 },
+            last,
+            picker.preview.len(),
+            if picker.preview_truncated { "+" } else { "" }
+        );
+        panel.row(out, bottom - 4, &status, PICKER_MUTED, false, false)?;
+        panel.divider(out, bottom - 3)?;
+        panel.row(
+            out,
+            bottom - 2,
+            editor
+                .error
+                .as_deref()
+                .unwrap_or("↑↓ / Tab select · PgUp/PgDn page · Enter jump"),
+            if editor.error.is_some() {
+                Color::Red
+            } else {
+                PICKER_MUTED
+            },
+            false,
+            false,
+        )?;
+        panel.row(
+            out,
+            bottom - 1,
+            "Esc / Ctrl+Z back · Ctrl+U clear filter · Ctrl+C quit",
+            PICKER_MUTED,
+            false,
+            false,
+        )?;
+    } else if let Some(matches) = &editor.completion {
+        panel.title(out, "Load NIfTI images")?;
+        panel.search(out, &editor.text, "type any filename substring")?;
+        let directory = if matches.directory.is_empty() {
+            "."
+        } else {
+            &matches.directory
+        };
+        let prefix = format!("{} · {} marked · ", matches.status(), editor.checked.len());
+        panel.row(
+            out,
+            panel.top + 6,
+            &picker_prefixed(&prefix, directory, w),
+            PICKER_MUTED,
+            false,
+            false,
+        )?;
+        let visible = panel.height as usize - 12;
+        let selected = matches.selected_index();
+        let start = selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(matches.values.len().saturating_sub(visible));
+        for (index, item) in matches.values.iter().enumerate().skip(start).take(visible) {
+            let active = index == selected;
+            let marked = editor
+                .checked
+                .iter()
+                .any(|p| p == &crate::path_complete::resolve(&item.path));
+            let prefix = format!(
+                "{} {} ",
+                if active { "❯" } else { " " },
+                if marked { "[✓]" } else { "[ ]" }
+            );
+            let label = item
+                .path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(&item.path);
+            let name = format!("{label}{}", if item.is_dir { "/" } else { "" });
+            let text = picker_prefixed(&prefix, &name, w);
+            panel.row(
+                out,
+                panel.top + 7 + (index - start) as u16,
+                &text,
+                if active {
+                    PICKER_ACCENT
+                } else if item.is_dir {
+                    PICKER_DIR
+                } else {
+                    PICKER_FG
+                },
+                active,
+                false,
+            )?;
+        }
+        if matches.values.is_empty() {
+            panel.row(
+                out,
+                panel.top + 7,
+                "No matching images or directories",
+                PICKER_MUTED,
+                false,
+                false,
+            )?;
+        }
+        let selected_path = matches.selected().map(|m| m.path.as_str()).unwrap_or("");
+        panel.divider(out, bottom - 4)?;
+        panel.row(
+            out,
+            bottom - 3,
+            &picker_prefixed("Selected: ", selected_path, w),
+            PICKER_MUTED,
+            false,
+            false,
+        )?;
+        let status = app
+            .notice
+            .as_deref()
+            .or(editor.error.as_deref())
+            .unwrap_or("↑↓ choose · Tab complete/cycle · → directory · Space mark");
+        panel.row(
+            out,
+            bottom - 2,
+            status,
+            if app.notice.is_some() {
+                PICKER_SEARCH
+            } else if editor.error.is_some() {
+                Color::Red
+            } else {
+                PICKER_MUTED
+            },
+            false,
+            false,
+        )?;
+        panel.row(
+            out,
+            bottom - 1,
+            "Enter load · Esc cancel · Ctrl+Z zoxide · PgUp/PgDn page",
+            PICKER_MUTED,
+            false,
+            false,
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     queue!(out, Clear(ClearType::All))?;
     let Some(editor) = &app.edit else {
@@ -2287,5 +2754,57 @@ mod layout_invalidation_tests {
         new.list_start += 1;
         assert!(!layout_changed(old, new)); // scrolling the text-only list
         assert!(!layout_changed(old, old)); // regular slice redraw
+    }
+}
+
+#[cfg(test)]
+mod picker_style_tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn picker_clipping_keeps_path_suffix_and_terminal_cell_width() {
+        assert_eq!(
+            picker_clip("/long/path/brain.nii.gz", 13, true),
+            "…brain.nii.gz"
+        );
+        assert_eq!(picker_clip("abcdef", 4, false), "abc…");
+        assert_eq!(picker_clip("a\x1bb", 10, false), "a�b");
+        assert_eq!(picker_clip("abcdef", 0, false), "");
+        assert!(picker_clip("/脑/画像.nii.gz", 12, true).width() <= 12);
+        let text = picker_prefixed("❯  10.0  ", "/long/path/brain.nii.gz", 23);
+        assert!(text.starts_with("❯  10.0  "));
+        assert!(text.ends_with("brain.nii.gz"));
+        assert!(text.width() <= 23);
+    }
+
+    #[test]
+    fn picker_panel_fits_supported_terminal_sizes() {
+        for cols in [42, 80, 120, 240] {
+            for rows in [22, 30, 44, 80] {
+                let p = PickerPanel::new(cols, rows);
+                assert!(p.left + p.width < cols);
+                assert!(p.bottom() < rows - 1);
+                let free = p.height as usize - 14;
+                for matches in [0usize, 1, 3, 1000] {
+                    let list = (free - free / 3).min(matches.max(1));
+                    let preview = free - list;
+                    assert!(list > 0 && preview > 0);
+                    assert_eq!(p.top + 7 + list as u16 + 2 + preview as u16, p.bottom() - 4);
+                }
+                assert_eq!(p.top + 7 + (p.height - 12), p.bottom() - 4);
+            }
+        }
+    }
+
+    #[test]
+    fn picker_highlight_uses_truecolor_and_keeps_marker() {
+        let mut out = Vec::new();
+        let p = PickerPanel::new(80, 24);
+        p.row(&mut out, 8, "❯ brain.nii.gz", PICKER_ACCENT, true, false)
+            .unwrap();
+        let ansi = String::from_utf8(out).unwrap();
+        assert!(ansi.contains("❯ brain.nii.gz"));
+        assert!(ansi.contains("48;2;49;50;68"));
     }
 }
