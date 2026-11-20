@@ -105,6 +105,8 @@ impl From<&SceneMontage> for MontageState {
 struct SceneRender {
     background: String,
     pixel_budget: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    montage_pixel_budget: Option<usize>,
     fps: u32,
     hover_delay_ms: u64,
     mouse_pixels: bool,
@@ -297,6 +299,7 @@ impl SceneFile {
                 }
                 .into(),
                 pixel_budget: app.pixel_budget,
+                montage_pixel_budget: Some(app.montage_pixel_budget),
                 fps: config.max_fps,
                 hover_delay_ms: config.hover_delay_ms,
                 mouse_pixels: config.mouse_pixels,
@@ -350,6 +353,13 @@ impl SceneFile {
         }
         if !(1..=120).contains(&self.render.fps) {
             bail!("Scene FPS must be 1..120");
+        }
+        if self
+            .render
+            .montage_pixel_budget
+            .is_some_and(|n| n > 10_000_000)
+        {
+            bail!("Scene montage pixel budget must be <= 10000000");
         }
         if self.render.pixel_budget > 10_000_000 {
             bail!("Scene pixel budget must be <= 10000000");
@@ -437,6 +447,9 @@ impl SceneFile {
         if let Some(m) = &self.view.montage {
             app.montage = m.into();
             app.montage_preset_pending = false;
+        }
+        if let Some(n) = self.render.montage_pixel_budget {
+            app.montage_pixel_budget = n;
         }
         app.scene_path = self.source.clone();
         app.show_atlas = self.atlas.as_ref().is_some_and(|a| a.visible);
@@ -798,6 +811,7 @@ visible = false
             render: SceneRender {
                 background: "black".into(),
                 pixel_budget: 1000,
+                montage_pixel_budget: None,
                 fps: 30,
                 hover_delay_ms: 20,
                 mouse_pixels: false,

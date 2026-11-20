@@ -22,6 +22,7 @@ pub enum EditField {
     MontageGap,
     MontageInterval,
     AtlasBlur,
+    PixelBudget,
 }
 
 #[derive(Clone)]
@@ -160,6 +161,7 @@ pub struct App {
     pub base_visible: bool,
     pub transparent_background: bool,
     pub pixel_budget: usize,
+    pub montage_pixel_budget: usize,
     pub atlas_aa: bool,
     pub highlighted_region: Option<i32>,
     pub path: String,
@@ -181,6 +183,8 @@ pub struct App {
     /// Previous file filter while the picker is accepting a zoxide directory query.
     pub picker_jump_from: Option<String>,
     pub directory_picker: Option<DirectoryPicker>,
+    pub picker_cursor: Option<usize>,
+    pub recursive_files: Option<path_complete::RecursiveFiles>,
     pub popup: Option<Popup>,
     pub popup_scroll: usize,
     pub notice: Option<String>,
@@ -197,6 +201,7 @@ pub enum Action {
     LoadOverlays(Vec<PathBuf>),
     SaveScene(PathBuf),
     CopyRegion,
+    CopyPath(PathBuf),
     YankLayer,
     PasteLayer(bool),
     UnloadLayer,
@@ -235,6 +240,7 @@ impl App {
             base_visible: true,
             transparent_background: false,
             pixel_budget: 1_000_000,
+            montage_pixel_budget: 4_000_000,
             atlas_aa: false,
             highlighted_region: None,
             path,
@@ -252,6 +258,8 @@ impl App {
             edit: None,
             picker_jump_from: None,
             directory_picker: None,
+            picker_cursor: None,
+            recursive_files: None,
             popup: None,
             popup_scroll: 0,
             notice: None,
@@ -325,6 +333,13 @@ impl App {
             EditField::MontageGap => self.montage.gap as f32,
             EditField::MontageInterval => self.montage.interval as f32,
             EditField::AtlasBlur => self.atlas_blur,
+            EditField::PixelBudget => {
+                if self.montage.enabled {
+                    self.montage_pixel_budget as f32
+                } else {
+                    self.pixel_budget as f32
+                }
+            }
             _ => return None,
         })
     }
@@ -344,6 +359,17 @@ impl App {
         }
     }
     fn apply_number(&mut self, vol: &Volume, field: EditField, value: f32) -> Result<(), String> {
+        if field == EditField::PixelBudget {
+            if !value.is_finite() || value.fract() != 0. || !(0.0..=10_000_000.0).contains(&value) {
+                return Err("Pixel budget must be 0..10000000".into());
+            }
+            if self.montage.enabled {
+                self.montage_pixel_budget = value as usize;
+            } else {
+                self.pixel_budget = value as usize;
+            }
+            return Ok(());
+        }
         if field == EditField::AtlasBlur {
             if !value.is_finite() || !(0.0..=4.0).contains(&value) {
                 return Err("Blur sigma must be 0..4 px".into());
@@ -628,7 +654,65 @@ impl App {
         }
     }
 
+    fn open_picker(&mut self) -> Action {
+        self.picker_jump_from = None;
+        self.directory_picker = None;
+        self.picker_cursor = None;
+        self.recursive_files = None;
+        self.edit = Some(WindowEdit {
+            field: EditField::AddPath,
+            text: String::new(),
+            error: None,
+            completion: Some(path_complete::search("")),
+            checked: Vec::new(),
+        });
+        Action::Layout
+    }
+    fn open_recursive(&mut self) -> Action {
+        let editor = self.edit.as_mut().expect("picker open");
+        let root = editor
+            .completion
+            .as_ref()
+            .map(|m| path_complete::resolve(&m.directory))
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."));
+        match path_complete::RecursiveFiles::load(root) {
+            Ok(files) => {
+                editor.text.clear();
+                editor.completion = Some(files.filter(""));
+                editor.error = None;
+                self.recursive_files = Some(files);
+                self.picker_cursor = None;
+            }
+            Err(e) => editor.error = Some(e),
+        }
+        Action::Layout
+    }
     fn picker_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Action {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        if key == KeyCode::Char('\x19') || ctrl && matches!(key, KeyCode::Char('y' | 'Y')) {
+            if let Some(dir) = self
+                .directory_picker
+                .as_ref()
+                .and_then(|p| p.selected_dir())
+            {
+                return Action::CopyPath(dir.path.clone());
+            }
+            if let Some(path) = self
+                .edit
+                .as_ref()
+                .and_then(|e| e.completion.as_ref())
+                .and_then(|m| m.selected())
+            {
+                let p = path_complete::resolve(&path.path);
+                return Action::CopyPath(std::fs::canonicalize(&p).unwrap_or(p));
+            }
+            return Action::None;
+        }
+        if self.picker_jump_from.is_none() && ctrl && matches!(key, KeyCode::Char('r' | 'R')) {
+            return self.open_recursive();
+        }
+
         let editor = self.edit.as_mut().expect("picker is open");
         let jump_key = key == KeyCode::Char('\x1a')
             || (matches!(key, KeyCode::Char('z' | 'Z'))
@@ -636,6 +720,7 @@ impl App {
         if self.picker_jump_from.is_some() {
             if jump_key || key == KeyCode::Esc {
                 editor.text = self.picker_jump_from.take().unwrap();
+                self.picker_cursor = None;
                 // The original file-list selection and marks were never changed.
                 self.directory_picker = None;
                 editor.error = None;
@@ -650,7 +735,9 @@ impl App {
                     Ok(dir) => {
                         self.picker_jump_from = None;
                         self.directory_picker = None;
+                        self.recursive_files = None;
                         editor.text = dir;
+                        self.picker_cursor = None;
                         editor.completion = Some(path_complete::search(&editor.text));
                         editor.error = None;
                     }
@@ -674,42 +761,104 @@ impl App {
                     });
                     editor.error = None;
                 }
-                KeyCode::Backspace => {
-                    editor.text.pop();
-                    picker.filter(&editor.text);
-                    editor.error = None;
-                }
-                KeyCode::Char('u' | 'U') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    editor.text.clear();
-                    picker.filter("");
-                    editor.error = None;
-                }
-                KeyCode::Char(c)
-                    if !c.is_control()
-                        && !modifiers.intersects(
-                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                        )
-                        && editor.text.len() < 4096 =>
-                {
-                    editor
-                        .text
-                        .push(if c == '-' && modifiers.contains(KeyModifiers::SHIFT) {
-                            '_'
-                        } else {
-                            c
-                        });
-                    picker.filter(&editor.text);
-                    editor.error = None;
-                }
-                _ => return Action::None,
+                _ => match path_complete::edit_filter(
+                    &mut editor.text,
+                    &mut self.picker_cursor,
+                    key,
+                    modifiers,
+                    true,
+                ) {
+                    path_complete::FilterEdit::Changed => {
+                        picker.filter(&editor.text);
+                        editor.error = None;
+                    }
+                    path_complete::FilterEdit::Moved => {}
+                    path_complete::FilterEdit::Unhandled => return Action::None,
+                },
             }
             return Action::Layout;
         }
         if jump_key {
             self.picker_jump_from = Some(std::mem::take(&mut editor.text));
+            self.picker_cursor = None;
             self.directory_picker = Some(DirectoryPicker::load());
             editor.error = None;
             return Action::Layout;
+        }
+        if let Some(files) = &self.recursive_files {
+            if ctrl && key == KeyCode::Char(' ') {
+                path_complete::edit_filter(
+                    &mut editor.text,
+                    &mut self.picker_cursor,
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                    true,
+                );
+                editor.completion = Some(files.filter(&editor.text));
+                return Action::Layout;
+            }
+            if key == KeyCode::Esc {
+                editor.text = files.root.to_string_lossy().into_owned();
+                editor.text.push('/');
+                editor.completion = Some(path_complete::search(&editor.text));
+                editor.error = None;
+                self.recursive_files = None;
+                self.picker_cursor = None;
+                return Action::Layout;
+            }
+            if matches!(key, KeyCode::Tab | KeyCode::BackTab) {
+                if let Some(m) = editor.completion.as_mut() {
+                    m.move_by(
+                        if key == KeyCode::BackTab || modifiers.contains(KeyModifiers::SHIFT) {
+                            -1
+                        } else {
+                            1
+                        },
+                    );
+                }
+                return Action::Layout;
+            }
+            if !matches!(
+                key,
+                KeyCode::Char(' ')
+                    | KeyCode::Enter
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+            ) {
+                return match path_complete::edit_filter(
+                    &mut editor.text,
+                    &mut self.picker_cursor,
+                    key,
+                    modifiers,
+                    true,
+                ) {
+                    path_complete::FilterEdit::Changed => {
+                        editor.completion = Some(files.filter(&editor.text));
+                        editor.error = None;
+                        Action::Layout
+                    }
+                    path_complete::FilterEdit::Moved => Action::Layout,
+                    _ => Action::None,
+                };
+            }
+        }
+        // Editing controls take priority over unmodified browse arrows and marking.
+        match path_complete::edit_filter(
+            &mut editor.text,
+            &mut self.picker_cursor,
+            key,
+            modifiers,
+            false,
+        ) {
+            path_complete::FilterEdit::Changed => {
+                editor.completion = Some(path_complete::search(&editor.text));
+                editor.error = None;
+                return Action::Layout;
+            }
+            path_complete::FilterEdit::Moved => return Action::Layout,
+            path_complete::FilterEdit::Unhandled => {}
         }
         match key {
             KeyCode::Esc => {
@@ -735,10 +884,19 @@ impl App {
                         matches,
                         key == KeyCode::BackTab || modifiers.contains(KeyModifiers::SHIFT),
                     );
+                    self.picker_cursor = None;
                 }
                 Action::Layout
             }
+            KeyCode::Left => {
+                editor.text = path_complete::parent_filter(&editor.text);
+                self.picker_cursor = None;
+                editor.completion = Some(path_complete::search(&editor.text));
+                editor.error = None;
+                Action::Layout
+            }
             KeyCode::Right => {
+                self.picker_cursor = None;
                 if let Some(m) = editor.completion.as_ref().and_then(|m| m.selected()) {
                     if m.is_dir {
                         editor.text = m.path.clone();
@@ -770,6 +928,10 @@ impl App {
                     return Action::LoadOverlays(paths);
                 }
                 let candidate = editor.completion.as_ref().and_then(|m| m.selected());
+                if self.recursive_files.is_some() && candidate.is_none() {
+                    editor.error = Some("No matching file selected".into());
+                    return Action::Layout;
+                }
                 let path = candidate
                     .map(|m| m.path.clone())
                     .unwrap_or_else(|| editor.text.clone());
@@ -784,6 +946,7 @@ impl App {
                         dir.push('/');
                     }
                     editor.text = dir;
+                    self.picker_cursor = None;
                     editor.completion = Some(path_complete::search(&editor.text));
                     editor.error = None;
                     return Action::Layout;
@@ -797,25 +960,6 @@ impl App {
                 }
                 editor.checked.push(path.clone());
                 Action::LoadOverlays(vec![path])
-            }
-            KeyCode::Backspace => {
-                editor.text.pop();
-                editor.completion = Some(path_complete::search(&editor.text));
-                editor.error = None;
-                Action::Layout
-            }
-            KeyCode::Char(c) if editor.text.len() < 4096 && !c.is_control() => {
-                // Ghostty/Rex may report Shift+- as Char('-') with SHIFT, not Char('_').
-                // Accept both forms; keep the unshifted hyphen unchanged.
-                let typed = if c == '-' && modifiers.contains(KeyModifiers::SHIFT) {
-                    '_'
-                } else {
-                    c
-                };
-                editor.text.push(typed);
-                editor.completion = Some(path_complete::search(&editor.text));
-                editor.error = None;
-                Action::Layout
             }
             _ => Action::None,
         }
@@ -845,6 +989,8 @@ impl App {
                 KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                     let step = if field == EditField::AtlasBlur {
                         0.25
+                    } else if field == EditField::PixelBudget {
+                        250_000.
                     } else {
                         1.0
                     };
@@ -866,6 +1012,7 @@ impl App {
                         EditField::MontageColumns | EditField::MontageRows => (1., 12.),
                         EditField::MontageGap => (0., 32.),
                         EditField::MontageInterval => (0., 256.),
+                        EditField::PixelBudget => (0., 10_000_000.),
                         _ => (0., 4.),
                     };
                     let value = (draft + sign * step * Self::multiplier(modifiers, false) as f32)
@@ -1024,7 +1171,8 @@ impl App {
         if key.kind == KeyEventKind::Repeat
             && self.edit.is_none()
             && self.popup.is_none()
-            && (key.code == KeyCode::Char('d') && !m.contains(KeyModifiers::SHIFT)
+            && (matches!(key.code, KeyCode::Char('f' | 'h' | 'F' | 'Z'))
+                || key.code == KeyCode::Char('d') && !m.contains(KeyModifiers::SHIFT)
                 || self.show_layer_list && matches!(key.code, KeyCode::Char('p' | 'P' | 'X' | 'Y')))
         {
             return Action::None;
@@ -1104,6 +1252,23 @@ impl App {
                     }
                     return Action::PasteLayer(above);
                 }
+                KeyCode::Up | KeyCode::Down if m.contains(KeyModifiers::SHIFT) => {
+                    return self.move_selected_layer(if key.code == KeyCode::Up { 1 } else { -1 })
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let count = self.layer_order.len();
+                    self.selected =
+                        if key.code == KeyCode::BackTab || m.contains(KeyModifiers::SHIFT) {
+                            (self.selected + 1) % count
+                        } else {
+                            (self.selected + count - 1) % count
+                        };
+                    return if self.montage.enabled && self.montage.show_clusters {
+                        Action::Redraw
+                    } else {
+                        Action::Ui
+                    };
+                }
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
                     let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
                         self.selected
@@ -1129,7 +1294,7 @@ impl App {
         if key.code == KeyCode::Esc {
             return Action::None;
         }
-        if key.code == KeyCode::Char('q') {
+        if key.code == KeyCode::Char('q') && !m.contains(KeyModifiers::SHIFT) {
             return Action::Quit;
         }
         match key.code {
@@ -1166,17 +1331,25 @@ impl App {
                 self.montage.show_numbers = !self.montage.show_numbers;
                 Action::Redraw
             }
-            KeyCode::Char('n') => {
-                self.picker_jump_from = None;
-                self.directory_picker = None;
-                self.edit = Some(WindowEdit {
-                    field: EditField::AddPath,
-                    text: String::new(),
-                    error: None,
-                    completion: Some(path_complete::search("")),
-                    checked: Vec::new(),
-                });
-                Action::Layout
+            KeyCode::Char('n') => self.open_picker(),
+            KeyCode::Char('Z') | KeyCode::Char('z')
+                if !self.montage.enabled
+                    && (key.code == KeyCode::Char('Z') || m.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.open_picker();
+                self.picker_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+            }
+            KeyCode::Char('F') | KeyCode::Char('f')
+                if !self.montage.enabled
+                    && (key.code == KeyCode::Char('F') || m.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.open_picker();
+                self.open_recursive()
+            }
+            KeyCode::Char('Q') | KeyCode::Char('q')
+                if key.code == KeyCode::Char('Q') || m.contains(KeyModifiers::SHIFT) =>
+            {
+                self.open_number(EditField::PixelBudget)
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 // Kitty enhanced keys can report uppercase O as lowercase 'o' + SHIFT.
@@ -1207,6 +1380,11 @@ impl App {
                 }
             }
             KeyCode::Tab => {
+                self.show_layer_list = true;
+                self.fullscreen = false;
+                Action::Layout
+            }
+            KeyCode::Char('f') if !m.contains(KeyModifiers::SHIFT) => {
                 self.fullscreen = !self.fullscreen;
                 if self.fullscreen {
                     self.show_layer_list = false;
@@ -1452,7 +1630,7 @@ impl App {
                 self.rotation = (self.rotation + 270) % 360;
                 Action::Redraw
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('h') if !m.contains(KeyModifiers::SHIFT) => {
                 self.flip_h = !self.flip_h;
                 Action::Redraw
             }
@@ -1768,7 +1946,7 @@ mod tests {
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Tab,
+            KeyCode::Char('f'),
             KeyModifiers::NONE,
         );
         assert!(app.fullscreen);
@@ -2194,6 +2372,53 @@ mod tests {
             .values
             .iter()
             .any(|m| m.path.ends_with("example.nii.gz")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn picker_left_returns_to_parent_and_preserves_marked_files() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "niv-parent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        let none = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('n'), none);
+        let editor = app.edit.as_mut().unwrap();
+        editor.text = format!("{}/", root.display());
+        editor.completion = Some(path_complete::search(&editor.text));
+        editor.checked.push(PathBuf::from("marked.nii.gz"));
+        key(&mut app, &vol, &mut layers, KeyCode::Right, none);
+        assert!(app.edit.as_ref().unwrap().text.ends_with("/child/"));
+        key(&mut app, &vol, &mut layers, KeyCode::Left, none);
+        assert_eq!(
+            app.edit.as_ref().unwrap().text,
+            format!("{}/", root.display())
+        );
+        assert_eq!(
+            app.edit.as_ref().unwrap().checked,
+            vec![PathBuf::from("marked.nii.gz")]
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(app.edit.as_ref().unwrap().text.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2651,11 +2876,11 @@ mod tests {
         let mut layers = Layers::default();
         let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
         let none = KeyModifiers::NONE;
-        key(&mut app, &vol, &mut layers, KeyCode::Tab, none);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('f'), none);
         assert!(app.fullscreen);
         key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none);
         assert!(app.show_layer_list && !app.fullscreen);
-        key(&mut app, &vol, &mut layers, KeyCode::Tab, none);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('f'), none);
         assert!(app.fullscreen && !app.show_layer_list);
         key(&mut app, &vol, &mut layers, KeyCode::Up, none);
         assert_eq!(app.index, 31);
@@ -2841,7 +3066,7 @@ mod tests {
         let mut app = App::new(Axis::Z, 30, 1, 90, (0., 1.), "test".into());
         let n = KeyModifiers::NONE;
         key(&mut app, &vol, &mut layers, KeyCode::Char('r'), n);
-        key(&mut app, &vol, &mut layers, KeyCode::Char('f'), n);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('h'), n);
         key(&mut app, &vol, &mut layers, KeyCode::Char('x'), n);
         assert_eq!((app.rotation, app.flip_h), (90, false));
         key(&mut app, &vol, &mut layers, KeyCode::Char('z'), n);
@@ -3051,6 +3276,62 @@ mod tests {
         assert_eq!(app.index, vol.depth(Axis::X) / 2);
     }
 
+    #[test]
+    fn tab_selects_layers_and_shift_arrows_reorder() {
+        let vol = example();
+        let mut layers = Layers::default();
+        layers.overlays.push(crate::layers::IntensityOverlay {
+            path: "other.nii.gz".into(),
+            name: "other".into(),
+            vol: example(),
+            window: (0., 1.),
+            default_window: (0., 1.),
+            data_range: (0., 0.),
+            palette: Palette::Gray,
+            visible: true,
+            opacity: 1.,
+        });
+        let mut app = App::new(Axis::Z, 30, 1, 0, (0., 1.), "base".into());
+        app.sync_layer_order(1);
+        app.selected = 1;
+        let n = KeyModifiers::NONE;
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Tab, n),
+            Action::Layout
+        );
+        key(&mut app, &vol, &mut layers, KeyCode::Tab, n);
+        assert_eq!(app.selected, 0);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.layer_order, vec![1, 0]);
+        assert_eq!(app.selected_layer_id(), 0);
+        key(&mut app, &vol, &mut layers, KeyCode::Enter, n);
+        assert!(!app.show_layer_list);
+        assert_eq!(app.selected_layer_id(), 0);
+        assert_eq!(app.index, 30);
+    }
+    #[test]
+    fn independent_montage_budget() {
+        let vol = example();
+        let mut app = App::new(Axis::Z, 30, 1, 0, (0., 1.), "base".into());
+        app.montage.enabled = true;
+        assert_eq!(
+            app.numeric_montage_value(EditField::PixelBudget),
+            Some(4_000_000.)
+        );
+        app.apply_number(&vol, EditField::PixelBudget, 3_000_000.)
+            .unwrap();
+        assert_eq!(app.montage_pixel_budget, 3_000_000);
+        assert_eq!(app.pixel_budget, 1_000_000);
+        assert!(app
+            .apply_number(&vol, EditField::PixelBudget, 10_000_001.)
+            .is_err());
+    }
     #[test]
     fn editor_validation() {
         assert_eq!(

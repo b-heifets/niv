@@ -38,8 +38,8 @@ pub fn plan(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, reserved_ro
     let native_width = columns_cells.saturating_mul(cw).max(1);
     let native_height = rows_cells.saturating_mul(ch).max(1);
     let native_pixels = native_width.saturating_mul(native_height);
-    let scale = if app.pixel_budget > 0 && native_pixels > app.pixel_budget {
-        (app.pixel_budget as f64 / native_pixels as f64).sqrt()
+    let scale = if app.montage_pixel_budget > 0 && native_pixels > app.montage_pixel_budget {
+        (app.montage_pixel_budget as f64 / native_pixels as f64).sqrt()
     } else {
         1.0
     };
@@ -387,7 +387,7 @@ mod tests {
         app.montage.stop = 25;
         app.montage.interval = 3;
         app.montage.columns = 3;
-        app.pixel_budget = 100_000;
+        app.montage_pixel_budget = 100_000;
         let p = plan(&v, &app, 100, 40, 3);
         assert!(p.geom.width * p.geom.height <= 101_000);
         assert_eq!(p.total_slices, 8);

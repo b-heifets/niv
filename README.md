@@ -27,17 +27,17 @@ niv brain.nii.gz -i '*zstat*.nii.gz' '*clusters*.nii.gz'
 niv brain.nii.gz -i 'stats/*fstat*.nii.gz' -i 'other/*tstat*.nii.gz'
 niv brain.nii.gz --background transparent # start in RGBA mode
 niv brain.nii.gz --hover-delay-ms 250       # delay before thicker hovered-region contour
-niv brain.nii.gz --atlas-aa                 # optional smoother atlas edges
+niv brain.nii.gz -a --atlas-aa                 # optional smoother atlas edges
 niv brain.nii.gz --fps 20 --profile        # if Rex still queues images after key release
 ```
 
-The screen has a colored region name at the upper left, `Press ? for help` at upper right, voxel indices and intensity values for every layer on the next row, the image, and a **single selected-layer status line below the image**. It shows `1: image  |  min: …  |  max: …  |  α: …`. Names use a middle ellipsis if space is tight; `t` reveals a list of layers in **top-to-bottom order**, while `i` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
+The screen has voxel coordinates and visible-layer values at the upper left, a centered colored region name, and `Press ? for help` at upper right on the same line. Overflow uses the empty left image gutter where possible, or additional header rows in narrow panes; long region names are clipped to avoid collisions. The reserved header size is based on the loaded layer ranges rather than hovered values to avoid image resizing during inspection. A blank row separates the header from the image. Axis and slice information remain available with `i`. The **full-width rounded selected-layer panel below the image** shows `1: image | min: … | max: … | α: …`. Names use a middle ellipsis if space is tight; Tab (or `t`) reveals a list of layers in **top-to-bottom order**, while `i` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
 
 ### Keys
 
 | Key | Function |
 | --- | --- |
-| `↑↓←→`, `hjk`, mouse wheel | Scroll volume slices |
+| `↑↓←→`, `jk`, mouse wheel | Scroll volume slices |
 | Command + direction | ×2 where Rex/terminal forwards Command |
 | Shift + direction | ×3 |
 | Control + direction | ×4 |
@@ -65,13 +65,15 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `l` | Cycle gray → warm → cool → categorical integer-ID palette |
-| `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter / q / Esc closes and retains the selection |
+| Tab / `t` | Open layer list (top image first); Tab or ↑/↓ selects; Shift+↑/↓ reorders; Enter/q/Esc closes |
 | Space | Toggle selected image visibility (including the original base) |
 | `I` (Shift+i) | Toggle keyboard inspection crosshair / pointer hover |
 | `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat any axis key to mirror horizontally |
 | `r`,`R` | Rotate clockwise / counterclockwise |
-| `f`,`v` | Flip horizontally / vertically |
-| Tab | Hide/show viewer text, fill terminal |
+| `h`,`v` | Flip horizontally / vertically |
+| `f` | Hide/show viewer text, fill terminal |
+| `Q` | Edit output pixel budget for current mode |
+| `F` / `Z` | Recursive file search / zoxide browser (outside montage) |
 | `q` | Close menu or numeric editor; quit in normal viewer |
 | Ctrl+C | Quit from any interactive menu or editor |
 
@@ -100,7 +102,7 @@ There are no gold selection borders or slice numbers by default.
 | ←/→ | Move one montage position; PgUp/PgDn move one grid |
 | `N` | Toggle slice numbers |
 | `C` | Toggle numeric cluster IDs |
-| `Tab` | Image-only mode for screenshots |
+| `f` | Image-only mode for screenshots |
 | `?` or `/` | Dedicated montage help |
 
 For numeric editors, type a replacement value or use arrows to change the
@@ -171,7 +173,7 @@ export NIV_FPS=30
 export NIV_ATLAS_AA=0
 ```
 
-CLI `--atlas` / `--atlas-wireframe` and `--lut` override the environment. `--axis x --rotate 90` are defaults. Image and atlas NIfTI files must share identical dimensions, voxel spacing, and sform (when present); no resampling/reorientation is performed.
+Atlas and template loading are opt-in: use `-a` or `-t` after the image arguments to use the environment defaults, or supply a path. CLI `--atlas` / `--atlas-wireframe` and `--lut` override the environment. `--axis x --rotate 90` are defaults. Image and atlas NIfTI files must share identical dimensions, voxel spacing, and sform (when present); no resampling/reorientation is performed.
 
 ### Performance and profiling
 
@@ -207,7 +209,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 ### Reordering image layers
 
-Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`d`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; further Esc presses do nothing; use q or Ctrl+C to exit `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`{`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; further Esc presses do nothing; use q or Ctrl+C to exit `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
 ## Save and reload scenes (v0.15)
 
@@ -365,3 +367,54 @@ Long paths preserve their ending with a leading ellipsis; Unicode cell widths
 are measured for alignment. Very small terminal panes retain the compact
 layout. Search, marking, directory jumps, preview scrolling, and keybindings
 are unchanged. The small `unicode-width` dependency is used only for text layout.
+
+### v0.24: picker line editing and unified viewer styling
+
+- In `n`, Left goes to the parent directory and Right enters the selected
+  directory (or completes a file path). Existing marks are preserved.
+- The file and zoxide filter lines both support Ctrl+A/E (start/end),
+  Ctrl+B/F (character movement), Ctrl+Left/Right and Alt+B/F (word movement),
+  Ctrl+U (clear the entire filter), Ctrl+W (delete back to previous whitespace),
+  Ctrl+G (delete previous alphanumeric/underscore word), Ctrl+K (delete to end),
+  Alt+D (delete next space-delimited word), Backspace and Delete. Bare Left/Right
+  move the cursor in the zoxide query. Space still marks a NIfTI file in `n`.
+- The selected path emphasizes its basename. The live `t` list uses a highlighted
+  row, `❯`, visible/hidden indicators, and a compact heading. The normal viewer
+  keeps two top rows and a single bottom information row; the top right shows
+  axis/slice or mode and help. Filename colors (including per-character rainbow)
+  are retained while numeric settings are muted.
+- `i` shows the region name and atlas label ID at the current probe, when solid
+  atlas labels are available. Projection mode has no unique voxel/region ID.
+  The help and info panels share the picker style and wrap long text.
+- Esc cancels menus but never quits; `q` quits from the normal viewer; Ctrl+C
+  remains the global exit. No new dependencies or changes to the rasterizer.
+
+### v0.25: optional atlas/template, recursive search, keymap and layer panel
+
+- `niv image.nii.gz` loads no atlas/template. `niv image.nii.gz -a -t`
+  uses `$ATLAS`/`$TEMPLATE`; `niv image.nii.gz -a atlas.nii.gz -t template.nii.gz`
+  overrides them. Bare flags should follow all input images, because the next
+  non-option argument is interpreted as a path. `--axis` replaces the former `-a`
+  axis shorthand. Scene loading remains self-contained.
+- `Z` opens the zoxide directory browser directly (outside montage); `F` opens
+  recursive `fd` search rooted at cwd. Inside `n`, use Ctrl+R to search recursively
+  from the current picker directory and Ctrl+Z for zoxide. `fd` (or `fdfind` on
+  Debian/Ubuntu) runs once per search opening; results are cached and filtered
+  as you type, with exact substring matches before fuzzy matches. The initial
+  scan is synchronous, so a huge or remote tree can delay opening; no file
+  contents are read. Space marks files; Ctrl+Space inserts a search space;
+  Enter loads; Esc returns to directory browsing. Ctrl+Y copies the highlighted
+  path via OSC 52. Hidden/ignored files follow fd's normal defaults.
+- Tab opens the rounded layer panel, subsequent Tab cycles downward (Shift+Tab
+  reverses). Shift+Up/Down changes compositing order; Enter/Esc/q closes.
+  `t` remains a toggle. `f` fills the terminal; `h` flips horizontally; `v` flips
+  vertically. Old Kitty graphics are retained until the replacement is ready
+  on layout changes; no intermediate animation frames are generated.
+- Montage raster budget defaults to 4,000,000 pixels independently of the
+  1,000,000-pixel slice budget. `Q` edits whichever mode is active; 0 is native
+  resolution, not supersampling. `NIV_MONTAGE_PIXEL_BUDGET` sets the default;
+  saved scenes preserve the chosen montage budget.
+- Optional key aliases: copy `examples/keys.toml` to `~/.config/niv/keys.toml`
+  or set `NIV_KEYS` to a different file. Separate `[viewer]`, `[layers]`,
+  `[montage]`, `[projection]` tables map physical keys to built-in keys. They
+  do not alter text editors or the reserved Esc/Ctrl+C. Help shows default keys.

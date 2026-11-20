@@ -1,0 +1,19 @@
+# Optional aliases: physical key = built-in key. Defaults still work unless
+# overridden. No chaining. Esc and Ctrl+C are reserved. Text fields unaffected.
+# Copy to ~/.config/niv/keys.toml (or export NIV_KEYS=/path/to/keys.toml).
+# Help panels show the built-in defaults.
+[viewer]
+# "F2" is not supported; use a character, arrow, Tab, Home, End, PageUp/Down,
+# Enter or Space, optionally with Ctrl+, Alt+, Shift+, Cmd+.
+# "Alt+f" = "F" # Recursive file search
+# "Alt+t" = "Tab" # layer panel
+
+[layers]
+# "Alt+k" = "Shift+Up"
+# "Alt+j" = "Shift+Down"
+
+[montage]
+# "Alt+b" = "Q" # Pixel budget
+
+[projection]
+# "Alt+a" = "A" # Average projection

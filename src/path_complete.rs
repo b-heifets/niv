@@ -269,6 +269,175 @@ fn dir_and_fragment(input: &str) -> (String, &str) {
     }
 }
 
+/// Move one directory up, undoing the path-prefix change made by Right.
+/// Keep relative paths relative; at the filesystem root there is no parent.
+pub fn parent_filter(input: &str) -> String {
+    let (directory, _) = dir_and_fragment(input);
+    if directory.is_empty() || directory == "./" {
+        return "../".into();
+    }
+    let path = Path::new(&directory);
+    if path.components().next_back() == Some(std::path::Component::ParentDir) {
+        return format!("{directory}../");
+    }
+    let parent = if directory == "~/" {
+        expand_home("~").parent().map(Path::to_path_buf)
+    } else {
+        path.parent().map(Path::to_path_buf)
+    };
+    let Some(parent) = parent else {
+        return directory;
+    };
+    if parent.as_os_str().is_empty() {
+        return String::new();
+    }
+    let mut text = parent.to_string_lossy().into_owned();
+    if !text.ends_with('/') {
+        text.push('/');
+    }
+    text
+}
+
+/// Byte cursor, always at a UTF-8 boundary. None represents the end.
+pub fn cursor_position(text: &str, cursor: Option<usize>) -> usize {
+    let mut pos = cursor.unwrap_or(text.len()).min(text.len());
+    while !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum FilterEdit {
+    Unhandled,
+    Moved,
+    Changed,
+}
+
+/// Small readline-style editor shared by the file and zoxide pickers.
+/// Bare arrows are left to directory navigation in the file picker.
+pub fn edit_filter(
+    text: &mut String,
+    cursor: &mut Option<usize>,
+    key: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+    directory_query: bool,
+) -> FilterEdit {
+    use crossterm::event::{KeyCode as K, KeyModifiers as M};
+    use FilterEdit::*;
+    let pos = cursor_position(text, *cursor);
+    let prev = || text[..pos].char_indices().next_back().map_or(0, |(i, _)| i);
+    let next = || {
+        text[pos..]
+            .chars()
+            .next()
+            .map_or(pos, |c| pos + c.len_utf8())
+    };
+    let word_left = |space_only: bool| {
+        let word = |c: char| {
+            if space_only {
+                !c.is_whitespace()
+            } else {
+                c.is_alphanumeric() || c == '_'
+            }
+        };
+        let mut start = pos;
+        let mut in_word = false;
+        for (i, c) in text[..pos].char_indices().rev() {
+            if word(c) {
+                in_word = true;
+            } else if in_word {
+                break;
+            }
+            start = i;
+        }
+        start
+    };
+    let word_right = || {
+        let mut end = pos;
+        let mut in_word = false;
+        for (i, c) in text[pos..].char_indices() {
+            if !c.is_whitespace() {
+                in_word = true;
+            } else if in_word {
+                break;
+            }
+            end = pos + i + c.len_utf8();
+        }
+        end
+    };
+    let ctrl = mods.contains(M::CONTROL);
+    let alt = mods.contains(M::ALT);
+    let plain = !mods.intersects(M::CONTROL | M::ALT | M::SUPER);
+    let cmd = match key {
+        K::Char(c) => c.to_ascii_lowercase(),
+        _ => '\0',
+    };
+    let mut target = pos;
+    let mut remove = None;
+    if ctrl && cmd == 'u' {
+        remove = Some(0..text.len());
+        target = 0;
+    } else if ctrl && cmd == 'w' {
+        target = word_left(true);
+        remove = Some(target..pos);
+    } else if ctrl && cmd == 'g' {
+        target = word_left(false);
+        remove = Some(target..pos);
+    } else if ctrl && cmd == 'k' {
+        remove = Some(pos..text.len());
+    } else if alt && cmd == 'd' {
+        remove = Some(pos..word_right());
+    } else if (ctrl && cmd == 'a') || key == K::Home {
+        target = 0;
+    } else if (ctrl && cmd == 'e') || key == K::End {
+        target = text.len();
+    } else if (ctrl && key == K::Left) || (alt && cmd == 'b') {
+        target = word_left(true);
+    } else if (ctrl && key == K::Right) || (alt && cmd == 'f') {
+        target = word_right();
+    } else if (ctrl && cmd == 'b') || (directory_query && plain && key == K::Left) {
+        target = prev();
+    } else if (ctrl && cmd == 'f') || (directory_query && plain && key == K::Right) {
+        target = next();
+    } else if key == K::Backspace {
+        target = prev();
+        remove = Some(target..pos);
+    } else if key == K::Delete || (ctrl && cmd == 'd') {
+        remove = Some(pos..next());
+    } else if let K::Char(c) = key {
+        if !plain || c.is_control() || (!directory_query && c == ' ') {
+            return Unhandled;
+        }
+        let typed = if c == '-' && mods.contains(M::SHIFT) {
+            '_'
+        } else {
+            c
+        };
+        if text.len() + typed.len_utf8() > 4096 {
+            return Moved;
+        }
+        text.insert(pos, typed);
+        *cursor = Some(pos + typed.len_utf8());
+        return Changed;
+    } else {
+        return Unhandled;
+    }
+    if let Some(range) = remove {
+        let changed = !range.is_empty();
+        text.replace_range(range, "");
+        *cursor = Some(target);
+        if changed {
+            Changed
+        } else {
+            Moved
+        }
+    } else {
+        *cursor = Some(target);
+        Moved
+    }
+}
+
 fn wild_match(pattern: &str, name: &str) -> bool {
     // A simple case-insensitive glob for the *current filename*; unlike a
     // recursive glob it is bounded by the number of entries in one directory.
@@ -349,6 +518,78 @@ pub fn search(input: &str) -> PathMatches {
     }
 }
 
+/// Scan once via fd, then filter cached paths without touching the filesystem.
+#[derive(Clone)]
+pub struct RecursiveFiles {
+    pub root: PathBuf,
+    files: std::rc::Rc<Vec<PathMatch>>,
+}
+impl RecursiveFiles {
+    pub fn load(root: PathBuf) -> Result<Self, String> {
+        let root = fs::canonicalize(&root).map_err(|e| format!("Cannot open search root: {e}"))?;
+        let run = |exe: &str| {
+            std::process::Command::new(exe)
+                .args([
+                    "--type",
+                    "f",
+                    "--print0",
+                    "--absolute-path",
+                    r"(?i)\.nii(\.gz)?$",
+                ])
+                .arg(&root)
+                .output()
+        };
+        let output = match run("fd") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => run("fdfind"),
+            other => other,
+        }
+        .map_err(|e| format!("Cannot run fd: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "fd: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let mut files: Vec<_> = output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| std::str::from_utf8(p).ok())
+            .map(|p| PathMatch {
+                path: p.to_owned(),
+                is_dir: false,
+            })
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Self {
+            root,
+            files: std::rc::Rc::new(files),
+        })
+    }
+    pub fn filter(&self, query: &str) -> PathMatches {
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        let mut exact = Vec::new();
+        let mut fuzzy = Vec::new();
+        for item in self.files.iter() {
+            let relative = Path::new(&item.path)
+                .strip_prefix(&self.root)
+                .unwrap_or(Path::new(&item.path));
+            let text = relative.to_string_lossy().to_lowercase();
+            if terms.iter().all(|t| text.contains(t.as_str())) {
+                exact.push(item.clone());
+            } else if terms.iter().all(|t| subsequence(t, &text)) {
+                fuzzy.push(item.clone());
+            }
+        }
+        exact.extend(fuzzy);
+        PathMatches {
+            values: exact,
+            selected: None,
+            directory: self.root.to_string_lossy().into_owned(),
+        }
+    }
+}
+
 fn common_prefix(values: &[PathMatch]) -> String {
     let Some(first) = values.first() else {
         return String::new();
@@ -419,6 +660,78 @@ pub fn is_nifti_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[test]
+    fn fd_result_filter_prefers_exact_and_preserves_paths_with_spaces() {
+        let files = RecursiveFiles {
+            root: PathBuf::from("/data"),
+            files: std::rc::Rc::new(vec![
+                PathMatch {
+                    path: "/data/b r a i n.nii.gz".into(),
+                    is_dir: false,
+                },
+                PathMatch {
+                    path: "/data/first scan/Brain.nii.gz".into(),
+                    is_dir: false,
+                },
+                PathMatch {
+                    path: "/data/other.nii".into(),
+                    is_dir: false,
+                },
+            ]),
+        };
+        let m = files.filter("brain");
+        assert_eq!(m.values.len(), 2);
+        assert_eq!(m.values[0].path, "/data/first scan/Brain.nii.gz");
+        assert_eq!(files.filter("first brain").values.len(), 1);
+        assert!(files.filter("absent").values.is_empty());
+    }
+    #[test]
+    fn parent_navigation_reverses_directory_prefix() {
+        assert_eq!(parent_filter("study/sub/"), "study/");
+        assert_eq!(parent_filter("study/sub/brain"), "study/");
+        assert_eq!(parent_filter("study/"), "");
+        assert_eq!(parent_filter(""), "../");
+        assert_eq!(parent_filter("../"), "../../");
+        assert_eq!(parent_filter("/tmp/"), "/");
+        assert_eq!(parent_filter("/"), "/");
+    }
+
+    #[test]
+    fn filter_editor_uses_readline_keys_and_utf8_boundaries() {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let mut text = "brain_map test".to_owned();
+        let mut cursor = None;
+        assert_eq!(
+            edit_filter(&mut text, &mut cursor, K::Char('w'), M::CONTROL, true),
+            FilterEdit::Changed
+        );
+        assert_eq!(text, "brain_map ");
+        edit_filter(&mut text, &mut cursor, K::Char('a'), M::CONTROL, true);
+        edit_filter(&mut text, &mut cursor, K::Char('脑'), M::NONE, true);
+        assert_eq!(text, "脑brain_map ");
+        edit_filter(&mut text, &mut cursor, K::Backspace, M::NONE, true);
+        assert_eq!(text, "brain_map ");
+        edit_filter(&mut text, &mut cursor, K::Char('f'), M::CONTROL, true);
+        edit_filter(&mut text, &mut cursor, K::Char('k'), M::CONTROL, true);
+        assert_eq!(text, "b");
+        edit_filter(&mut text, &mut cursor, K::Char('u'), M::CONTROL, true);
+        assert_eq!(text, "");
+        assert_eq!(
+            edit_filter(&mut text, &mut cursor, K::Left, M::NONE, false),
+            FilterEdit::Unhandled
+        );
+        assert_eq!(
+            edit_filter(&mut text, &mut cursor, K::Right, M::NONE, false),
+            FilterEdit::Unhandled
+        );
+        assert_eq!(
+            edit_filter(&mut text, &mut cursor, K::Char(' '), M::NONE, false),
+            FilterEdit::Unhandled
+        );
+        edit_filter(&mut text, &mut cursor, K::Char('-'), M::SHIFT, false);
+        assert_eq!(text, "_");
+    }
+
     fn test_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "niv-path-{}-{}",

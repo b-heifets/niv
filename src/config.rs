@@ -47,7 +47,8 @@ const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE/GLOB ... [OPTIONS]
        niv -i FILE/GLOB ... [OPTIONS]
        niv --scene FILE.niv.toml
-Defaults: --axis x --rotate 90; $ATLAS, $ATLAS_LUT; --template uses $TEMPLATE.
+Defaults: --axis x --rotate 90; no atlas or template unless requested.
+-a [FILE] atlas ($ATLAS); -t [FILE] template ($TEMPLATE). Put bare flags last.
 Press ? in the viewer for keyboard help.  -v shows version.
 Use --help for full CLI options.
 "#;
@@ -68,7 +69,7 @@ SCENES
                           and --bench may be supplied as overrides.
 
 VIEW
-  -a, --axis x|y|z       Slice axis (default x; NIV_AXIS or NII_AXIS)
+      --axis x|y|z       Slice axis (default x; NIV_AXIS or NII_AXIS)
   -r, --rotate DEGREES  Clockwise 0,90,180,270 (default 90; NIV_ROTATE)
       --slice N          Starting slice (zero based; default center)
       --step N           Starting slice stride (default 1)
@@ -93,12 +94,12 @@ LAYERS AND ATLAS
                                    quoted globs, and repeated -i groups.
                                    Matched files are sorted; all images are
                                    aligned to the base volume. Default grayscale.
-      --template                  Append $TEMPLATE as the bottom grayscale layer
+  -t, --template [FILE]           Append FILE or $TEMPLATE as bottom layer
       --overlay FILE              Additional image with fixed warm tint; repeatable
       --overlay-window MIN,MAX    Most recently supplied overlay range
       --overlay-color RRGGBB      Most recent overlay fixed tint
       --overlay-opacity 0..1      Most recent overlay opacity (default 1)
-      --atlas FILE                Solid ID-label atlas; default $ATLAS
+  -a, --atlas [FILE]              Solid ID-label atlas; FILE or $ATLAS (opt-in)
       --atlas-wireframe FILE      Precomputed ID/binary wireframe; overrides $ATLAS
       --atlas-labels FILE         Companion solid atlas for wireframe inspection
       --lut FILE.csv              LUT; default $ATLAS_LUT when atlas is present
@@ -111,6 +112,9 @@ LAYERS AND ATLAS
                                   (NIV_ATLAS_AA=1; toggle with g; slower than exact)
 
 INTERACTIVE HELP
+  Put bare -a / -t after image arguments (a following non-option is a path).
+  NIV_MONTAGE_PIXEL_BUDGET sets montage resolution (default 4000000; 0 = native).
+  NIV_KEYS optionally names a TOML keymap; see examples/keys.toml.
   Press ? in the viewer for context-specific keyboard controls.
   -v, -V, --version       Show version.
 
@@ -118,7 +122,7 @@ EXAMPLES
   niv mean_IF.nii.gz
   niv template.nii.gz clusters.nii.gz
   niv -i template.nii.gz "*clusters*.nii.gz"
-  ATLAS=/data/atlas.nii.gz ATLAS_LUT=/data/CCFv3-2020_regional_summary.csv niv mean_IF.nii.gz
+  ATLAS=/data/atlas.nii.gz ATLAS_LUT=/data/CCFv3-2020_regional_summary.csv niv mean_IF.nii.gz -a
   niv mean_IF.nii.gz -i 'stat*.nii.gz' '*clusters*.nii.gz'
   niv mean_IF.nii.gz -i layer1.nii.gz layer2.nii.gz --atlas atlas.nii.gz
   niv mean_IF.nii.gz --atlas other.nii.gz --overlay zstat.nii.gz --overlay-window 2,6
@@ -172,7 +176,8 @@ fn parse_args_with_template(
     )?;
     let mut rotation = parse_rotation(&env::var("NIV_ROTATE").unwrap_or_else(|_| "90".to_owned()))?;
     let mut path = None;
-    let mut use_template = false;
+    let mut template_path: Option<PathBuf> = None;
+    let mut use_atlas = false;
     let mut initial_slice = None;
     let mut step = 1;
     let mut window = None;
@@ -232,8 +237,46 @@ fn parse_args_with_template(
             profile = true;
             continue;
         }
-        if arg == "--template" {
-            use_template = true;
+        if matches!(arg.as_str(), "-a" | "--atlas" | "-t" | "--template")
+            || arg.starts_with("--atlas=")
+            || arg.starts_with("--template=")
+            || arg.starts_with("-a=")
+            || arg.starts_with("-t=")
+        {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            let atlas = matches!(flag, "-a" | "--atlas");
+            let explicit = inline.map(str::to_owned).or_else(|| {
+                if args.peek().is_some_and(|v| !v.starts_with('-')) {
+                    args.next()
+                } else {
+                    None
+                }
+            });
+            if explicit.as_deref() == Some("") {
+                bail!("{flag}: empty path");
+            }
+            if atlas {
+                if atlas_path.is_some() || use_atlas {
+                    bail!("Specify only one atlas");
+                }
+                use_atlas = true;
+                atlas_path = explicit.map(PathBuf::from);
+            } else {
+                if template_path.is_some() {
+                    bail!("Specify only one template");
+                }
+                template_path = Some(match explicit {
+                    Some(p) => PathBuf::from(p),
+                    None => PathBuf::from(
+                        template_env
+                            .clone()
+                            .filter(|v| !v.is_empty())
+                            .context("-t/--template requires TEMPLATE or a path")?,
+                    ),
+                });
+            }
             continue;
         }
         if arg == "--atlas-aa" {
@@ -278,7 +321,7 @@ fn parse_args_with_template(
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
         let needs_value = matches!(
             flag,
-            "-a" | "--axis"
+            "--axis"
                 | "--slice"
                 | "--step"
                 | "-w"
@@ -312,7 +355,7 @@ fn parse_args_with_template(
                     .with_context(|| format!("{flag} needs a value"))?
             };
             match flag {
-                "-a" | "--axis" => axis = Axis::parse(&val)?,
+                "--axis" => axis = Axis::parse(&val)?,
                 "--slice" => {
                     initial_slice = Some(
                         val.parse()
@@ -353,7 +396,7 @@ fn parse_args_with_template(
                         .opacity = parse_opacity(&val)?;
                 }
                 "--atlas" | "--atlas-wireframe" => {
-                    if atlas_path.is_some() {
+                    if atlas_path.is_some() || use_atlas {
                         bail!("Use only one of --atlas / --atlas-wireframe");
                     }
                     atlas_wireframe = flag == "--atlas-wireframe";
@@ -378,17 +421,15 @@ fn parse_args_with_template(
         }
     }
     // Explicit opt-in: no extra template loading during normal startup.
-    if use_template {
-        let template = template_env
-            .filter(|v| !v.is_empty())
-            .context("--template requires the TEMPLATE environment variable")?;
-        append_image(&mut path, &mut overlays, PathBuf::from(template));
+    if let Some(template) = template_path {
+        append_image(&mut path, &mut overlays, template);
     }
-    // Explicit --atlas/--atlas-wireframe takes precedence over environment defaults.
-    if atlas_path.is_none() {
-        atlas_path = env::var_os("ATLAS")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
+    if use_atlas && atlas_path.is_none() {
+        atlas_path = Some(PathBuf::from(
+            env::var_os("ATLAS")
+                .filter(|v| !v.is_empty())
+                .context("-a/--atlas requires ATLAS or a path")?,
+        ));
     }
     // A global LUT setting should not prevent running without an atlas.
     if atlas_path.is_some() && lut_path.is_none() {
@@ -599,8 +640,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(cfg.overlays.is_empty());
+        assert!(cfg.atlas_path.is_none());
         let cfg =
-            parse_args_with_template(args(&["--template", "a.nii.gz", "b.nii.gz"]), template())
+            parse_args_with_template(args(&["a.nii.gz", "b.nii.gz", "--template"]), template())
                 .unwrap()
                 .unwrap();
         assert_eq!(cfg.path, PathBuf::from("a.nii.gz"));
@@ -613,6 +655,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.path, PathBuf::from("template.nii.gz"));
+    }
+    #[test]
+    fn explicit_atlas_and_template_paths() {
+        let args = [
+            "image.nii.gz",
+            "-a",
+            "atlas.nii.gz",
+            "-t",
+            "template.nii.gz",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let c = parse_args_with_template(args, None).unwrap().unwrap();
+        assert_eq!(c.atlas_path, Some(PathBuf::from("atlas.nii.gz")));
+        assert_eq!(c.overlays[0].path, PathBuf::from("template.nii.gz"));
     }
     #[test]
     fn multiple_glob_patterns_expand_in_sorted_order() {
