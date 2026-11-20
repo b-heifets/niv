@@ -98,8 +98,10 @@ There are no gold selection borders or slice numbers by default.
 | `+` / `-` | Zoom in/out by decreasing/increasing grid dimensions |
 | `[` / `]` | Adjust manual slice interval |
 | `<` / `>` | Adjust tile gap |
-| ↑/↓ or wheel | Move the visible window by one row when more slices exist |
-| ←/→ | Move one montage position; PgUp/PgDn move one grid |
+| ↑/↓ or wheel | Translate all displayed slices together, preserving their interval |
+| ←/→ | Adjust tile gap; PgUp/PgDn page within the selected range |
+| Hover or click | Inspect the voxel and atlas region in that tile, without changing the page |
+| `H` | Toggle delayed atlas-outline highlight for the hovered tile (off by default) |
 | `N` | Toggle slice numbers |
 | `C` | Toggle numeric cluster IDs |
 | `f` | Image-only mode for screenshots |
@@ -449,3 +451,11 @@ Successful pasted image loads are silent; failures still show a status message. 
 - `a` opens the atlas picker when no atlas is loaded and the configured path is unset or missing. Ctrl+A always opens the atlas picker.
 - The layer-list heading is bold and bright; numeric range editors show the actual finite data minimum/maximum alongside the current setting.
 - `b` toggles black/RGB and transparent/RGBA at runtime, as before. To prefer transparent on startup, set `export NIV_BACKGROUND=transparent` in `~/.config/niv/env.zsh`. `--background black` overrides that environment setting. Scenes continue to restore their saved background.
+
+### v0.26.5: montage navigation and wheel responsiveness
+
+Up/Down, j/k and wheel shift the montage start and stop together by the ordinary stride (including modifiers), clamped to the volume. Left/Right changes the gap. PageUp/PageDown still page within long manually spaced ranges. Hover or click a tile updates the text probe without selecting or paging to the tile. H toggles optional delayed dilation using the normal hover delay; this still sends a full montage frame when the region changes, so it defaults off. The selected slice is no longer shown in the montage footer.
+
+The gap's approximate micrometre equivalent is calculated from the displayed tile raster scale and the NIfTI voxel spacing, not from the slice interval. The interval also shows its physical axial distance. For NIfTI headers without spatial units, no physical conversion is displayed unless NIV_SPATIAL_UNITS=mm (or um/m) is configured. Only use this override when the header spacing is known to be in those units.
+
+Queued wheel events of the same direction and modifier are coalesced to one step per frame, preserving intervening non-motion input or a direction change. True OS-generated inertial wheel events may continue arriving after the physical gesture ends; terminal wheel events provide no gesture-release signal.

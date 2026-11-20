@@ -573,6 +573,7 @@ fn draw_ui(
     let footer_x = 0u16;
     let (w, h, _) = vol.plane(app.axis);
     let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
+    let probe_slice = app.probe_index();
     let (hint, hint_x, center_width, _) = header_bands(cols, centered_header(app, layers));
     let (mut label, mut label_color) = (String::new(), PICKER_FG);
     if app.projection != app::ProjectionMode::Slice {
@@ -600,8 +601,8 @@ fn draw_ui(
             _ => "",
         };
         label = format!("Projection along {}{outline}", app.axis.label());
-    } else if layers.atlas.is_some() {
-        if let Some((text, color)) = layers.region_details(app.axis, app.index, vh, vv) {
+    } else if layers.atlas.is_some() && probe_slice.is_some() {
+        if let Some((text, color)) = layers.region_details(app.axis, probe_slice.unwrap(), vh, vv) {
             label = text;
             if let Some(rgb) = color {
                 label_color = rgb_color(rgb);
@@ -619,7 +620,7 @@ fn draw_ui(
         label_x.min(hint_x)
     })
     .saturating_sub(1);
-    let [ix, iy, iz] = app.axis.xyz(app.index, vh, vv);
+    let [ix, iy, iz] = app.axis.xyz(probe_slice.unwrap_or(app.index), vh, vv);
     let coords = if app.projection == app::ProjectionMode::Slice {
         format!("[{ix},{iy},{iz}]")
     } else {
@@ -629,16 +630,28 @@ fn draw_ui(
             volume::Axis::Z => format!("[{ix},{iy},*]"),
         }
     };
-    let mut parts = vec![coords];
+    let mut parts = if probe_slice.is_some() {
+        vec![coords]
+    } else {
+        Vec::new()
+    };
     for pos in (0..=layers.overlays.len()).rev() {
+        let Some(slice) = probe_slice else {
+            break;
+        };
         let id = app.layer_at(pos);
         if !app.layer_visible(layers, id) {
             continue;
         }
-        let value = if id == 0 {
-            render::display_value(vol, app, id, vh, vv)
+        let source = if id == 0 {
+            vol
         } else {
-            render::display_value(&layers.overlays[id - 1].vol, app, id, vh, vv)
+            &layers.overlays[id - 1].vol
+        };
+        let value = if app.montage.enabled {
+            source.sample(app.axis, slice, vh, vv)
+        } else {
+            render::display_value(source, app, id, vh, vv)
         };
         parts.push(format!(
             "| {}{}: {}",
@@ -762,24 +775,37 @@ fn draw_ui(
     if app.montage.enabled {
         let reserved = (view.head + rows.saturating_sub(view.footer)) as usize;
         let plan = montage::plan(vol, app, cols, rows, reserved);
-        let summary = format!(
-            "Montage {}–{} / {} | {}×{} | gap {} px | {}/{} shown | row {}/{} | slice {}",
-            app.montage.start,
-            app.montage.stop,
-            if app.montage.interval == 0 {
-                "auto".into()
-            } else {
-                app.montage.interval.to_string()
-            },
-            plan.rows,
-            plan.columns,
-            plan.gap,
-            plan.tiles.len(),
-            plan.total_slices,
-            plan.page + 1,
-            plan.pages,
-            app.index
-        );
+        let gap = montage::gap_micrometres(vol, app, &plan)
+            .map(|um| format!("{} px (≈{um:.0} µm)", plan.gap))
+            .unwrap_or_else(|| format!("{} px", plan.gap));
+        let interval = if app.montage.interval == 0 {
+            "auto".into()
+        } else {
+            app.montage.interval.to_string()
+        };
+        let depth_spacing = vol
+            .micrometre_scale()
+            .filter(|_| app.montage.count() > 1)
+            .map(|scale| {
+                let um = if app.montage.interval == 0 {
+                    (app.montage.stop - app.montage.start) as f64 / (app.montage.count() - 1) as f64
+                } else {
+                    app.montage.interval as f64
+                } * vol.spacing[app.axis.index()] as f64
+                    * scale;
+                format!(
+                    " ({}{um:.0} µm)",
+                    if app.montage.interval == 0 { "≈" } else { "" }
+                )
+            })
+            .unwrap_or_default();
+        let page = if plan.pages > 1 {
+            format!(" | row {}/{}", plan.page + 1, plan.pages)
+        } else {
+            String::new()
+        };
+        let summary=format!("Montage {}–{} | interval {interval}{depth_spacing} | {}×{} | gap {gap} | {}/{} shown{page}",
+            app.montage.start,app.montage.stop,plan.rows,plan.columns,plan.tiles.len(),plan.total_slices);
         styled_layer_line(
             out,
             view.footer + 1,
@@ -2049,8 +2075,10 @@ fn draw_popup(
                     "  D        Edit tile gap (pixels)",
                     "  Type value or ↑↓ to adjust; Enter apply; Esc cancel",
                     "  +/- zoom   [/] interval   </> gap (quick adjustment)",
-                    "  ↑↓ or wheel    Move rows; ←→ move by one slice",
-                    "  PgUp/PgDn a screen; Home/End first/last slice",
+                    "  ↑↓ / jk / wheel  Shift every slice (modifiers change stride)",
+                    "  ←→  Adjust tile gap; PgUp/PgDn page within range",
+                    "  Home/End first/last page · Hover or click to inspect",
+                    "  H   Toggle delayed outline highlight (slower) · u copy region",
                     "",
                     "ANNOTATIONS & APPEARANCE",
                     "  N   Toggle slice numbers (off by default)",
@@ -2089,21 +2117,23 @@ fn draw_popup(
                 lines.push("REGION AT PROBE".into());
                 if app.projection != app::ProjectionMode::Slice {
                     lines.push("No unique 3D atlas region in a full-depth projection".into());
-                } else {
+                } else if let Some(slice) = app.probe_index() {
                     let (w, h, _) = vol.plane(app.axis);
                     let (vh, vv) = app.probe.unwrap_or((w / 2, h / 2));
                     let (vh, vv) = (vh.min(w - 1), vv.min(h - 1));
-                    let [x, y, z] = app.axis.xyz(app.index, vh, vv);
+                    let [x, y, z] = app.axis.xyz(slice, vh, vv);
                     lines.push(format!("Voxel      [{x},{y},{z}]"));
-                    if let Some((label, _)) = layers.region_details(app.axis, app.index, vh, vv) {
+                    if let Some((label, _)) = layers.region_details(app.axis, slice, vh, vv) {
                         lines.push(format!("Region     {label}"));
                         lines.push(format!(
                             "Region ID  {}",
-                            layers.atlas_id_at(app.axis, app.index, vh, vv).unwrap_or(0)
+                            layers.atlas_id_at(app.axis, slice, vh, vv).unwrap_or(0)
                         ));
                     } else {
                         lines.push("Region ID  unavailable without solid atlas labels".into());
                     }
+                } else {
+                    lines.push("Hover or click a montage tile first".into());
                 }
                 lines.push(String::new());
             }
@@ -2144,14 +2174,23 @@ fn draw_popup(
             ));
             lines.push(String::new());
             lines.push("VIEW".into());
-            lines.push(format!(
-                "Axis       {} slice {}/{}  · rotation {}° · stride {}",
-                app.axis.label(),
-                app.index + 1,
-                vol.depth(app.axis),
-                app.rotation,
-                app.stride
-            ));
+            if app.montage.enabled {
+                lines.push(format!(
+                    "Axis       {} · rotation {}° · stride {}",
+                    app.axis.label(),
+                    app.rotation,
+                    app.stride
+                ));
+            } else {
+                lines.push(format!(
+                    "Axis       {} slice {}/{}  · rotation {}° · stride {}",
+                    app.axis.label(),
+                    app.index + 1,
+                    vol.depth(app.axis),
+                    app.rotation,
+                    app.stride
+                ));
+            }
             lines.push(format!("Projection {}", app.projection_for(id).label()));
             lines.push(format!(
                 "Background {}",
@@ -2559,8 +2598,7 @@ fn benchmark(vol: &Volume, layers: &Layers, app: &mut App, count: usize) -> Resu
 /// advanced. Without this, an expensive frame can leave dozens of repeats in
 /// Crossterm's queue, causing scrolling to continue long after key release.
 /// Preserve the first different input so a direction change or Quit is never
-/// swallowed. Applies to keyboard navigation only; wheel events retain their
-/// native number of steps, and probe movement remains precise.
+/// swallowed. The wheel path separately coalesces its own queued events; probe movement remains precise.
 fn is_slice_key(key: &crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyEventKind};
     key.kind != KeyEventKind::Release
@@ -2604,14 +2642,93 @@ fn drop_stale_key_repeats(
     Ok(dropped)
 }
 
+/// Collapse queued like-direction wheel events into one update. Mouse motion
+/// interleaved with scrolls is superseded by the last wheel position. Do not
+/// swallow clicks, keystrokes, resizes or changes of wheel direction/modifier.
+fn same_wheel(a: MouseEvent, b: MouseEvent) -> bool {
+    wheel_step(a.kind, a.modifiers).is_some() && a.kind == b.kind && a.modifiers == b.modifiers
+}
+fn coalesce_wheel(mut latest: MouseEvent, next_event: &mut Option<Event>) -> Result<MouseEvent> {
+    let mut trailing_motion = None;
+    for _ in 0..4096 {
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
+        match event::read()? {
+            Event::Mouse(m) if same_wheel(latest, m) => {
+                latest = m;
+                trailing_motion = None;
+            }
+            Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                trailing_motion = Some(m);
+            }
+            other => {
+                *next_event = Some(other);
+                break;
+            }
+        }
+    }
+    if next_event.is_none() {
+        *next_event = trailing_motion.map(Event::Mouse);
+    }
+    Ok(latest)
+}
+
+fn set_montage_probe(app: &mut App, probe: Option<(usize, (usize, usize))>) -> bool {
+    let (slice, hv) = match probe {
+        Some((s, hv)) => (Some(s), Some(hv)),
+        None => (None, None),
+    };
+    let changed = app.montage_probe_slice != slice || app.probe != hv;
+    app.montage_probe_slice = slice;
+    app.probe = hv;
+    changed
+}
+fn hover_target(app: &App, layers: &Layers, delay: Duration) -> Option<(Option<usize>, i32)> {
+    if delay.is_zero()
+        || app.projection != app::ProjectionMode::Slice
+        || app.inspect_mode
+        || !app.show_atlas
+        || app.edit.is_some()
+        || app.popup.is_some()
+        || (app.montage.enabled && !app.montage_hover_highlight)
+    {
+        return None;
+    }
+    let slice = app.probe_index()?;
+    let (h, v) = app.probe?;
+    layers
+        .atlas_id_at(app.axis, slice, h, v)
+        .map(|id| (app.montage.enabled.then_some(slice), id))
+}
+fn schedule_hover(
+    app: &App,
+    layers: &Layers,
+    delay: Duration,
+    candidate: &mut Option<(Option<usize>, i32)>,
+    deadline: &mut Option<Instant>,
+) {
+    let target = hover_target(app, layers, delay);
+    let current = app
+        .highlighted_region
+        .map(|id| (app.montage_highlight_slice, id));
+    if target != *candidate || (target != current && deadline.is_none()) {
+        *candidate = target;
+        *deadline = Some(Instant::now() + delay);
+    }
+}
+
 /// OSC 52 requests clipboard access at the viewing terminal (including SSH).
 fn copy_region(out: &mut impl Write, vol: &Volume, app: &App, layers: &Layers) -> Result<bool> {
-    if app.projection != app::ProjectionMode::Slice || app.montage.enabled {
+    if app.projection != app::ProjectionMode::Slice {
         return Ok(false);
     }
+    let Some(slice) = app.probe_index() else {
+        return Ok(false);
+    };
     let (w, h, _) = vol.plane(app.axis);
     let (u, v) = app.probe.unwrap_or((w / 2, h / 2));
-    let Some(id) = layers.atlas_id_at(app.axis, app.index, u, v) else {
+    let Some(id) = layers.atlas_id_at(app.axis, slice, u, v) else {
         return Ok(false);
     };
     let Some(info) = layers.atlas.as_ref().and_then(|a| a.regions.get(&id)) else {
@@ -2767,6 +2884,7 @@ fn replace_atlas(
     layers.atlas = Some(atlas);
     app.projection_cache.clear_atlas();
     app.highlighted_region = None;
+    app.montage_highlight_slice = None;
     app.show_atlas = true;
     if app.projection != app::ProjectionMode::Slice {
         app.show_projected_atlas = true;
@@ -2965,7 +3083,7 @@ fn run() -> Result<()> {
     let mut deferred_event: Option<Event> = None;
     // The candidate region is updated immediately on hover; graphics are only
     // redrawn if the candidate differs from the active highlight after a delay.
-    let mut hover_candidate: Option<i32> = None;
+    let mut hover_candidate: Option<(Option<usize>, i32)> = None;
     let mut hover_deadline: Option<Instant> = None;
     let hover_delay = Duration::from_millis(config.hover_delay_ms);
     loop {
@@ -3001,29 +3119,49 @@ fn run() -> Result<()> {
                             pending_frame = true;
                         }
                         let before_index = app.index;
+                        let before_montage = app.montage;
+                        let before_transform = (
+                            app.axis,
+                            app.rotation,
+                            app.flip_h,
+                            app.flip_v,
+                            app.fullscreen,
+                            app.show_layer_list,
+                        );
                         let action = app.key(&vol, &mut layers, key.clone());
-                        navigated = before_index != app.index;
+                        navigated = before_index != app.index || before_montage != app.montage;
+                        if app.montage.enabled
+                            && (navigated
+                                || before_transform
+                                    != (
+                                        app.axis,
+                                        app.rotation,
+                                        app.flip_h,
+                                        app.flip_v,
+                                        app.fullscreen,
+                                        app.show_layer_list,
+                                    ))
+                        {
+                            app.clear_montage_probe();
+                            hover_candidate = None;
+                            hover_deadline = None;
+                        }
                         if matches!(action, Action::Redraw | Action::Layout) {
-                            // Slice/axis change: update the region associated with
-                            // the cursor; don't retain an outline from another slice.
-                            if app.projection != app::ProjectionMode::Slice
-                                || app.montage.enabled
-                                || app.inspect_mode
-                                || app.probe.is_none()
-                                || !app.show_atlas
+                            if !app.montage.enabled
+                                && (app.projection != app::ProjectionMode::Slice
+                                    || app.inspect_mode
+                                    || !app.show_atlas)
                             {
                                 app.highlighted_region = None;
-                                hover_candidate = None;
-                                hover_deadline = None;
-                            } else if config.hover_delay_ms != 0 {
-                                let target = app.probe.and_then(|(h, v)| {
-                                    layers.atlas_id_at(app.axis, app.index, h, v)
-                                });
-                                if target != hover_candidate {
-                                    hover_candidate = target;
-                                    hover_deadline = Some(Instant::now() + hover_delay);
-                                }
+                                app.montage_highlight_slice = None;
                             }
+                            schedule_hover(
+                                &app,
+                                &layers,
+                                hover_delay,
+                                &mut hover_candidate,
+                                &mut hover_deadline,
+                            );
                         }
                         match action {
                             Action::Quit => {
@@ -3328,76 +3466,125 @@ fn run() -> Result<()> {
                         }
                     }
                     Event::Resize(_, _) => {
+                        if app.montage.enabled {
+                            app.clear_montage_probe();
+                            hover_candidate = None;
+                            hover_deadline = None;
+                        }
                         pending_layout = true;
                         pending_frame = true;
                         last_draw = Instant::now() - frame_interval;
                     }
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown
-                        | MouseEventKind::ScrollLeft
-                        | MouseEventKind::ScrollRight
-                            if app.edit.is_none() && app.popup.is_none() =>
-                        {
-                            let (direction, multiplier) =
-                                wheel_step(mouse.kind, mouse.modifiers).unwrap();
-                            let delta = if app.montage.enabled {
-                                -direction * (app.montage.columns * multiplier) as isize
-                            } else {
-                                direction * (app.stride * multiplier) as isize
-                            };
-                            if app.move_slices(&vol, delta) {
-                                pending_frame = true;
-                                navigated = true;
-                            }
-                        }
-                        MouseEventKind::Down(_)
-                            if app.montage.enabled && app.edit.is_none() && app.popup.is_none() =>
-                        {
-                            if let Some((slice, probe)) =
-                                mouse_montage_tile(&vol, &app, view, mouse, config.mouse_pixels)
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight
+                                if app.edit.is_none() && app.popup.is_none() =>
                             {
-                                app.index = slice;
-                                app.probe = Some(probe);
-                                pending_frame = true;
-                            }
-                        }
-                        MouseEventKind::Moved
-                        | MouseEventKind::Drag(_)
-                        | MouseEventKind::Down(_)
-                            if !app.montage.enabled
-                                && !app.inspect_mode
-                                && app.edit.is_none()
-                                && app.popup.is_none() =>
-                        {
-                            let next = mouse_voxel(&vol, &app, view, mouse, config.mouse_pixels);
-                            if app.probe != next {
-                                app.probe = next;
-                                pending_ui = true;
-                            }
-                            if next.is_some()
-                                && mouse.kind
-                                    == MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                                && app.projection == app::ProjectionMode::Slice
-                            {
-                                let _ = copy_region(&mut out, &vol, &app, &layers)?;
-                            }
-                            if app.projection == app::ProjectionMode::Slice
-                                && config.hover_delay_ms != 0
-                                && app.show_atlas
-                                && layers.atlas.is_some()
-                            {
-                                let target = next.and_then(|(h, v)| {
-                                    layers.atlas_id_at(app.axis, app.index, h, v)
-                                });
-                                if target != hover_candidate {
-                                    hover_candidate = target;
+                                let mouse = coalesce_wheel(mouse, &mut deferred_event)?;
+                                let (direction, multiplier) =
+                                    wheel_step(mouse.kind, mouse.modifiers).unwrap();
+                                let delta = direction * (app.stride * multiplier) as isize;
+                                let changed = if app.montage.enabled {
+                                    app.shift_montage(&vol, delta)
+                                } else {
+                                    app.move_slices(&vol, delta)
+                                };
+                                if changed {
+                                    pending_frame = true;
+                                    navigated = true;
+                                }
+                                if app.montage.enabled {
+                                    let probe = mouse_montage_tile(
+                                        &vol,
+                                        &app,
+                                        view,
+                                        mouse,
+                                        config.mouse_pixels,
+                                    );
+                                    if set_montage_probe(&mut app, probe) {
+                                        pending_ui = true;
+                                    }
+                                } else if !app.inspect_mode {
+                                    let probe =
+                                        mouse_voxel(&vol, &app, view, mouse, config.mouse_pixels);
+                                    if app.probe != probe {
+                                        app.probe = probe;
+                                        pending_ui = true;
+                                    }
+                                }
+                                // Dilation should follow the stable final slice,
+                                // not introduce another expensive redraw during a burst.
+                                schedule_hover(
+                                    &app,
+                                    &layers,
+                                    hover_delay,
+                                    &mut hover_candidate,
+                                    &mut hover_deadline,
+                                );
+                                if changed && hover_candidate.is_some() {
                                     hover_deadline = Some(Instant::now() + hover_delay);
                                 }
                             }
+                            MouseEventKind::Moved
+                            | MouseEventKind::Drag(_)
+                            | MouseEventKind::Down(_)
+                                if app.montage.enabled
+                                    && app.edit.is_none()
+                                    && app.popup.is_none() =>
+                            {
+                                let probe = mouse_montage_tile(
+                                    &vol,
+                                    &app,
+                                    view,
+                                    mouse,
+                                    config.mouse_pixels,
+                                );
+                                if set_montage_probe(&mut app, probe) {
+                                    pending_ui = true;
+                                }
+                                schedule_hover(
+                                    &app,
+                                    &layers,
+                                    hover_delay,
+                                    &mut hover_candidate,
+                                    &mut hover_deadline,
+                                );
+                            }
+                            MouseEventKind::Moved
+                            | MouseEventKind::Drag(_)
+                            | MouseEventKind::Down(_)
+                                if !app.montage.enabled
+                                    && !app.inspect_mode
+                                    && app.edit.is_none()
+                                    && app.popup.is_none() =>
+                            {
+                                let next =
+                                    mouse_voxel(&vol, &app, view, mouse, config.mouse_pixels);
+                                if app.probe != next {
+                                    app.probe = next;
+                                    pending_ui = true;
+                                }
+                                if next.is_some()
+                                    && mouse.kind
+                                        == MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                                    && app.projection == app::ProjectionMode::Slice
+                                {
+                                    let _ = copy_region(&mut out, &vol, &app, &layers)?;
+                                }
+                                schedule_hover(
+                                    &app,
+                                    &layers,
+                                    hover_delay,
+                                    &mut hover_candidate,
+                                    &mut hover_deadline,
+                                );
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 }
                 if navigated || (deferred_event.is_none() && !event::poll(Duration::ZERO)?) {
@@ -3407,10 +3594,17 @@ fn run() -> Result<()> {
         }
         if hover_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             hover_deadline = None;
-            if app.highlighted_region != hover_candidate {
-                app.highlighted_region = hover_candidate;
+            // Re-evaluate after possible menu, atlas or geometry changes.
+            let target = hover_target(&app, &layers, hover_delay);
+            let current = app
+                .highlighted_region
+                .map(|id| (app.montage_highlight_slice, id));
+            if current != target {
+                app.highlighted_region = target.map(|(_, id)| id);
+                app.montage_highlight_slice = target.and_then(|(slice, _)| slice);
                 pending_frame = true;
             }
+            hover_candidate = target;
         }
         if (pending_frame || pending_ui || pending_layout) && last_draw.elapsed() >= frame_interval
         {
@@ -3568,6 +3762,34 @@ mod mouse_tests {
         assert!(!same_navigation_key(&down, &quit));
     }
     #[test]
+    fn wheel_bursts_only_coalesce_matching_direction_and_modifiers() {
+        let a = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..mouse(1, 2)
+        };
+        let b = MouseEvent {
+            column: 4,
+            row: 5,
+            ..a
+        };
+        assert!(same_wheel(a, b));
+        assert!(!same_wheel(
+            a,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                ..a
+            }
+        ));
+        assert!(!same_wheel(
+            a,
+            MouseEvent {
+                modifiers: KeyModifiers::SHIFT,
+                ..a
+            }
+        ));
+        assert!(!same_wheel(a, mouse(1, 2)));
+    }
+    #[test]
     fn wheel_modifiers_and_horizontal_fallback() {
         assert_eq!(
             wheel_step(MouseEventKind::ScrollUp, KeyModifiers::NONE),
@@ -3699,6 +3921,7 @@ mod layout_invalidation_tests {
         let vol = Volume {
             data: ndarray::Array3::zeros((8, 9, 10)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -3717,6 +3940,7 @@ mod layout_invalidation_tests {
         let vol = Volume {
             data: ndarray::Array3::zeros((10, 10, 10)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -3875,6 +4099,7 @@ mod runtime_reference_tests {
         Volume {
             data: ndarray::Array3::zeros((2, 2, 2)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         }

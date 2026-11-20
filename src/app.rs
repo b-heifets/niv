@@ -139,6 +139,10 @@ pub struct App {
     pub montage_preset_pending: bool,
     // Session-only slice position before entering montage.
     pub pre_montage_slice: Option<(Axis, usize)>,
+    /// Transient pointer slice, independent of the page anchor in index.
+    pub montage_probe_slice: Option<usize>,
+    pub montage_highlight_slice: Option<usize>,
+    pub montage_hover_highlight: bool,
     pub atlas_blur: f32,
     pub projection: ProjectionMode,
     /// 0 = major divisions, 1 = broad, 2 = silhouette. Visibility is independent.
@@ -228,6 +232,9 @@ impl App {
             montage: MontageState::default(),
             montage_preset_pending: true,
             pre_montage_slice: None,
+            montage_probe_slice: None,
+            montage_highlight_slice: None,
+            montage_hover_highlight: false,
             atlas_blur: 0.,
             projection: ProjectionMode::Slice,
             projected_atlas_detail: 0,
@@ -282,6 +289,8 @@ impl App {
     /// Called after the reference volume is available, or when the slicing axis
     /// changes. Avoids letting a saved bound exceed the axis depth.
     pub fn reset_montage(&mut self, vol: &Volume) {
+        self.montage_probe_slice = None;
+        self.montage_highlight_slice = None;
         let last = vol.depth(self.axis) - 1;
         self.montage = MontageState {
             enabled: self.montage.enabled,
@@ -589,6 +598,41 @@ impl App {
         }
     }
 
+    pub fn clear_montage_probe(&mut self) {
+        self.montage_probe_slice = None;
+        self.montage_highlight_slice = None;
+        self.probe = None;
+        self.highlighted_region = None;
+    }
+
+    /// Translate the entire slice range, preserving its width, sampling
+    /// interval and page position. Clamp the translation, not each tile.
+    pub fn shift_montage(&mut self, vol: &Volume, delta: isize) -> bool {
+        let last = vol.depth(self.axis) - 1;
+        let shift = delta.clamp(
+            -(self.montage.start as isize),
+            last.saturating_sub(self.montage.stop) as isize,
+        );
+        if shift == 0 {
+            return false;
+        }
+        self.montage.start = self.montage.start.saturating_add_signed(shift);
+        self.montage.stop = self.montage.stop.saturating_add_signed(shift);
+        self.index = self.index.saturating_add_signed(shift);
+        self.montage_preset_pending = false;
+        self.clear_montage_probe();
+        true
+    }
+
+    /// The probe slice is never used as a montage page selector.
+    pub fn probe_index(&self) -> Option<usize> {
+        if self.montage.enabled {
+            self.montage_probe_slice.filter(|_| self.probe.is_some())
+        } else {
+            Some(self.index)
+        }
+    }
+
     pub fn move_slices(&mut self, vol: &Volume, delta: isize) -> bool {
         if self.projection != ProjectionMode::Slice {
             return false;
@@ -603,6 +647,9 @@ impl App {
         };
         let changed = new_index != self.index;
         self.index = new_index;
+        if changed && self.montage.enabled {
+            self.clear_montage_probe();
+        }
         changed
     }
 
@@ -1582,6 +1629,22 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('H') if self.montage.enabled => {
+                self.montage_hover_highlight = !self.montage_hover_highlight;
+                if !self.montage_hover_highlight {
+                    self.highlighted_region = None;
+                    self.montage_highlight_slice = None;
+                }
+                Action::Redraw
+            }
+            KeyCode::Char('h') if self.montage.enabled && m.contains(KeyModifiers::SHIFT) => {
+                self.montage_hover_highlight = !self.montage_hover_highlight;
+                if !self.montage_hover_highlight {
+                    self.highlighted_region = None;
+                    self.montage_highlight_slice = None;
+                }
+                Action::Redraw
+            }
             KeyCode::Char('G') => self.open_number(EditField::AtlasBlur),
             KeyCode::Char('g') if m.contains(KeyModifiers::SHIFT) => {
                 self.open_number(EditField::AtlasBlur)
@@ -1608,6 +1671,7 @@ impl App {
                 self.montage.enabled = !self.montage.enabled;
                 if self.montage.enabled {
                     self.pre_montage_slice = Some((self.axis, self.index));
+                    self.clear_montage_probe();
                     self.projection = ProjectionMode::Slice;
                     self.inspect_mode = false;
                     if self.montage_preset_pending {
@@ -1620,8 +1684,7 @@ impl App {
                         Some((axis, index)) if axis == self.axis => index.min(depth - 1),
                         _ => depth / 2,
                     };
-                    self.probe = None;
-                    self.highlighted_region = None;
+                    self.clear_montage_probe();
                 }
                 self.normalize_montage(vol);
                 Action::Layout
@@ -1679,11 +1742,7 @@ impl App {
             {
                 self.set_projection(ProjectionMode::MinPositive)
             }
-            KeyCode::Char('u')
-                if !self.montage.enabled && self.projection == ProjectionMode::Slice =>
-            {
-                Action::CopyRegion
-            }
+            KeyCode::Char('u') if self.projection == ProjectionMode::Slice => Action::CopyRegion,
             KeyCode::Char(' ') => {
                 let id = self.selected_layer_id();
                 if id == 0 {
@@ -1897,13 +1956,35 @@ impl App {
                     };
                     self.move_probe(vol, dx * multiplier as isize, dy * multiplier as isize);
                 } else if self.montage.enabled {
-                    let delta = match key.code {
-                        KeyCode::Up | KeyCode::Char('k' | 'K') => -(self.montage.columns as isize),
-                        KeyCode::Down | KeyCode::Char('j' | 'J') => self.montage.columns as isize,
-                        KeyCode::Left | KeyCode::Char('h' | 'H') => -1,
-                        _ => 1,
-                    };
-                    self.move_slices(vol, delta * multiplier as isize);
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k' | 'K') => {
+                            if !self.shift_montage(vol, (self.stride * multiplier) as isize) {
+                                return Action::None;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j' | 'J') => {
+                            if !self.shift_montage(vol, -((self.stride * multiplier) as isize)) {
+                                return Action::None;
+                            }
+                        }
+                        KeyCode::Left => {
+                            let next = self.montage.gap.saturating_sub(multiplier);
+                            if next == self.montage.gap {
+                                return Action::None;
+                            }
+                            self.montage.gap = next;
+                            self.clear_montage_probe();
+                        }
+                        KeyCode::Right => {
+                            let next = (self.montage.gap + multiplier).min(32);
+                            if next == self.montage.gap {
+                                return Action::None;
+                            }
+                            self.montage.gap = next;
+                            self.clear_montage_probe();
+                        }
+                        _ => return Action::None,
+                    }
                 } else {
                     let sign = match key.code {
                         KeyCode::Up | KeyCode::Right | KeyCode::Char('k' | 'K') => 1,
@@ -1960,6 +2041,7 @@ mod tests {
         Volume {
             data: Array3::zeros((20, 30, 100)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         }
@@ -2797,6 +2879,7 @@ mod tests {
         let labels = Volume {
             data: Array3::zeros((3, 4, 5)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -3558,6 +3641,69 @@ mod tests {
     }
 
     #[test]
+    fn montage_scroll_translates_all_slices_and_preserves_span() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 37, 1, 0, (0., 1.), "test".into());
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        let before = app.montage;
+        let old: Vec<_> = (0..before.count()).map(|i| before.slice_at(i)).collect();
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.montage.start, before.start + 3);
+        assert_eq!(app.montage.stop, before.stop + 3);
+        for (i, slice) in old.iter().enumerate() {
+            assert_eq!(app.montage.slice_at(i), *slice + 3);
+        }
+        assert!(app.shift_montage(&vol, 999));
+        assert_eq!(app.montage.stop, 99);
+        assert!(!app.shift_montage(&vol, 1));
+        assert!(app.shift_montage(&vol, -999));
+        assert_eq!(app.montage.start, 0);
+        assert_eq!(app.montage.stop, before.stop - before.start);
+        let gap = app.montage.gap;
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.montage.gap, gap + 1);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.montage.gap, gap);
+    }
+    #[test]
+    fn montage_probe_does_not_change_page_anchor() {
+        let vol = example();
+        let mut app = App::new(Axis::Z, 20, 1, 0, (0., 1.), "test".into());
+        app.reset_montage(&vol);
+        app.montage.enabled = true;
+        app.montage_probe_slice = Some(55);
+        app.probe = Some((2, 3));
+        assert_eq!(app.probe_index(), Some(55));
+        assert_eq!(app.index, 20);
+        app.clear_montage_probe();
+        assert_eq!(app.probe_index(), None);
+    }
+    #[test]
     fn montage_exit_restores_slice_or_new_axis_midpoint() {
         let vol = example();
         let mut layers = Layers::default();
@@ -3803,6 +3949,7 @@ mod layer_list_escape_tests {
         let volume = Volume {
             data: Array3::zeros((4, 4, 4)),
             spacing: [1.0; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -3849,6 +3996,7 @@ mod layer_list_escape_tests {
         let volume = Volume {
             data: Array3::zeros((4, 4, 4)),
             spacing: [1.0; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };

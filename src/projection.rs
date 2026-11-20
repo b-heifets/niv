@@ -367,6 +367,7 @@ mod tests {
         Volume {
             data,
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         }

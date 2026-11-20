@@ -177,6 +177,7 @@ mod tests {
         let vol = Volume {
             data: Array3::from_shape_fn((2, 2, 3), |(_, _, z)| [0.0, 10.0, 20.0][z]),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -194,6 +195,7 @@ mod tests {
         let vol = Volume {
             data: Array3::from_shape_fn((4, 5, 6), |(x, y, z)| (x * 20 + y * 4 + z) as f32),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -220,6 +222,7 @@ mod tests {
         let vol = Volume {
             data: Array3::from_shape_fn((2, 3, 1), |(x, y, _)| (10 * x + 20 * y) as f32),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1095,6 +1098,7 @@ mod layer_tests {
         let base = Volume {
             data: Array3::from_shape_fn((3, 1, 2), |(_, _, z)| [2., 8.][z]),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1105,6 +1109,7 @@ mod layer_tests {
                 vol: Volume {
                     data: Array3::from_elem((3, 1, 2), 6.),
                     spacing: [1.; 3],
+                    spatial_units: 2,
                     sform: None,
                     datatype: 16,
                 },
@@ -1159,6 +1164,7 @@ mod layer_tests {
         let base = Volume {
             data: Array3::from_shape_fn((3, 1, 2), |(_, _, z)| [2., 8.][z]),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1168,6 +1174,7 @@ mod layer_tests {
                 |(x, _, z)| if x == 1 { [0., 6.][z] } else { 0. },
             ),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1229,6 +1236,7 @@ mod layer_tests {
         let base = Volume {
             data: Array3::from_elem((3, 3, 2), 10.),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1241,6 +1249,7 @@ mod layer_tests {
                 }
             }),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1284,6 +1293,7 @@ mod layer_tests {
         let base = Volume {
             data: Array3::zeros((4, 4, 2)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1293,6 +1303,7 @@ mod layer_tests {
                 |(x, y, _)| if x == 1 && y == 1 { 1. } else { 2. },
             ),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1361,6 +1372,7 @@ mod layer_tests {
         Volume {
             data: Array3::from_shape_vec((3, 1, 1), a).unwrap(),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         }
@@ -1547,6 +1559,7 @@ mod layer_tests {
         let base = Volume {
             data: Array3::zeros((4, 4, 1)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1558,6 +1571,7 @@ mod layer_tests {
                 (false, false) => 4.0,
             }),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1675,6 +1689,7 @@ mod inspector_tests {
         let vol = Volume {
             data: Array3::zeros((4, 3, 2)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1694,6 +1709,7 @@ mod inspector_tests {
         let base = Volume {
             data: Array3::zeros((3, 3, 1)),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -1703,6 +1719,7 @@ mod inspector_tests {
                 |(x, y, _)| if x == 1 && y == 1 { 3. } else { 4. },
             ),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };

@@ -459,6 +459,7 @@ mod tests {
         let mk = |value: f32| Volume {
             data: Array3::from_elem((2, 2, 1), value),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };

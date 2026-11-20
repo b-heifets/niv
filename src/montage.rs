@@ -1,6 +1,6 @@
 //! Paged montage rendered as a single Kitty graphics placement.
 //! Each thumbnail uses the existing layered compositor and atlas boundary code.
-//! Pages follow the selected slice; the entire volume is never rasterized at once.
+//! Pages follow a page anchor independent of mouse inspection; the entire volume is never rasterized at once.
 use crate::{
     app::App,
     layers::Layers,
@@ -106,6 +106,19 @@ pub fn plan(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, reserved_ro
         pages,
         tiles,
     }
+}
+
+/// Physical equivalent of the decorative tile gap, based on the in-plane
+/// field of view and raster scale. This is not the distance between slices.
+pub fn gap_micrometres(vol: &Volume, app: &App, plan: &Plan) -> Option<f64> {
+    let (mut a, mut b) = app.axis.plane_axes();
+    if app.rotation % 180 != 0 {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let dims = vol.dims();
+    let sx = dims[a] as f64 * vol.spacing[a] as f64 / plan.tile_width as f64;
+    let sy = dims[b] as f64 * vol.spacing[b] as f64 / plan.tile_height as f64;
+    Some(plan.gap as f64 * (sx + sy) * 0.5 * vol.micrometre_scale()?)
 }
 
 fn put_pixel(frame: &mut [u8], width: usize, channels: usize, x: usize, y: usize, color: [u8; 3]) {
@@ -318,11 +331,15 @@ pub fn composite(
     let channels = if app.transparent_background { 4 } else { 3 };
     let mut frame = vec![0u8; plan.geom.width * plan.geom.height * channels];
     let mut tile_app = app.clone();
-    // Do not draw one crosshair or hover highlight on every thumbnail.
+    // Draw the optional delayed outline only on the probed thumbnail.
     tile_app.inspect_mode = false;
-    tile_app.highlighted_region = None;
     for tile in &plan.tiles {
         tile_app.index = tile.slice;
+        tile_app.highlighted_region = if app.montage_highlight_slice == Some(tile.slice) {
+            app.highlighted_region
+        } else {
+            None
+        };
         let pixels = render::composite_with_map(
             vol,
             &tile_app,
@@ -373,6 +390,7 @@ mod tests {
         Volume {
             data: Array3::from_shape_fn((12, 20, 30), |(x, y, z)| (x * 1000 + y * 30 + z) as f32),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         }
@@ -398,6 +416,76 @@ mod tests {
         let sample = SamplingMap::new(&v, &app, p.tile_width, p.tile_height);
         let rgb = composite(&v, &app, &Layers::default(), &p, &sample);
         assert_eq!(rgb.len(), p.geom.width * p.geom.height * 3);
+    }
+    #[test]
+    fn hover_dilation_is_confined_to_one_tile() {
+        let v = vol();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 30000.), "test".into());
+        app.reset_montage(&v);
+        app.montage.enabled = true;
+        let labels = Volume {
+            data: Array3::from_shape_fn((12, 20, 30), |(x, _, _)| if x < 6 { 1. } else { 2. }),
+            spacing: [1.; 3],
+            spatial_units: 2,
+            sform: None,
+            datatype: 16,
+        };
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(crate::layers::Atlas {
+                vol: labels,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 0, 0],
+                width: 1,
+                opacity: 1.,
+                regions: Default::default(),
+            }),
+        };
+        let p = plan(&v, &app, 100, 40, 3);
+        let map = SamplingMap::new(&v, &app, p.tile_width, p.tile_height);
+        let plain = composite(&v, &app, &layers, &p, &map);
+        let tile = p.tiles[0];
+        app.montage_highlight_slice = Some(tile.slice);
+        app.highlighted_region = Some(1);
+        let highlighted = composite(&v, &app, &layers, &p, &map);
+        let mut changed = 0;
+        for (i, (before, after)) in plain
+            .chunks_exact(3)
+            .zip(highlighted.chunks_exact(3))
+            .enumerate()
+        {
+            if before != after {
+                let x = i % p.geom.width;
+                let y = i / p.geom.width;
+                assert!(
+                    x >= tile.x
+                        && x < tile.x + p.tile_width
+                        && y >= tile.y
+                        && y < tile.y + p.tile_height
+                );
+                changed += 1;
+            }
+        }
+        assert!(changed > 0);
+    }
+    #[test]
+    fn physical_gap_uses_in_plane_raster_scale() {
+        let mut v = vol();
+        v.spacing = [0.03; 3];
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "test".into());
+        app.reset_montage(&v);
+        app.montage.enabled = true;
+        let mut p = plan(&v, &app, 100, 40, 3);
+        // At one raster pixel per voxel, eight pixels = 240 µm.
+        p.tile_width = 12;
+        p.tile_height = 20;
+        p.gap = 8;
+        assert!((gap_micrometres(&v, &app, &p).unwrap() - 240.).abs() < 1e-3);
+        app.rotation = 90;
+        p.tile_width = 40;
+        p.tile_height = 24;
+        assert!((gap_micrometres(&v, &app, &p).unwrap() - 120.).abs() < 1e-3);
     }
     #[test]
     fn default_grid_has_twelve_clean_tiles_and_includes_both_bounds() {
@@ -431,6 +519,7 @@ mod tests {
         let v = Volume {
             data: Array3::from_elem((20, 20, 12), 2.),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };

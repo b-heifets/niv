@@ -743,6 +743,7 @@ visible = false
         let vol = Volume {
             data: Array3::zeros((6, 7, 8)),
             spacing: [1.0; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };

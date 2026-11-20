@@ -54,6 +54,8 @@ impl Axis {
 pub struct Volume {
     pub data: Array3<f32>,
     pub spacing: [f32; 3],
+    /// NIfTI spatial unit code (low three bits of xyzt_units).
+    pub spatial_units: u8,
     /// S-form transform when supplied by NIfTI, used to reject misregistered overlays.
     pub sform: Option<[[f32; 4]; 3]>,
     /// Datatype stored in the original NIfTI header before f32 conversion.
@@ -76,6 +78,7 @@ impl Volume {
         }
         let header = object.header();
         let datatype = header.datatype;
+        let spatial_units = header.xyzt_units & 7;
         let sform = if header.sform_code != 0 {
             Some([header.srow_x, header.srow_y, header.srow_z])
         } else {
@@ -114,6 +117,7 @@ impl Volume {
         Ok(Self {
             data,
             spacing,
+            spatial_units,
             sform,
             datatype,
         })
@@ -156,6 +160,21 @@ impl Volume {
     pub fn dims(&self) -> [usize; 3] {
         let sh = self.data.shape();
         [sh[0], sh[1], sh[2]]
+    }
+    /// Conversion from header spacing units to micrometres. Unknown units
+    /// are not guessed; optionally supply NIV_SPATIAL_UNITS=mm/um/m.
+    pub fn micrometre_scale(&self) -> Option<f64> {
+        match self.spatial_units {
+            1 => Some(1_000_000.),
+            2 => Some(1_000.),
+            3 => Some(1.),
+            _ => match std::env::var("NIV_SPATIAL_UNITS").ok().as_deref() {
+                Some("mm") => Some(1_000.),
+                Some("um" | "µm") => Some(1.),
+                Some("m") => Some(1_000_000.),
+                _ => None,
+            },
+        }
     }
     pub fn depth(&self, axis: Axis) -> usize {
         self.dims()[axis.index()]
@@ -234,6 +253,7 @@ mod tests {
         Volume {
             data: Array3::from_shape_fn((3, 4, 5), |(x, y, z)| (x * 100 + y * 10 + z) as f32),
             spacing: [1., 2., 3.],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         }
@@ -262,6 +282,7 @@ mod tests {
         let v = Volume {
             data: Array3::from_shape_vec((2, 2, 1), vec![0., 10., f32::NAN, -1.]).unwrap(),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
@@ -276,6 +297,7 @@ mod tests {
             )
             .unwrap(),
             spacing: [1.; 3],
+            spatial_units: 2,
             sform: None,
             datatype: 16,
         };
