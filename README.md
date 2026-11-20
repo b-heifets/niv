@@ -423,8 +423,18 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
 ### v0.26: reference images on demand
 
 - `a`: load `$ATLAS` if no atlas is loaded; afterward toggle its visibility (independent in projection mode).
-- `Ctrl+A`: choose a solid atlas, using the same picker as images. `Ctrl+Z` opens zoxide, `Ctrl+R` opens recursive fd. Enter loads a single atlas; Space multi-marking is disabled. Custom atlases use numeric labels without a LUT by default; `Ctrl+L` enables the configured LUT (`$ATLAS_LUT` or current LUT). Selecting the configured atlas automatically uses its configured LUT. Only use a LUT whose IDs match the atlas.
+- `Ctrl+A`: choose a solid atlas, using the same picker as images. `Ctrl+Z` opens zoxide, `Ctrl+R` opens recursive fd. Enter loads a single atlas; Space multi-marking is disabled. Custom atlases use numeric labels without a LUT by default; `Ctrl+L` opens a custom CSV picker for the highlighted atlas. `Ctrl+O` enables the configured LUT (`$ATLAS_LUT`). Selecting the configured atlas automatically uses its configured LUT. Only use a LUT whose IDs match the atlas.
 - `Ctrl+T`: load/reveal `$TEMPLATE` below other layers, without duplicating an already loaded file. New templates use grayscale and AVG when projecting.
 - All volumes must be aligned to the original voxel grid. A failed atlas replacement leaves the existing atlas intact. Runtime atlas paths/settings are included in saved scenes. No atlas/template is read at startup unless requested with `-a`/`-t` or a scene.
 - Filenames containing `cluster` (case-insensitive) or a separate `ci` token default to the categorical palette. Explicit overlay tint and scene palette take precedence. Change palettes with `l`.
 - The header uses one row in the common case, reclaiming a terminal row for the image. Additional rows are allocated for overflow; the footer remains at the last terminal row.
+
+### v0.26.1: custom LUT picker, fractional spacing and wheel modifiers
+
+- In Ctrl+A, highlight an atlas and press Ctrl+L to browse for a CSV. Ctrl+Z and Ctrl+R work in the CSV picker. Enter loads the atlas with the selected LUT; Esc returns (from recursive search or zoxide, Esc first closes that submode). CSVs must use the supported UNRAVEL schema: Region_ID, Region, Abbr, R, G, B; General_Region optional. Existing atlas stays intact if loading fails. Ctrl+O selects the configured LUT instead.
+- Normal view reserves one cell where room permits and splits the spare vertical space into sub-cell gaps using Kitty Y pixel placement. Mouse hit-testing accounts for the offset. Fullscreen and montage layouts are unchanged.
+- Requests Shift mouse capture with XTSHIFTESCAPE while active, releases on exit. Shift wheel uses the 3x stride, and horizontal wheel events also navigate at 3x (Ctrl overrides at 4x). Some terminal clients intercept these events before delivery; in Ghostty try mouse-shift-capture = true if needed.
+
+## v0.26.2
+
+`niv -a` (or `niv -a atlas.nii.gz`) opens an atlas-only wireframe using a hidden reference layer. `-a -t` shows the atlas over the template. In the normal viewer, a bracketed paste containing existing NIfTI paths loads aligned image layers, including Finder drops when the terminal supplies bracketed paths. Paste is not interpreted as shell commands. Remote paths must exist on the host running niv.

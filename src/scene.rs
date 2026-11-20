@@ -576,6 +576,7 @@ pub fn config_from_args(argv: &[String]) -> Result<Config> {
     }
     Ok(Config {
         path: base.context("Scene is missing its reference image")?,
+        atlas_only: false,
         axis: Axis::parse(&scene.view.axis)?,
         initial_slice: Some(scene.view.slice),
         step: scene.view.stride,

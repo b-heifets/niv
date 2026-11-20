@@ -186,6 +186,8 @@ pub struct App {
     pub picker_cursor: Option<usize>,
     pub picker_atlas: bool,
     pub picker_atlas_lut: bool,
+    pub picker_lut_atlas: Option<PathBuf>,
+    pub picker_lut_path: Option<PathBuf>,
     pub recursive_files: Option<path_complete::RecursiveFiles>,
     pub popup: Option<Popup>,
     pub popup_scroll: usize,
@@ -265,6 +267,8 @@ impl App {
             picker_cursor: None,
             picker_atlas: false,
             picker_atlas_lut: false,
+            picker_lut_atlas: None,
+            picker_lut_path: None,
             recursive_files: None,
             popup: None,
             popup_scroll: 0,
@@ -663,6 +667,8 @@ impl App {
     fn open_picker(&mut self) -> Action {
         self.picker_atlas = false;
         self.picker_atlas_lut = false;
+        self.picker_lut_atlas = None;
+        self.picker_lut_path = None;
         self.picker_jump_from = None;
         self.directory_picker = None;
         self.picker_cursor = None;
@@ -684,7 +690,7 @@ impl App {
             .map(|m| path_complete::resolve(&m.directory))
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("."));
-        match path_complete::RecursiveFiles::load(root) {
+        match path_complete::RecursiveFiles::load_kind(root, self.picker_lut_atlas.is_some()) {
             Ok(files) => {
                 editor.text.clear();
                 editor.completion = Some(files.filter(""));
@@ -698,12 +704,38 @@ impl App {
     }
     fn picker_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Action {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-        if self.picker_atlas
-            && self.picker_jump_from.is_none()
-            && (key == KeyCode::Char('\x0c') || ctrl && matches!(key, KeyCode::Char('l' | 'L')))
-        {
-            self.picker_atlas_lut = !self.picker_atlas_lut;
-            return Action::Layout;
+        let csv = self.picker_lut_atlas.is_some();
+        if self.picker_atlas && !csv && self.picker_jump_from.is_none() {
+            if key == KeyCode::Char('\x0f') || ctrl && matches!(key, KeyCode::Char('o' | 'O')) {
+                self.picker_atlas_lut = !self.picker_atlas_lut;
+                return Action::Layout;
+            }
+            if key == KeyCode::Char('\x0c') || ctrl && matches!(key, KeyCode::Char('l' | 'L')) {
+                let editor = self.edit.as_mut().expect("atlas picker open");
+                let path = editor
+                    .completion
+                    .as_ref()
+                    .and_then(|m| m.selected())
+                    .map(|m| path_complete::resolve(&m.path))
+                    .unwrap_or_else(|| path_complete::resolve(&editor.text));
+                if !path_complete::is_nifti_file(&path) {
+                    editor.error = Some("Highlight the atlas NIfTI first, then Ctrl+L".into());
+                    return Action::Layout;
+                }
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                editor.text = path
+                    .parent()
+                    .map(|p| format!("{}/", p.display()))
+                    .unwrap_or_default();
+                editor.completion = Some(path_complete::search_kind(&editor.text, true));
+                editor.error = None;
+                editor.checked.clear();
+                self.picker_lut_atlas = Some(path);
+                self.picker_lut_path = None;
+                self.recursive_files = None;
+                self.picker_cursor = None;
+                return Action::Layout;
+            }
         }
         if key == KeyCode::Char('\x19') || ctrl && matches!(key, KeyCode::Char('y' | 'Y')) {
             if let Some(dir) = self
@@ -753,7 +785,7 @@ impl App {
                         self.recursive_files = None;
                         editor.text = dir;
                         self.picker_cursor = None;
-                        editor.completion = Some(path_complete::search(&editor.text));
+                        editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                         editor.error = None;
                     }
                     Err(e) => editor.error = Some(e),
@@ -815,7 +847,7 @@ impl App {
             if key == KeyCode::Esc {
                 editor.text = files.root.to_string_lossy().into_owned();
                 editor.text.push('/');
-                editor.completion = Some(path_complete::search(&editor.text));
+                editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                 editor.error = None;
                 self.recursive_files = None;
                 self.picker_cursor = None;
@@ -868,7 +900,7 @@ impl App {
             false,
         ) {
             path_complete::FilterEdit::Changed => {
-                editor.completion = Some(path_complete::search(&editor.text));
+                editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                 editor.error = None;
                 return Action::Layout;
             }
@@ -877,7 +909,16 @@ impl App {
         }
         match key {
             KeyCode::Esc => {
-                self.edit = None;
+                if let Some(atlas) = self.picker_lut_atlas.take() {
+                    self.picker_lut_path = None;
+                    self.picker_cursor = None;
+                    editor.text = atlas.to_string_lossy().into_owned();
+                    editor.completion = Some(path_complete::search_kind(&editor.text, false));
+                    editor.error = None;
+                    editor.checked.clear();
+                } else {
+                    self.edit = None;
+                }
                 Action::Layout
             }
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
@@ -894,10 +935,11 @@ impl App {
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 if let Some(matches) = editor.completion.as_mut() {
-                    path_complete::advance(
+                    path_complete::advance_kind(
                         &mut editor.text,
                         matches,
                         key == KeyCode::BackTab || modifiers.contains(KeyModifiers::SHIFT),
+                        csv,
                     );
                     self.picker_cursor = None;
                 }
@@ -906,7 +948,7 @@ impl App {
             KeyCode::Left => {
                 editor.text = path_complete::parent_filter(&editor.text);
                 self.picker_cursor = None;
-                editor.completion = Some(path_complete::search(&editor.text));
+                editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                 editor.error = None;
                 Action::Layout
             }
@@ -915,11 +957,11 @@ impl App {
                 if let Some(m) = editor.completion.as_ref().and_then(|m| m.selected()) {
                     if m.is_dir {
                         editor.text = m.path.clone();
-                        editor.completion = Some(path_complete::search(&editor.text));
+                        editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                         editor.error = None;
                     } else {
                         editor.text = m.path.clone();
-                        editor.completion = Some(path_complete::search(&editor.text));
+                        editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                     }
                 }
                 Action::Layout
@@ -965,9 +1007,17 @@ impl App {
                     }
                     editor.text = dir;
                     self.picker_cursor = None;
-                    editor.completion = Some(path_complete::search(&editor.text));
+                    editor.completion = Some(path_complete::search_kind(&editor.text, csv));
                     editor.error = None;
                     return Action::Layout;
+                }
+                if csv {
+                    if !path_complete::is_csv_file(&path) {
+                        editor.error = Some("Choose an existing CSV LUT".into());
+                        return Action::Layout;
+                    }
+                    self.picker_lut_path = Some(std::fs::canonicalize(&path).unwrap_or(path));
+                    return Action::LoadAtlas(self.picker_lut_atlas.clone());
                 }
                 if !path_complete::is_nifti_file(&path) {
                     editor.error = Some(format!(
@@ -1947,7 +1997,7 @@ mod tests {
             &mut app,
             &vol,
             &mut layers,
-            KeyCode::Char('l'),
+            KeyCode::Char('o'),
             KeyModifiers::CONTROL,
         );
         assert!(app.picker_atlas_lut);
@@ -1975,8 +2025,50 @@ mod tests {
                 KeyCode::Enter,
                 KeyModifiers::NONE
             ),
-            Action::LoadAtlas(Some(atlas))
+            Action::LoadAtlas(Some(atlas.clone()))
         );
+        let csv = root.join("colors.csv");
+        std::fs::write(&csv, b"").unwrap();
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL
+            ),
+            Action::Layout
+        );
+        assert_eq!(
+            app.picker_lut_atlas,
+            Some(std::fs::canonicalize(&atlas).unwrap())
+        );
+        let editor = app.edit.as_mut().unwrap();
+        editor.text = csv.to_string_lossy().into_owned();
+        editor.completion = Some(path_complete::search_kind(&editor.text, true));
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ),
+            Action::LoadAtlas(Some(std::fs::canonicalize(&atlas).unwrap()))
+        );
+        assert_eq!(
+            app.picker_lut_path,
+            Some(std::fs::canonicalize(&csv).unwrap())
+        );
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(app.picker_lut_atlas.is_none());
+        assert!(app.picker_lut_path.is_none());
         std::fs::remove_dir_all(root).unwrap();
         key(
             &mut app,

@@ -15,6 +15,7 @@ pub struct OverlaySpec {
 
 pub struct Config {
     pub path: PathBuf,
+    pub atlas_only: bool,
     pub axis: Axis,
     pub initial_slice: Option<usize>,
     pub step: usize,
@@ -46,6 +47,7 @@ pub struct Config {
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE/GLOB ... [OPTIONS]
        niv -i FILE/GLOB ... [OPTIONS]
+       niv -a [ATLAS.nii.gz]
        niv --scene FILE.niv.toml
 Defaults: --axis x --rotate 90; no atlas or template unless requested.
 -a [FILE] atlas ($ATLAS); -t [FILE] template ($TEMPLATE). Put bare flags last.
@@ -100,6 +102,7 @@ LAYERS AND ATLAS
       --overlay-color RRGGBB      Most recent overlay fixed tint
       --overlay-opacity 0..1      Most recent overlay opacity (default 1)
   -a, --atlas [FILE]              Solid ID-label atlas; FILE or $ATLAS (opt-in)
+                                   With no image, display only the atlas wireframe.
       --atlas-wireframe FILE      Precomputed ID/binary wireframe; overrides $ATLAS
       --atlas-labels FILE         Companion solid atlas for wireframe inspection
       --lut FILE.csv              LUT; default $ATLAS_LUT when atlas is present
@@ -440,8 +443,13 @@ fn parse_args_with_template(
     if atlas_labels_path.is_some() && (!atlas_wireframe || atlas_path.is_none()) {
         bail!("--atlas-labels is only used with --atlas-wireframe");
     }
+    let atlas_only = path.is_none() && atlas_path.is_some();
+    if atlas_only {
+        path = atlas_path.clone();
+    }
     Ok(Some(Config {
         path: path.context("Missing NIfTI file. See: niv --help")?,
+        atlas_only,
         axis,
         initial_slice,
         step,
@@ -655,6 +663,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.path, PathBuf::from("template.nii.gz"));
+    }
+    #[test]
+    fn atlas_only_uses_atlas_as_reference() {
+        let c = parse_args_with_template(vec!["-a".into(), "atlas.nii.gz".into()], None)
+            .unwrap()
+            .unwrap();
+        assert!(c.atlas_only);
+        assert_eq!(c.path, PathBuf::from("atlas.nii.gz"));
+        assert_eq!(c.atlas_path.as_ref(), Some(&c.path));
+        let c = parse_args_with_template(
+            vec!["image.nii.gz".into(), "-a".into(), "atlas.nii.gz".into()],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!c.atlas_only);
     }
     #[test]
     fn explicit_atlas_and_template_paths() {

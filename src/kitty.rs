@@ -35,15 +35,20 @@ pub fn send<W: Write>(
     image_id: u32,
     frame: &Encoded,
     geom: Geometry,
+    y_offset: usize,
 ) -> io::Result<()> {
     let mut chunks = frame.payload.as_bytes().chunks(CHUNK).peekable();
     if let Some(first) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
         write!(
             out,
-            "\x1b_Ga=T,f={},t=d,o=z,s={},v={},i={image_id},c={},r={},C=1,q=1,m={more};",
+            "\x1b_Ga=T,f={},t=d,o=z,s={},v={},i={image_id},c={},r={},C=1,q=1,",
             frame.format, geom.width, geom.height, geom.cols, geom.rows
         )?;
+        if y_offset > 0 {
+            write!(out, "Y={y_offset},")?;
+        }
+        write!(out, "m={more};")?;
         out.write_all(first)?;
         out.write_all(b"\x1b\\")?;
         while let Some(chunk) = chunks.next() {
@@ -65,9 +70,10 @@ pub fn replace<W: Write>(
     image_id: u32,
     frame: &Encoded,
     geom: Geometry,
+    y_offset: usize,
     previous_id: Option<u32>,
 ) -> io::Result<()> {
-    send(out, image_id, frame, geom)?;
+    send(out, image_id, frame, geom, y_offset)?;
     if let Some(previous) = previous_id {
         delete(out, previous)?;
     }
@@ -93,11 +99,24 @@ mod tests {
             height: 1,
         };
         let mut output = Vec::new();
-        replace(&mut output, 51, &frame, geom, Some(50)).unwrap();
+        replace(&mut output, 51, &frame, geom, 0, Some(50)).unwrap();
         let sequence = String::from_utf8(output).unwrap();
         let new_at = sequence.find("i=51").unwrap();
         let old_at = sequence.find("a=d,d=I,i=50").unwrap();
         assert!(new_at < old_at);
+    }
+    #[test]
+    fn supports_subcell_vertical_placement() {
+        let frame = encode_pixels(&[0; 3], false).unwrap();
+        let geom = Geometry {
+            cols: 1,
+            rows: 1,
+            width: 1,
+            height: 1,
+        };
+        let mut output = Vec::new();
+        send(&mut output, 7, &frame, geom, 6).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains(",Y=6,m="));
     }
     #[test]
     fn rgb_and_rgba_have_distinct_format_headers() {
@@ -110,7 +129,7 @@ mod tests {
                 height: 1,
             };
             let mut output = Vec::new();
-            send(&mut output, 100, &frame, geom).unwrap();
+            send(&mut output, 100, &frame, geom, 0).unwrap();
             let txt = String::from_utf8(output).unwrap();
             assert!(txt.contains(format));
         }
@@ -129,7 +148,7 @@ mod tests {
             height: 300,
         };
         let mut result = Vec::new();
-        send(&mut result, 42, &frame, geom).unwrap();
+        send(&mut result, 42, &frame, geom, 0).unwrap();
         let text = String::from_utf8(result).unwrap();
         assert!(text.starts_with("\x1b_Ga=T,f=32,t=d,o=z,s=400,v=300,i=42,c=20,r=10,C=1,q=1,m="));
         assert!(text.ends_with("\x1b\\"));

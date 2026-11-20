@@ -16,8 +16,9 @@ use app::{Action, App, EditField, Popup};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
     style::{
@@ -65,14 +66,21 @@ impl TerminalGuard {
             let _ = terminal::disable_raw_mode();
             return Err(err.into());
         }
+        // XTSHIFTESCAPE: request Shift mouse reporting while this TUI runs.
+        // Unsupported terminals may ignore it. Reset on exit.
+        let _ = io::stdout().write_all(b"\x1b[>1s");
+        let _ = io::stdout().flush();
         if mouse_pixels {
             io::stdout().write_all(b"\x1b[?1016h")?;
             io::stdout().flush()?;
         }
-        Ok(Self {
+        // Enable paste events only after terminal initialization succeeds.
+        let guard = Self {
             enhanced_keys,
             mouse_pixels,
-        })
+        };
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        Ok(guard)
     }
 }
 impl Drop for TerminalGuard {
@@ -81,7 +89,8 @@ impl Drop for TerminalGuard {
         if self.mouse_pixels {
             let _ = out.write_all(b"\x1b[?1016l");
         }
-        let _ = execute!(out, DisableMouseCapture);
+        let _ = out.write_all(b"\x1b[>0s");
+        let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture);
         if self.enhanced_keys {
             let _ = execute!(out, PopKeyboardEnhancementFlags);
         }
@@ -141,6 +150,7 @@ struct ViewLayout {
     geom: render::Geometry,
     x: u16,
     y: u16,
+    y_offset: usize,
     footer: u16,
     head: u16,
     list_start: usize,
@@ -270,7 +280,10 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
     // Cap header growth so small panes always retain a usable image area.
     let max_head = rows.saturating_sub(footer_rows + 1).max(head).min(8);
     loop {
-        let reserved = (head + footer_rows) as usize;
+        let gap = usize::from(
+            !app.fullscreen && !app.montage.enabled && rows.saturating_sub(head + footer_rows) > 2,
+        );
+        let reserved = (head + footer_rows) as usize + gap;
         let geom = if app.montage.enabled {
             montage::plan(vol, app, cols, rows, reserved).geom
         } else {
@@ -278,7 +291,15 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
         };
         let available = rows.saturating_sub(head + footer_rows);
         let x = cols.saturating_sub(geom.cols) / 2;
-        let y = head + available.saturating_sub(geom.rows) / 2;
+        let spare = available.saturating_sub(geom.rows);
+        let y = head + spare / 2;
+        // Split one spare cell into a half-cell gap at either end. No padding
+        // pixels are encoded; Kitty Y places the image below the text.
+        let y_offset = if gap > 0 && spare % 2 == 1 {
+            render::cell_pixels(cols, rows).1 / 2
+        } else {
+            0
+        };
         if app.fullscreen
             || head >= max_head
             || pack_header(&estimate, &header_widths(first, head, cols, x, geom.rows)).1
@@ -288,6 +309,7 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
                 geom,
                 x,
                 y,
+                y_offset,
                 footer: rows.saturating_sub(footer_rows),
                 head,
                 list_start,
@@ -308,6 +330,7 @@ fn layer_list_rows(count: usize) -> usize {
 fn layout_changed(old: ViewLayout, new: ViewLayout) -> bool {
     old.x != new.x
         || old.y != new.y
+        || old.y_offset != new.y_offset
         || old.footer != new.footer
         || old.head != new.head
         || old.list_count != new.list_count
@@ -1329,11 +1352,15 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
     } else if let Some(matches) = &editor.completion {
         panel.title(
             out,
-            match (app.picker_atlas, app.recursive_files.is_some()) {
-                (true, true) => "fd · Find atlas",
-                (true, false) => "Load solid label atlas",
-                (false, true) => "fd · Find NIfTI images recursively",
-                (false, false) => "Load NIfTI images",
+            if app.picker_lut_atlas.is_some() {
+                "Choose atlas LUT CSV"
+            } else {
+                match (app.picker_atlas, app.recursive_files.is_some()) {
+                    (true, true) => "fd · Find atlas",
+                    (true, false) => "Load solid label atlas",
+                    (false, true) => "fd · Find NIfTI images recursively",
+                    (false, false) => "Load NIfTI images",
+                }
             },
         )?;
         panel.search(
@@ -1347,10 +1374,16 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         } else {
             &matches.directory
         };
-        let prefix = if app.picker_atlas {
+        let prefix = if let Some(atlas) = &app.picker_lut_atlas {
             format!(
-                "{} · LUT: {} · ",
-                matches.status(),
+                "{} matches · Atlas: {} · ",
+                matches.values.len(),
+                layers::short_name(atlas)
+            )
+        } else if app.picker_atlas {
+            format!(
+                "{} matches · LUT: {} · ",
+                matches.values.len(),
                 if app.picker_atlas_lut {
                     "configured"
                 } else {
@@ -1418,7 +1451,7 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
             panel.row(
                 out,
                 panel.top + 7,
-                "No matching images or directories",
+                "No matching files or directories",
                 PICKER_MUTED,
                 false,
                 false,
@@ -1427,17 +1460,17 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         let selected_path = matches.selected().map(|m| m.path.as_str()).unwrap_or("");
         panel.divider(out, bottom - 4)?;
         selected_path_line(out, panel.left + 2, bottom - 3, w, selected_path)?;
-        let status =
-            app.notice
-                .as_deref()
-                .or(editor.error.as_deref())
-                .unwrap_or(if app.picker_atlas {
-                    "↑↓ choose · Ctrl+L toggle configured LUT · one atlas only"
-                } else if app.recursive_files.is_some() {
-                    "↑↓ / Tab select · Space mark · Ctrl+Space query space · Ctrl+Y copy"
-                } else {
-                    "↑↓ choose · Tab complete · ←→ parent/child · Space mark"
-                });
+        let status = app.notice.as_deref().or(editor.error.as_deref()).unwrap_or(
+            if app.picker_lut_atlas.is_some() {
+                "↑↓ choose CSV · Ctrl+Y copy path · Esc back"
+            } else if app.picker_atlas {
+                "↑↓ choose · Ctrl+L choose CSV · Ctrl+O configured LUT"
+            } else if app.recursive_files.is_some() {
+                "↑↓ / Tab select · Space mark · Ctrl+Space query space · Ctrl+Y copy"
+            } else {
+                "↑↓ choose · Tab complete · ←→ parent/child · Space mark"
+            },
+        );
         panel.row(
             out,
             bottom - 2,
@@ -1455,7 +1488,9 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         panel.row(
             out,
             bottom - 1,
-            if app.picker_atlas {
+            if app.picker_lut_atlas.is_some() {
+                "Enter load atlas + LUT · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
+            } else if app.picker_atlas {
                 "Enter load atlas · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
             } else {
                 "Enter load · Esc back · Ctrl+Z zoxide · Ctrl+R fd · Ctrl+Y copy"
@@ -1658,7 +1693,9 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
     line(
         out,
         0,
-        if app.picker_atlas {
+        if app.picker_lut_atlas.is_some() {
+            "Choose atlas LUT CSV"
+        } else if app.picker_atlas {
             "Load solid label atlas"
         } else {
             "Load NIfTI images"
@@ -1684,10 +1721,12 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
         line(
             out,
             2,
-            &if app.picker_atlas {
+            &if app.picker_lut_atlas.is_some() {
+                format!("{} CSV matches · in {}", matches.values.len(), directory)
+            } else if app.picker_atlas {
                 format!(
                     "{} · LUT: {} · in {}",
-                    matches.status(),
+                    matches.values.len(),
                     if app.picker_atlas_lut {
                         "configured"
                     } else {
@@ -1768,8 +1807,10 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
             line(
                 out,
                 rows - 2,
-                if app.picker_atlas {
-                    "Enter atlas · Ctrl+L LUT · Ctrl+Z zoxide · Ctrl+R fd"
+                if app.picker_lut_atlas.is_some() {
+                    "Enter atlas + LUT · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
+                } else if app.picker_atlas {
+                    "Enter atlas · Ctrl+L CSV · Ctrl+O configured LUT · Ctrl+Z zoxide"
                 } else {
                     "Enter load · Esc cancel · Ctrl+Z zoxide browser · PgUp/PgDn page"
                 },
@@ -1857,7 +1898,7 @@ fn draw_popup(
                     "",
                     "ATLAS & APPEARANCE",
                     "  a load/toggle atlas · O atlas opacity",
-                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L LUT)",
+                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L choose CSV)",
                     "  Ctrl+T  Load/reveal configured template below images",
                     "  T enable/cycle major / broad / silhouette; a hide/show",
                     "  g edge AA · G atlas blur · b background · f fill",
@@ -1906,7 +1947,7 @@ fn draw_popup(
                     "",
                     "ATLAS & PROJECTION",
                     "  a      Load/toggle atlas    X / A / U  Projection max/avg/min+",
-                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L LUT)",
+                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L choose CSV)",
                     "  Ctrl+T  Load/reveal configured template below images",
                     "  g      Edge AA (optional)    V   Return to slices",
                     "  u or left click: copy hovered atlas region; OSC 52",
@@ -1945,7 +1986,7 @@ fn draw_popup(
                     "  f     Image only (no UI text) · Q montage pixel budget",
                     "  g   Edge AA    G   Atlas Gaussian blur (0..4 px)",
                     "  a   Load/toggle atlas    O   Atlas opacity",
-                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L LUT)",
+                    "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L choose CSV)",
                     "  Ctrl+T  Load/reveal configured template below images",
                     "",
                     "LAYERS",
@@ -2226,6 +2267,7 @@ fn draw(
             },
             x: 0,
             y: 0,
+            y_offset: 0,
             footer: 0,
             head: 0,
             list_start: 0,
@@ -2285,7 +2327,14 @@ fn draw(
     }
     queue!(out, MoveTo(view.x, view.y))?;
     let next = frames.allocate();
-    kitty::replace(out, next, &frame, view.geom, frames.active_id)?;
+    kitty::replace(
+        out,
+        next,
+        &frame,
+        view.geom,
+        view.y_offset,
+        frames.active_id,
+    )?;
     frames.active_id = Some(next);
     draw_ui(out, vol, layers, app, base_range, view)?;
     out.flush()?;
@@ -2295,6 +2344,17 @@ fn draw(
     stats.output += t.elapsed();
     stats.compressed_bytes += frame.bytes;
     Ok(view)
+}
+
+fn wheel_step(kind: MouseEventKind, mods: KeyModifiers) -> Option<(isize, usize)> {
+    let (direction, horizontal) = match kind {
+        MouseEventKind::ScrollUp => (1, false),
+        MouseEventKind::ScrollDown => (-1, false),
+        MouseEventKind::ScrollLeft => (1, true),
+        MouseEventKind::ScrollRight => (-1, true),
+        _ => return None,
+    };
+    Some((direction, App::multiplier(mods, horizontal)))
 }
 
 fn mouse_montage_tile(
@@ -2370,7 +2430,7 @@ fn mouse_raster(
     let display_w = geom.width as f64 * scale;
     let display_h = geom.height as f64 * scale;
     let x = mx - (box_w - display_w) * 0.5;
-    let y = my - (box_h - display_h) * 0.5;
+    let y = my - view.y_offset as f64 - (box_h - display_h) * 0.5;
     if x < 0. || y < 0. || x >= display_w || y >= display_h {
         return None;
     }
@@ -2608,17 +2668,12 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// keep the existing atlas, paths and cached projections intact.
 fn replace_atlas(
     path: &std::path::Path,
-    use_lut: bool,
+    lut: Option<std::path::PathBuf>,
     vol: &Volume,
     config: &mut config::Config,
     app: &mut App,
     layers: &mut Layers,
 ) -> Result<()> {
-    let lut = if use_lut {
-        env_path("ATLAS_LUT").or_else(|| config.lut_path.clone())
-    } else {
-        None
-    };
     let atlas = layers::load_atlas(
         path,
         vol,
@@ -2692,6 +2747,51 @@ fn reveal_template(
     Ok(())
 }
 
+/// Decode literal or shell-escaped paths from a terminal paste, never execute them.
+fn pasted_image_paths(text: &str) -> Result<Vec<std::path::PathBuf>> {
+    let text = text.trim();
+    let literal = path_complete::resolve(text);
+    if path_complete::is_nifti_file(&literal) {
+        return Ok(vec![literal]);
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\\') | (Some('"'), '\\') => {
+                let next = chars
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Incomplete path escape"))?;
+                word.push(next);
+            }
+            (None, c) if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+    if quote.is_some() {
+        bail!("Unclosed path quote");
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let paths = words
+        .iter()
+        .map(|w| path_complete::resolve(w))
+        .collect::<Vec<_>>();
+    if paths.is_empty() || paths.iter().any(|p| !path_complete::is_nifti_file(p)) {
+        bail!("Paste one or more existing .nii/.nii.gz paths on this host");
+    }
+    Ok(paths)
+}
+
 fn run() -> Result<()> {
     let Some(mut config) = config::parse()? else {
         return Ok(());
@@ -2718,6 +2818,10 @@ fn run() -> Result<()> {
         name,
     );
     app.base_palette = layers::default_palette(&config.path);
+    if config.atlas_only {
+        app.base_visible = false;
+        app.base_palette = layers::Palette::Random;
+    }
     app.pixel_budget = config.pixel_budget;
     if let Ok(value) = std::env::var("NIV_MONTAGE_PIXEL_BUDGET") {
         app.montage_pixel_budget = value
@@ -2950,6 +3054,13 @@ fn run() -> Result<()> {
                                         .as_ref()
                                         .zip(default.as_ref())
                                         .is_some_and(|(a, b)| same_file(a, b));
+                                let lut = if from_picker && app.picker_lut_atlas.is_some() {
+                                    app.picker_lut_path.clone()
+                                } else if use_lut {
+                                    env_path("ATLAS_LUT")
+                                } else {
+                                    None
+                                };
                                 let path = chosen.or(default);
                                 let result = if let Some(path) = path {
                                     app.notice =
@@ -2959,7 +3070,7 @@ fn run() -> Result<()> {
                                     }
                                     replace_atlas(
                                         &path,
-                                        use_lut,
+                                        lut,
                                         &vol,
                                         &mut config,
                                         &mut app,
@@ -2976,6 +3087,8 @@ fn run() -> Result<()> {
                                         app.recursive_files = None;
                                         app.directory_picker = None;
                                         app.picker_atlas = false;
+                                        app.picker_lut_atlas = None;
+                                        app.picker_lut_path = None;
                                         app.notice = Some("Atlas loaded".into());
                                         hover_candidate = None;
                                         hover_deadline = None;
@@ -3063,21 +3176,61 @@ fn run() -> Result<()> {
                             drop_stale_key_repeats(key, &mut deferred_event)?;
                         }
                     }
+                    Event::Paste(text) => {
+                        // Never interpret pasted text as viewer shortcuts. In ordinary
+                        // viewing mode, a file drop can load aligned intensity layers.
+                        if app.edit.is_none() && app.popup.is_none() {
+                            app.notice = Some(match pasted_image_paths(&text) {
+                                Ok(paths) => {
+                                    let mut loaded = 0;
+                                    let mut errors = Vec::new();
+                                    for path in paths {
+                                        match layers.add_overlay(&path, &vol) {
+                                            Ok(_) => loaded += 1,
+                                            Err(err) => {
+                                                errors.push(format!("{}: {err:#}", path.display()))
+                                            }
+                                        }
+                                    }
+                                    app.sync_layer_order(layers.overlays.len());
+                                    if loaded > 0 {
+                                        app.selected = app.layer_order.len() - 1;
+                                    }
+                                    if errors.is_empty() {
+                                        format!("Loaded {loaded} pasted image(s)")
+                                    } else {
+                                        format!(
+                                            "Loaded {loaded}; {} failed: {}",
+                                            errors.len(),
+                                            errors[0]
+                                        )
+                                    }
+                                }
+                                Err(err) => format!("Paste: {err:#}"),
+                            });
+                            pending_layout = true;
+                            pending_frame = true;
+                        } else if let Some(editor) = app.edit.as_mut() {
+                            editor.error =
+                                Some("Close this editor before dropping image files".into());
+                            pending_layout = true;
+                            pending_frame = true;
+                        }
+                    }
                     Event::Resize(_, _) => {
                         pending_layout = true;
                         pending_frame = true;
                         last_draw = Instant::now() - frame_interval;
                     }
                     Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight
                             if app.edit.is_none() && app.popup.is_none() =>
                         {
-                            let direction = if mouse.kind == MouseEventKind::ScrollUp {
-                                1
-                            } else {
-                                -1
-                            };
-                            let multiplier = App::multiplier(mouse.modifiers, false);
+                            let (direction, multiplier) =
+                                wheel_step(mouse.kind, mouse.modifiers).unwrap();
                             let delta = if app.montage.enabled {
                                 -direction * (app.montage.columns * multiplier) as isize
                             } else {
@@ -3206,6 +3359,27 @@ fn main() {
 mod mouse_tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    #[test]
+    fn pasted_paths_accept_spaces_and_multiple_files() {
+        let dir = std::env::temp_dir().join(format!("niv-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("first image.nii.gz");
+        let b = dir.join("second.nii");
+        std::fs::write(&a, b"").unwrap();
+        std::fs::write(&b, b"").unwrap();
+        assert_eq!(
+            pasted_image_paths(a.to_str().unwrap()).unwrap(),
+            vec![a.clone()]
+        );
+        let escaped = a.to_str().unwrap().replace(' ', "\\ ");
+        assert_eq!(
+            pasted_image_paths(&format!("{} '{}'", escaped, b.display())).unwrap(),
+            vec![a, b]
+        );
+        assert!(pasted_image_paths("not an image").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn mouse(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Moved,
@@ -3274,6 +3448,26 @@ mod mouse_tests {
         assert!(!same_navigation_key(&down, &quit));
     }
     #[test]
+    fn wheel_modifiers_and_horizontal_fallback() {
+        assert_eq!(
+            wheel_step(MouseEventKind::ScrollUp, KeyModifiers::NONE),
+            Some((1, 1))
+        );
+        assert_eq!(
+            wheel_step(MouseEventKind::ScrollDown, KeyModifiers::SHIFT),
+            Some((-1, 3))
+        );
+        assert_eq!(
+            wheel_step(MouseEventKind::ScrollLeft, KeyModifiers::NONE),
+            Some((1, 3))
+        );
+        assert_eq!(
+            wheel_step(MouseEventKind::ScrollRight, KeyModifiers::CONTROL),
+            Some((-1, 4))
+        );
+        assert_eq!(wheel_step(MouseEventKind::Moved, KeyModifiers::NONE), None);
+    }
+    #[test]
     fn mouse_uses_placement_offsets() {
         let view = ViewLayout {
             geom: render::Geometry {
@@ -3284,6 +3478,7 @@ mod mouse_tests {
             },
             x: 2,
             y: 3,
+            y_offset: 0,
             footer: 15,
             head: 2,
             list_start: 0,
@@ -3298,6 +3493,15 @@ mod mouse_tests {
             Some((20, 24))
         );
         assert_eq!(mouse_raster(view, mouse(1, 3), false, 8, 16), None);
+        let shifted = ViewLayout {
+            y_offset: 8,
+            ..view
+        };
+        assert_eq!(
+            mouse_raster(shifted, mouse(36, 80), true, 8, 16),
+            Some((20, 24))
+        );
+        assert_eq!(mouse_raster(shifted, mouse(36, 50), true, 8, 16), None);
     }
 }
 
@@ -3395,6 +3599,7 @@ mod layout_invalidation_tests {
             },
             x: 2,
             y: 3,
+            y_offset: 0,
             footer: 15,
             head: 2,
             list_start: 0,

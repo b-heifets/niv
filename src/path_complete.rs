@@ -23,7 +23,7 @@ impl PathMatches {
     pub fn status(&self) -> String {
         let count = self.values.len();
         if count == 0 {
-            "No matching NIfTI files or directories".into()
+            "No matching files or directories".into()
         } else {
             format!("{count} matches · ↑↓ choose · Tab complete/cycle · Space mark · Enter load")
         }
@@ -467,6 +467,10 @@ fn wild_match(pattern: &str, name: &str) -> bool {
 }
 
 pub fn search(input: &str) -> PathMatches {
+    search_kind(input, false)
+}
+
+pub fn search_kind(input: &str, csv: bool) -> PathMatches {
     let (dir, fragment) = dir_and_fragment(input);
     let base = if dir.is_empty() {
         PathBuf::from(".")
@@ -490,7 +494,13 @@ pub fn search(input: &str) -> PathMatches {
         }
         let is_dir = entry.path().is_dir();
         let lower = filename.to_lowercase();
-        if !is_dir && !(lower.ends_with(".nii") || lower.ends_with(".nii.gz")) {
+        if !is_dir
+            && !(if csv {
+                lower.ends_with(".csv")
+            } else {
+                lower.ends_with(".nii") || lower.ends_with(".nii.gz")
+            })
+        {
             continue;
         }
         let matches = if wildcard {
@@ -525,7 +535,7 @@ pub struct RecursiveFiles {
     files: std::rc::Rc<Vec<PathMatch>>,
 }
 impl RecursiveFiles {
-    pub fn load(root: PathBuf) -> Result<Self, String> {
+    pub fn load_kind(root: PathBuf, csv: bool) -> Result<Self, String> {
         let root = fs::canonicalize(&root).map_err(|e| format!("Cannot open search root: {e}"))?;
         let run = |exe: &str| {
             std::process::Command::new(exe)
@@ -534,7 +544,11 @@ impl RecursiveFiles {
                     "f",
                     "--print0",
                     "--absolute-path",
-                    r"(?i)\.nii(\.gz)?$",
+                    if csv {
+                        r"(?i)\.csv$"
+                    } else {
+                        r"(?i)\.nii(\.gz)?$"
+                    },
                 ])
                 .arg(&root)
                 .output()
@@ -608,13 +622,18 @@ fn common_prefix(values: &[PathMatch]) -> String {
 
 /// Tab extends a true common *prefix* if one exists, otherwise cycles the
 /// visible selection. A unique match completes directly. Shift-Tab reverses.
+#[cfg(test)]
 pub fn advance(text: &mut String, matches: &mut PathMatches, reverse: bool) {
+    advance_kind(text, matches, reverse, false);
+}
+
+pub fn advance_kind(text: &mut String, matches: &mut PathMatches, reverse: bool, csv: bool) {
     if matches.values.is_empty() {
         return;
     }
     if matches.values.len() == 1 {
         *text = matches.values[0].path.clone();
-        *matches = search(text); // Tab into directories automatically
+        *matches = search_kind(text, csv); // Tab into directories automatically
         return;
     }
     if matches.selected.is_none() && !reverse {
@@ -638,13 +657,20 @@ pub fn advance(text: &mut String, matches: &mut PathMatches, reverse: bool) {
         let prefix = common_prefix(&prefix_candidates);
         if prefix.to_lowercase().starts_with(&text.to_lowercase()) && prefix.len() > text.len() {
             *text = prefix;
-            *matches = search(text);
+            *matches = search_kind(text, csv);
             return;
         }
         matches.selected = Some(0);
     } else {
         matches.move_by(if reverse { -1 } else { 1 });
     }
+}
+
+pub fn is_csv_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("csv"))
+        && path.is_file()
 }
 
 pub fn is_nifti_file(path: &Path) -> bool {
@@ -684,6 +710,23 @@ mod tests {
         assert_eq!(m.values[0].path, "/data/first scan/Brain.nii.gz");
         assert_eq!(files.filter("first brain").values.len(), 1);
         assert!(files.filter("absent").values.is_empty());
+    }
+    #[test]
+    fn csv_search_and_completion_exclude_nifti_files() {
+        let root = test_directory();
+        let csv = root.join("region colors.CSV");
+        fs::write(&csv, b"").unwrap();
+        let mut text = format!("{}/region", root.display());
+        let mut list = search_kind(&text, true);
+        assert_eq!(list.values.len(), 1);
+        advance_kind(&mut text, &mut list, false, true);
+        assert_eq!(PathBuf::from(&text), csv);
+        assert!(is_csv_file(&csv));
+        assert!(search_kind(&format!("{}/", root.display()), true)
+            .values
+            .iter()
+            .all(|m| m.is_dir || m.path.ends_with(".CSV")));
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn parent_navigation_reverses_directory_prefix() {
