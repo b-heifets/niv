@@ -3051,6 +3051,7 @@ fn run() -> Result<()> {
     app.atlas_blur = config.atlas_blur;
     app.base_opacity = config.base_opacity;
     app.transparent_background = config.transparent_background;
+    app.reverse_key_scroll = config.reverse_key_scroll;
     app.default_window = vol.auto_window();
     app.atlas_name = config.atlas_path.as_ref().map(|p| layers::short_name(p));
     app.sync_layer_order(layers.overlays.len());
@@ -3497,6 +3498,11 @@ fn run() -> Result<()> {
                                 let mouse = coalesce_wheel(mouse, &mut deferred_event)?;
                                 let (direction, multiplier) =
                                     wheel_step(mouse.kind, mouse.modifiers).unwrap();
+                                let direction = if config.reverse_wheel_scroll {
+                                    -direction
+                                } else {
+                                    direction
+                                };
                                 let delta = direction * (app.stride * multiplier) as isize;
                                 let changed = if app.montage.enabled {
                                     app.shift_montage(&vol, delta)

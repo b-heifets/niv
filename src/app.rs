@@ -164,6 +164,7 @@ pub struct App {
     pub base_opacity: f32,
     pub base_visible: bool,
     pub transparent_background: bool,
+    pub reverse_key_scroll: bool,
     pub pixel_budget: usize,
     pub montage_pixel_budget: usize,
     pub atlas_aa: bool,
@@ -253,6 +254,7 @@ impl App {
             base_opacity: 1.0,
             base_visible: true,
             transparent_background: false,
+            reverse_key_scroll: false,
             pixel_budget: 1_000_000,
             montage_pixel_budget: 4_000_000,
             atlas_aa: false,
@@ -1968,12 +1970,16 @@ impl App {
                 } else if self.montage.enabled {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k' | 'K') => {
-                            if !self.shift_montage(vol, (self.stride * multiplier) as isize) {
+                            let sign = if self.reverse_key_scroll { -1 } else { 1 };
+                            if !self.shift_montage(vol, sign * (self.stride * multiplier) as isize)
+                            {
                                 return Action::None;
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j' | 'J') => {
-                            if !self.shift_montage(vol, -((self.stride * multiplier) as isize)) {
+                            let sign = if self.reverse_key_scroll { 1 } else { -1 };
+                            if !self.shift_montage(vol, sign * (self.stride * multiplier) as isize)
+                            {
                                 return Action::None;
                             }
                         }
@@ -2000,6 +2006,7 @@ impl App {
                         KeyCode::Up | KeyCode::Right | KeyCode::Char('k' | 'K') => 1,
                         _ => -1,
                     };
+                    let sign = if self.reverse_key_scroll { -sign } else { sign };
                     if !self.move_slices(vol, sign * (self.stride * multiplier) as isize)
                         && self.projection != ProjectionMode::Slice
                     {
@@ -3650,6 +3657,35 @@ mod tests {
         assert_ne!(app.window.1, 0.99994_f32);
     }
 
+    #[test]
+    fn reverse_arrow_direction_changes_only_slice_navigation() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 50, 1, 0, (0., 1.), "test".into());
+        key(&mut app, &vol, &mut layers, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.index, 51);
+        app.reverse_key_scroll = true;
+        key(&mut app, &vol, &mut layers, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.index, 50);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.index, 51);
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        let start = app.montage.start;
+        key(&mut app, &vol, &mut layers, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.montage.start, start - 1);
+    }
     #[test]
     fn montage_scroll_translates_all_slices_and_preserves_span() {
         let vol = example();

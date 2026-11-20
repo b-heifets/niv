@@ -21,6 +21,8 @@ pub struct Config {
     pub step: usize,
     pub base_opacity: f32,
     pub transparent_background: bool,
+    pub reverse_key_scroll: bool,
+    pub reverse_wheel_scroll: bool,
     pub hover_delay_ms: u64,
     pub atlas_opacity: f32,
     pub rotation: u16,
@@ -79,6 +81,9 @@ VIEW
       --opacity 0..1    Base image opacity (default 1)
       --background black|transparent  Kitty pixel format (default black/RGB;
                        NIV_BACKGROUND may set the default; b toggles in TUI)
+      NIV_SCROLL_KEYS=normal|reverse    Reverse arrow and j/k slice scrolling
+      NIV_SCROLL_WHEEL=normal|reverse   Reverse trackpad and mouse-wheel scrolling
+                       Terminal input cannot reliably distinguish those devices.
       --hover-delay-ms N  Idle milliseconds before highlighting a hovered atlas
                        region (default 20ms; NIV_HOVER_DELAY_MS; 0 disables highlight)
       --fps N            Maximum redraw FPS (default 30; NIV_FPS)
@@ -187,6 +192,8 @@ fn parse_args_with_template(
     let mut base_opacity = 1.0f32;
     let mut transparent_background =
         parse_background(&env::var("NIV_BACKGROUND").unwrap_or_else(|_| "black".to_owned()))?;
+    let reverse_key_scroll = scroll_direction_from_env("NIV_SCROLL_KEYS")?;
+    let reverse_wheel_scroll = scroll_direction_from_env("NIV_SCROLL_WHEEL")?;
     let mut hover_delay_ms = env::var("NIV_HOVER_DELAY_MS")
         .ok()
         .map(|v| parse_delay(&v))
@@ -458,6 +465,8 @@ fn parse_args_with_template(
         base_opacity,
         atlas_opacity,
         transparent_background,
+        reverse_key_scroll,
+        reverse_wheel_scroll,
         hover_delay_ms,
         overlays,
         atlas_path,
@@ -539,6 +548,19 @@ fn parse_pixel_budget(s: &str) -> Result<usize> {
         bail!("Pixel budget must be between 0 and 10000000");
     }
     Ok(n)
+}
+
+pub(crate) fn scroll_direction_from_env(name: &str) -> Result<bool> {
+    let value = env::var(name).unwrap_or_else(|_| "normal".to_owned());
+    parse_scroll_direction(&value).with_context(|| format!("Invalid {name}"))
+}
+
+fn parse_scroll_direction(s: &str) -> Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "normal" => Ok(false),
+        "reverse" => Ok(true),
+        _ => bail!("Scroll direction must be normal or reverse"),
+    }
 }
 
 fn parse_background(s: &str) -> Result<bool> {
@@ -735,6 +757,12 @@ mod tests {
         assert!(cfg.overlays[1].path.ends_with("y_1.nii"));
         assert!(expand_images(&format!("{}/z*.nii.gz", root.display())).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn scroll_direction_validation() {
+        assert_eq!(parse_scroll_direction("normal").unwrap(), false);
+        assert_eq!(parse_scroll_direction("REVERSE").unwrap(), true);
+        assert!(parse_scroll_direction("sideways").is_err());
     }
     #[test]
     fn test_window() {

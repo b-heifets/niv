@@ -584,6 +584,8 @@ pub fn config_from_args(argv: &[String]) -> Result<Config> {
         window: None,
         base_opacity: 1.0,
         transparent_background: scene.render.background == "transparent",
+        reverse_key_scroll: crate::config::scroll_direction_from_env("NIV_SCROLL_KEYS")?,
+        reverse_wheel_scroll: crate::config::scroll_direction_from_env("NIV_SCROLL_WHEEL")?,
         hover_delay_ms: scene.render.hover_delay_ms,
         atlas_opacity: scene.atlas.as_ref().map_or(1.0, |a| a.opacity),
         overlays,

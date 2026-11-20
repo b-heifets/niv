@@ -1,466 +1,187 @@
-# niv v0.23.1
+# niv
 
-Fast, keyboard-driven NIfTI stack viewer for Ghostty / Rex / Kitty-graphics terminals, written in Rust. Loads a `.nii` or `.nii.gz` volume into RAM, draws grayscale or color-mapped slices, composites additional aligned intensity layers, and optionally draws colored CCF atlas contours above them.
+**A fast, keyboard-first NIfTI viewer for the terminal.**
 
-## Install / upgrade
+`niv` is a Rust terminal UI for browsing `.nii` and `.nii.gz` volumes, combining aligned image layers, and inspecting anatomical atlas regions. It draws its image using the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) and is designed for local terminals such as Ghostty and remote workflows using Rex/SSH.
+
+![niv slice viewer showing an anatomical template, color-coded cluster map, and CCFv3 atlas wireframe outlines](assets/niv-viewer.webp)
+
+*Slice view — registered anatomical template, categorical cluster overlay, and colored CCFv3 atlas boundaries.*
+
+> **Status:** Active development / experimental. Most use has been on macOS with Ghostty and Rex. Other Kitty-compatible terminals may work, but behavior depends on the terminal's graphics, mouse and keyboard support.
+
+## Features
+
+- **Responsive slice browsing** in the X, Y or Z array axis, with independent orientation settings and a keyboard, trackpad or wheel.
+- **Multiple image layers** with reorder, hide/show, adjustable intensity windows, opacity, and grayscale, warm, cool, or deterministic categorical colors.
+- **Anatomical atlas wireframes** from a solid label volume, with region names/IDs from an optional CSV lookup table (LUT), hover inspection, and color-coded contours.
+- **Per-layer projections**: maximum, average, and minimum-positive projections; cached after first calculation.
+- **Montage viewing** with configurable bounds, spacing, rows/columns, and resolution, intended for preparing figures.
+- **File discovery** with a searchable image picker, recursive `fd` search, and optional `zoxide` directory navigation; optional paths pasted or dropped from the terminal.
+- **Saved `.niv.toml` scenes** for restoring the image stack and many viewer settings.
+- **24-bit RGB or 32-bit RGBA** output: opacity and threshold transparency work *between layers* in either mode; RGBA permits the terminal background to show through empty pixels.
+
+`niv` does **not** currently perform registration or resampling. Image layers and atlas volumes must have the same voxel grid. Array axes are not automatically reoriented to anatomical world space.
+
+## Screenshots
+
+### Maximum-intensity projection
+
+![Sagittal maximum-intensity projection with a grayscale template and categorical cluster overlays](assets/niv-projection.webp)
+
+*Independent per-layer projections: an anatomical template with superimposed cluster labels. Projection results are cached so window and opacity adjustments do not require re-projecting the volume.*
+
+### Montage
+
+![Three-by-four montage of coronal brain slices showing an anatomical template, colored clusters, and atlas contours](assets/niv-montage.webp)
+
+*Multi-slice montage with adjustable bounds, slice interval, grid layout, and rendering resolution.*
+
+### Image picker
+
+![Terminal file picker with filename filtering and a marked NIfTI image](assets/niv-picker.webp)
+
+*Interactive NIfTI loading with substring filtering and multi-selection; recursive `fd` search and `zoxide` directory navigation are also available.*
+
+These images are bundled as compressed, lossless WebP assets. Full-resolution screenshots and additional views can be added to the project documentation later.
+
+## Requirements
+
+- Rust and Cargo (Rust **1.85 or newer** per `Cargo.toml`; a newer stable toolchain is recommended).
+- A terminal that supports the Kitty graphics protocol; Ghostty is the main development target.
+- Optional: [`fd`](https://github.com/sharkdp/fd) for recursive file search and [`zoxide`](https://github.com/ajeetdsouza/zoxide) for ranked directory navigation.
+- Optional: Rex for remote terminal sessions. `niv` does not link to Rex or libghostty.
+
+## Installation
 
 ```bash
-cd ~/Documents/_GitHub/niv
-# Extract the latest source-only update here.
-cargo fmt
+git clone https://github.com/b-heifets/niv.git
+cd niv
 cargo test
-cargo install --path . --force
-niv --version       # 0.23.1
+cargo install --path . --locked
+niv -v
 ```
 
-Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP includes updated Rust source files, `Cargo.toml`, `README.md`, and an example scene, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
+For a development checkout, use `cargo build --release` and run `./target/release/niv`. You can install that build with `cargo install --path .`. Commit `Cargo.lock` when publishing an executable application; `--locked` requires it.
 
-## Viewer
+## Quick start
 
 ```bash
-niv brain.nii.gz                           # defaults to --axis x --rotate 90
-niv brain.nii.gz activation.nii.gz
-niv -i brain.nii.gz activation.nii.gz
-niv brain.nii.gz --overlay activation.nii.gz
-niv brain.nii.gz -i activation_a.nii.gz activation_b.nii.gz
-niv brain.nii.gz -i '*zstat*.nii.gz' '*clusters*.nii.gz'
-niv brain.nii.gz -i 'stats/*fstat*.nii.gz' -i 'other/*tstat*.nii.gz'
-niv brain.nii.gz --background transparent # start in RGBA mode
-niv brain.nii.gz --hover-delay-ms 250       # delay before thicker hovered-region contour
-niv brain.nii.gz -a --atlas-aa                 # optional smoother atlas edges
-niv brain.nii.gz --fps 20 --profile        # if Rex still queues images after key release
+niv image.nii.gz                              # single image, no atlas by default
+niv template.nii.gz clusters.nii.gz -a         # cluster layer + configured atlas
+niv -i image_1.nii.gz image_2.nii.gz           # multiple images
+niv image.nii.gz -a -t                        # add configured atlas and template
+niv -a                                       # configured atlas only
+niv image.nii.gz -a /path/to/atlas.nii.gz --lut /path/to/regions.csv
+niv image.nii.gz --background transparent
+niv image.nii.gz --profile
+niv --scene analysis.niv.toml
 ```
 
-The screen has voxel coordinates and visible-layer values at the upper left, a centered colored region name, and `Press ? for help` at upper right on the same line. Overflow uses the empty left image gutter where possible, or additional header rows in narrow panes; long region names are clipped to avoid collisions. The reserved header size is based on the loaded layer ranges rather than hovered values to avoid image resizing during inspection. A fractional-cell inset separates the header from the image. Axis and slice information remain available with `i`. The **full-width rounded selected-layer panel below the image** shows `1: image | min: … | max: … | α: …`. Names use a middle ellipsis if space is tight; Tab reveals a list of layers in **top-to-bottom order**, while `i` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
+The first ordinary image is the reference grid. Loaded images appear in the **top-to-bottom** layer list, with the atlas drawn over all intensity layers. For a bare `-a` or `-t`, place the flag **after** image filenames so the next filename is not interpreted as its explicit argument. Quoted glob patterns can be supplied with `-i` and expanded by `niv`.
 
-### Keys
+Press **`?`** inside the viewer for the complete, context-sensitive key reference. `niv -h` shows brief CLI help; `niv --help` documents options.
 
-| Key | Function |
+### Everyday shortcuts
+
+| Key | Action |
 | --- | --- |
-| `↑↓←→`, `jk`, mouse wheel | Scroll volume slices |
-| Command + direction | ×2 where Rex/terminal forwards Command |
-| Shift + direction | ×3 |
-| Control + direction | ×4 |
-| Option/Alt + direction | ×2 fallback for Command |
-| `[` / `]` | Decrease/increase base stride by one |
-| `X` / `A` | Enter projection; set selected image max / average (`V` returns to slices) |
-| `p` | Toggle paged montage view (atlas and layers are retained) |
-| `B` / `E` | Edit montage start / stop |
-| `[` / `]` in montage | Decrease / increase slice spacing by one index |
-| `+` / `-` in montage | Zoom in / out (fewer / more rows and columns) |
-| `<` / `>` in montage | Decrease / increase tile gap by one output pixel |
-| `b` | Toggle **black/RGB** ↔ **transparent/RGBA** background |
-| `a` | Toggle atlas outlines |
-| `g` | Toggle optional antialiasing for **solid-label atlas** contours (off by default) |
-| `?` or `/` | Popup keyboard help |
-| `i` | Metadata and full layer names |
-| `n` | Open a searchable file picker; type any filename substring (case-insensitive); ↑↓ select, Tab complete/cycle, → enter directory, Space mark multiple, Enter load |
-| `1`–`9`; `;` | Select image by current stack position (1 = top); cycle beyond nine layers |
-| `w` / `{` (or `{` / `}`) | Raise / lower selected image |
-| `d` | Unload selected image (keep at least one reference image) |
-| `Y` | Copy selected image path to clipboard and yank display settings |
-| `X` in the layer list | Mark selected image for a move |
-| `p` / `P` in the layer list | Paste below / above selected image (move if cut; duplicate if yanked) |
-| `e`, `m`, `M` | Edit selected-layer range / only min / only max |
-| `0` | Reset range to actual finite min/max |
-| `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
-| `l` | Cycle gray → warm → cool → categorical integer-ID palette |
-| Tab | Open layer list (top image first); Tab or ↑/↓ selects; Shift+↑/↓ reorders; Enter/q/Esc closes |
-| Space | Toggle selected image visibility (including the original base) |
-| `I` (Shift+i) | Toggle keyboard inspection crosshair / pointer hover |
-| `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat any axis key to mirror horizontally |
-| `r`,`R` | Rotate clockwise / counterclockwise |
-| `h`,`v` | Flip horizontally / vertically |
-| `f` | Hide/show viewer text, fill terminal |
-| `Q` | Edit output pixel budget for current mode |
-| `F` / `Z` | Recursive file search / zoxide browser (outside montage) |
-| `q` | Close menu or numeric editor; quit in normal viewer |
-| Ctrl+C | Quit from any interactive menu or editor |
+| `↑` / `↓` or `j` / `k`, mouse wheel | Browse slices |
+| `x`, `c`/`y`, `z` | Switch array axis; repeat to flip horizontally |
+| `r` / `R` | Rotate current view |
+| `h`, `v` | Flip horizontally or vertically |
+| `Tab` | Open layer list; Tab cycles; `Shift+↑` / `Shift+↓` reorders |
+| `m`, `M`, `e` | Edit display minimum, maximum, or both |
+| `o`, `O` | Edit selected-layer or atlas opacity |
+| `l`, `b` | Cycle color palette / toggle background mode |
+| `a`, `t` | Load/toggle atlas or load/reveal template from configured defaults |
+| `n`, `F`, `Z` | File picker, recursive `fd` search, zoxide browser |
+| `p` | Enter/exit montage |
+| `X`, `A`, `U`, `V` | Max, average, minimum-positive projections; return to slices |
+| `s` | Save scene |
+| `i` | Image metadata and atlas region ID |
+| `f`, `q`, `Ctrl+C` | Fill viewer, quit normal mode, emergency quit |
 
-**Important:** Command/Super may be reserved by Ghostty, Rex, or the OS and not arrive as a terminal key modifier. Option/Alt has the same ×2 mapping as a fallback. Shift/Ctrl/Option support likewise depends on which input sequences your Rex client forwards.
+In menus `q` and Esc close the menu rather than immediately exiting. Background and layer-opacity changes do not rescan the volume.
 
-### Montage mode (v0.15)
+## Configuration
 
-Press **`p`** to open a montage for figure preparation. The default is a
-**3-row × 4-column** grid with zero-raster-pixel gaps and up to 12 evenly spaced
-slices including the bounds. If a solid atlas (or companion solid labels) is
-loaded, bounds trim about 10% from each end of the occupied atlas along the
-current array axis. Otherwise the central 80% of the reference grid is used.
-For an X-axis grid with 440 slices, the preferred preset instead uses indices 81–433, interval 29 (12 tiles on the first page, 13 total).
-There are no gold selection borders or slice numbers by default.
-
-| Key | Effect |
-| --- | --- |
-| `p` / `P` | Toggle montage / reset to preset |
-| `B` / `E` | Edit inclusive start / stop (zero-based slice indices) |
-| `Z` / `F` | Edit columns / rows (1–12) |
-| `U` | Edit slice interval (0 = automatic 12 slices, 1–256 manual) |
-| `D` | Edit tile gap (0–32 output pixels) |
-| `+` / `-` | Zoom in/out by decreasing/increasing grid dimensions |
-| `[` / `]` | Adjust manual slice interval |
-| `<` / `>` | Adjust tile gap |
-| ↑/↓ or wheel | Translate all displayed slices together, preserving their interval |
-| ←/→ | Adjust tile gap; PgUp/PgDn page within the selected range |
-| Hover or click | Inspect the voxel and atlas region in that tile, without changing the page |
-| `H` | Toggle delayed atlas-outline highlight for the hovered tile (off by default) |
-| `N` | Toggle slice numbers |
-| `C` | Toggle numeric cluster IDs |
-| `f` | Image-only mode for screenshots |
-| `?` or `/` | Dedicated montage help |
-
-For numeric editors, type a replacement value or use arrows to change the
-current draft. Enter applies; Esc cancels; Ctrl+U clears the draft. The grid
-fits both screen dimensions without changing aspect ratio. Manual intervals
-show additional rows when needed. The last slice is included when on the
-specified manual interval; automatic mode includes both endpoints.
-
-Cluster labels use the selected visible categorical image (`c` cycles to the
-categorical palette), or the topmost visible categorical image if the selection
-is not categorical. Positive or negative integer IDs other than zero above
-the display threshold are labeled once per slice, using the same color as the
-cluster. The renderer anchors labels near the cluster centroid at an actual
-cluster pixel, prioritizes larger regions, and omits colliding or oversized
-labels. Atlas acronym labels are not drawn by this toggle.
-
-**Atlas Gaussian blur:** `G` opens a numeric sigma editor (0–4 output pixels,
-0 disables it; arrows change by 0.25 px). `--atlas-blur SIGMA` or
-`NIV_ATLAS_BLUR` sets the initial value for ordinary image loading. The filter
-blurs premultiplied color and alpha of the wireframe only, including hover
-strokes, preserving the underlying intensity rasters. It can be used with or
-without the original `g` edge antialiasing. Blur and cluster annotations cost
-additional time; both default off for fast browsing. Blur can soften/widen
-contours and mix neighboring region colors without changing label IDs.
-
-**Performance and scenes:** The montage is one Kitty image, and its total
-raster is capped by the pixel budget. Only the visible rows are rendered.
-`s` saves the range, grid, gap, label toggles, and atlas blur with normal scene
-settings; older scenes remain readable (new fields default to off or 3 rows).
-
-### Loading many images
-
-The first ordinary image (positional or supplied with **`-i` / `--images`**) is the reference volume. Further images from either form become aligned intensity layers; multiple distinct glob patterns are supported. These are expanded by `niv` even when quoted (recommended in zsh to avoid shell `nomatch`); each pattern's matches are sorted and overlapping matches are deduplicated.
-
-```bash
-niv mean_IF.nii.gz -i 'stats/*_tstat*.nii.gz' 'stats/*_fstat*.nii.gz'
-niv mean_IF.nii.gz -i image_1.nii.gz image_2.nii.gz --atlas atlas.nii.gz
-niv mean_IF.nii.gz -i 'a/*.nii.gz' -i 'b/*.nii.gz'
-```
-
-New layers use grayscale and **100% opacity** by default. The legacy `--overlay FILE` flag still creates a warm-tinted layer and supports `--overlay-color`, `--overlay-window`, and `--overlay-opacity` options. The atlas stays on top and all images must share the reference volume's voxel grid.
-
-When already viewing an image, press **`n`** to open the file picker. Type any substring of the filename, including middle words such as `fstat` or `cluster`. The picker lists all current-directory matches, with directories first. Use ↑/↓ (or PgUp/PgDn) to highlight, Tab/Shift+Tab to complete or cycle, → to enter a directory, and **Space** to mark multiple images. Press Enter to load marked files or the highlighted file. Press Esc to return to the viewer. Full paths appear on the picker's selection line. This completion runs inside `niv`, not the shell; it doesn't require zsh or Oh My Zsh. It searches one directory at a time for responsiveness, rather than recursively indexing the entire filesystem.
-
-### How backgrounds, thresholds and opacity work
-
-**Black / RGB (default)**: Each NIfTI layer is composited into an opaque black RGB canvas **in memory**. Values at/below a layer's display minimum are skipped, so that they reveal lower layers. Partial image/atlas opacity blends with lower layers (or black). Final empty voxels are black. The terminal receives Kitty `f=24` compressed RGB bytes (3 channels/pixel).
-
-**Transparent / RGBA (`b`)**: Layers are composited in memory using straight alpha, with empty voxels remaining transparent. The terminal receives Kitty `f=32` (4 channels/pixel), allowing the Ghostty background to appear through empty pixels. Per-layer opacity and threshold behavior are the same in both modes. True final-terminal transparency requires RGBA, but **multiple-layer transparency does not**.
-
-`NIV_BACKGROUND=black|transparent` or `--background black|transparent` sets the startup mode. Black is the faster default. Performance can differ due to compression ratios and terminal/Rex transmission; it is **not guaranteed** to be exactly 25% faster.
-
-### Hovered-region highlight
-
-The feature is enabled by default with a 20ms delay. When enabled, with a **solid** atlas, entering a labeled region starts a short delay. If the pointer remains in that region past the delay, its contours are drawn thicker (3px) while other regions retain their usual outline thickness. When enabled, hover events *before* the delay only update the text line; they do not re-transmit the image. Moving between voxels of the same region does not restart the timer.
-
-Use `NIV_HOVER_DELAY_MS=20` (default) or `--hover-delay-ms 150` to tune, 0–2000 ms; `0` disables the highlight. The thicker outline needs one full redraw when the region changes. Its antialiasing now follows `g`, and the atlas strokes are composited once per pixel to prevent bright intersections. For precomputed wireframe outlines, thickening requires companion solid labels (`--atlas-labels`); without them, the outline is unchanged. A keyboard probe remains available with `I` if iOS Rex does not forward mouse-move events.
-
-### Environment variables
+Environment settings can be kept in `~/.config/niv/env.zsh`, sourced from `~/.zshrc`:
 
 ```zsh
-export ATLAS="$HOME/Documents/__Heifets_lab_data/_UNRAVEL/atlases/CCFv3-2020/30um/atlas_CCFv3_2020_30um.nii.gz"
-export ATLAS_LUT="$HOME/Documents/_GitHub/UNRAVEL/unravel/core/csvs/CCFv3-2020_regional_summary.csv"
-export NIV_BACKGROUND=black
-export NIV_HOVER_DELAY_MS=20
+[[ -f "$HOME/.config/niv/env.zsh" ]] && source "$HOME/.config/niv/env.zsh"
+```
+
+Start from [`examples/env.zsh`](examples/env.zsh). Example settings:
+
+```zsh
+export NIV_AXIS=x
+export NIV_ROTATE=90
+export NIV_BACKGROUND=transparent
 export NIV_PIXEL_BUDGET=1000000
-export NIV_FPS=30
-export NIV_ATLAS_AA=0
+export NIV_MONTAGE_PIXEL_BUDGET=4000000
+export NIV_HOVER_DELAY_MS=20
+
+# Choose which direction each input class scrolls.
+export NIV_SCROLL_KEYS=normal       # normal | reverse — arrows and j/k
+export NIV_SCROLL_WHEEL=normal      # normal | reverse — mouse wheel and trackpad
+
+# Optional paths — no atlas/template loads unless requested via -a/-t or keys.
+export ATLAS='/path/to/atlas.nii.gz'
+export ATLAS_LUT='/path/to/atlas_regions.csv'
+export TEMPLATE='/path/to/template.nii.gz'
 ```
 
-Atlas and template loading are opt-in: use `-a` or `-t` after the image arguments to use the environment defaults, or supply a path. CLI `--atlas` / `--atlas-wireframe` and `--lut` override the environment. `--axis x --rotate 90` are defaults. Image and atlas NIfTI files must share identical dimensions, voxel spacing, and sform (when present); no resampling/reorientation is performed.
+**Trackpads versus mouse wheels:** terminals typically send both as mouse-scroll events, so they share `NIV_SCROLL_WHEEL`; `niv` cannot reliably distinguish the physical input device. The `normal` setting preserves the historical `niv` scroll direction. The direction settings only reverse *slice navigation* (including montage scrolling), not menu selection, pointer movement, or montage gap controls.
 
-### Performance and profiling
-
-The default pixel budget is **1,000,000 output pixels** (the display placement retains its full terminal footprint). Lower it for high-latency Rex/Tailscale connections, or set `--pixel-budget 0` for native terminal resolution. `NIV_PIXEL_BUDGET` sets the default. The CPU renderer caches the screen-to-voxel sampling map between slice changes. Atlas strokes use a one-pass coverage buffer: line corners and intersections are no longer brightened by repeated alpha blending. For antialiasing, the centerline remains between the same voxel faces and only a soft fringe changes coverage; it does not smooth the actual stair-step label geometry. Repeated navigation keys already buffered before a redraw are discarded after one navigation increment; different keys and Quit are preserved, while a matching key-release simply ends the repeat burst. A pending image is presented before another navigation event is handled. This reduces delayed scrolling after key release, although Rex/Ghostty may still queue images asynchronously. The default redraw cap is **30 FPS** (`NIV_FPS` or `--fps`), rather than 60 FPS, to reduce terminal image backlog. Hover-region highlighting is enabled with a short 20ms delay; set `NIV_HOVER_DELAY_MS=0` to disable it and avoid those extra redraws.
-
-Use `--profile` with interactive viewing. After quitting, it reports average **rasterization**, **zlib/base64 encoding**, and **terminal write/flush** durations plus compressed payload bytes. This does not measure asynchronous terminal decode or network rendering latency.
+Use shell-scoped overrides to test before changing your defaults:
 
 ```bash
-niv brain.nii.gz --profile --pixel-budget 1000000
-niv brain.nii.gz --profile --pixel-budget 0
-niv brain.nii.gz --bench 100
+NIV_SCROLL_WHEEL=reverse niv image.nii.gz
+NIV_SCROLL_KEYS=reverse niv image.nii.gz
 ```
 
-Kitty can transmit 8-bit terminal palette indices, but those colors are tied to the terminal palette and are unsuitable for the atlas LUT and arbitrary layer colors. Paletted PNG is another future transport to benchmark, but entails encoding/decoding costs and would not be universally faster.
+### Custom keybindings
 
-### Benchmark RGB vs RGBA
+Copy the example [`examples/keys.toml`](examples/keys.toml) to `~/.config/niv/keys.toml`. It supports context-specific key aliases for viewer, layers, montage and projections. `Ctrl+C` and Esc cannot be remapped.
 
 ```bash
-niv data/sample.nii.gz --background black --bench 100
-niv data/sample.nii.gz --background transparent --bench 100
+mkdir -p ~/.config/niv
+cp examples/keys.toml ~/.config/niv/keys.toml
 ```
 
-`--bench` reports **rasterization plus zlib encoding without terminal transmission**. Compare with actual scrolling through local and remote Rex to find whether CPU rendering, encoded bytes, or terminal transfer is the bottleneck. The application is currently CPU-rendered; it does **not** use multi-threading or a GPU. For the current CPU/Kitty pipeline, avoiding alpha bytes and unnecessary redraws is a low-complexity optimization worth testing before a GPU rewrite.
+## Atlas and UNRAVEL
 
-## Limits
+`niv` is designed to work with registered volumes produced by **[UNRAVEL](https://github.com/b-heifets/UNRAVEL)**, the *UN-biased high-Resolution Analysis and Validation of Ensembles using Light sheet images* toolkit. See the [UNRAVEL documentation](https://b-heifets.github.io/UNRAVEL/index.html).
 
-- `float64` NIfTI data are converted to `f32` (hover shows seven *decimal places*, not guaranteed seven significant digits of source precision).
-- True transparent pixels require Kitty RGBA support in the terminal/Rex client. Image opacity works in RGB mode too, but with black as the final background.
-- The optional `--atlas-aa` (or `g` / `NIV_ATLAS_AA=1`) uses improved centered fractional-coverage subpixel line edges for contours generated from the **solid** atlas, which can soften jagged appearance at low pixel budgets. It is off by default because it adds raster work. It is **not** vector tracing or spline smoothing, and it does not change atlas labels or underlying voxel geometry. For precomputed wireframes, `g` can soften the dilated **hovered-region** outline when companion solid labels are loaded, but does not smooth the original mask. Hover selection draws a thicker 3-pixel contour when enabled.
-- Runtime `n` image loading and `.nii.gz` decompression are synchronous; loading several large images can briefly block the UI.
-- Hover events, Command modifier events and pixel-mouse tracking are client-dependent.
-- `cargo test` and interactive visual testing should be run locally; this source distribution was assembled where Rust's toolchain was unavailable.
+For CCFv3-2020, `niv` can use the atlas volume and the `CCFv3-2020_regional_summary.csv` LUT for anatomy names, acronyms and colors. Load the solid-label atlas using `-a` or inside the viewer; custom atlas/LUT pairs can be selected from the atlas picker. Atlas outlines are optional for ordinary image viewing, and projected outlines are disabled by default for speed.
 
-### Reordering image layers
+**Future direction:** tighter integration so UNRAVEL workflows can launch `niv` as an image viewer. `niv` is currently a separate project; integration is planned, not yet an UNRAVEL feature.
 
-Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`{`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press Tab for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; further Esc presses do nothing; use q or Ctrl+C to exit `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+## Performance notes
 
-## Save and reload scenes (v0.15)
+The viewer loads NIfTI volumes into memory. It then renders only the currently displayed slice or montage tiles. Projection results are cached as 2D intensity arrays, allowing display-window changes without re-projecting the full 3D volume.
 
-Press **`s`** in the viewer to save your current scene. An editable filename prompt
-appears, defaulting to `<base-name>.niv.toml` in the current working directory,
-or the current scene filename if you loaded a scene. Press **Enter** to save or
-**Esc** to cancel. Saving to an existing filename replaces that scene file atomically. The viewer
-requires the `.niv.toml` suffix to prevent accidentally overwriting NIfTI data.
+At low bandwidth or with high latency over Rex, try:
 
 ```bash
-niv brain.nii.gz -i zstat1.nii.gz zstat2.nii.gz  # browse and configure layers
-# press s, edit the scene filename if desired, then Enter
-niv --scene brain.niv.toml                         # restore the scene
-niv --scene brain.niv.toml --pixel-budget 200000   # optional performance override
-niv --scene brain.niv.toml --fps 20 --profile
-niv --scene examples/demo_scene.niv.toml           # bundled demonstration
+niv image.nii.gz --background black --pixel-budget 200000 --fps 20 --profile
 ```
 
-Scenes are **plain TOML text**, not shell scripts. You can edit them in Neovim,
-share them with collaborators, or commit them to Git (they don't embed image
-bytes). They restore the base and additional NIfTI paths, **top-to-bottom layer
-ordering**, each layer's visibility, grayscale/color palette, display window
-and opacity, the atlas/LUT and atlas settings, slice/axis/rotation/flips,
-selected layer, inspection state, montage range/layout, and performance defaults.
+`--profile` reports rasterization, encoding and local terminal-write times; actual remote delivery and terminal presentation may take longer. RGB is sometimes slightly faster than RGBA, but both support multilayer compositing.
 
-`[[layers]]` entries are stored **top-to-bottom**, matching the Tab layer list; exactly one has `role = "base"`.
-The atlas is represented separately and always remains the topmost layer.
-`view.selected` is zero-based (0 is the top image).
-File paths below the scene directory are saved as **relative paths**, so moving
-the scene and its data directory together works. Files elsewhere are saved as
-absolute paths. On reload, relative paths are resolved from the scene location,
-regardless of the shell working directory. A scene is intended for files on the
-**same registered voxel grid**; it does not embed or resample NIfTI data.
+## Development and attribution
 
-Use `niv --scene FILE.niv.toml` as a self-contained input mode. It deliberately
-rejects mixing in `-i`/`--atlas`/image paths; edit/save the scene or load images
-interactively instead. `--fps`, `--pixel-budget`, `--profile`, and `--bench`
-may be supplied alongside `--scene`. Standard image-loading commands remain
-unchanged.
+Project creation and ongoing development: **[Daniel Rijsketic](https://github.com/daniel-rijsketic)** (`@daniel-rijsketic`). Contributions, bugs and pull requests are welcome. Commit author attribution is preserved through Git; the hosting account (`b-heifets`) does not determine commit authorship.
 
-Scene files may include local research paths, so review them before sharing.
+This Rust project was developed with AI-assisted coding and iterative testing. Please review and test changes before relying on it in published analyses.
 
-### Projection views and layer visibility
+## Citation
 
-Press `X` for maximum intensity projection or `A` for average intensity projection
-along the current axis for the selected image. Other images default to MAX. Select
-any layer and press X, A or U to change its own method; V returns to slice view.
-Choices stay with the image when reordered and are retained during the session.
-Projections use the full depth and the mean includes finite zeros; NaN and infinite
-values are excluded. Each visible image is reduced before applying its display
-window, palette, opacity and stacking order. Cached native-resolution 2D arrays
-are reused for contrast changes, zoom, rotation, reordering and repeat visits to
-the same axis and projection mode. No projection scans occur on ordinary startup.
-Hidden images are not fully projected until displayed; their probe values are
-computed individually if needed. The cache is in memory for this session only.
+For research use, GitHub's **Cite this repository** control can generate a citation from [`CITATION.cff`](CITATION.cff), identifying **Daniel Rijsketic** as the software author. This is separate from the GitHub account hosting the repository.
 
-The atlas silhouette is the outline of the union of all nonzero finite labels
-along the projection axis. In v0.20 it is one of the choices under `T`; grouped
-contours are the default when General_Region is available. The silhouette uses
-the configured single atlas outline color, width, opacity, AA and blur. A solid atlas or companion
-solid label file is required. Toggle with `a`. Region-specific hover outlines are
-disabled in projection view; `*` in the probe coordinates represents the collapsed
-axis. Montage remains slice-based. Projection mode is not persisted in scenes.
-Categorical images are reduced numerically too, so overlapping cluster IDs or
-average IDs are not anatomically meaningful.
+## License
 
-Space toggles any selected image, including the original reference image; it
-remains loaded as the grid reference. With all images hidden, only the atlas
-and background remain. Scene files save and restore the visibility of every image.
+**GNU General Public License v3.0 (GPL-3.0-only)** — see [LICENSE](LICENSE). This matches the current UNRAVEL license; the `niv` project remains independently versioned and maintained.
 
-### v0.18.2 viewer refinements
-
-- Leaving montage (`p`) restores the previously viewed slice if the axis is unchanged, or the middle slice otherwise (including a montage opened from a scene).
-- The `n` file picker checks the highlighted file on Enter when nothing else is marked, and keeps its selection and loading progress visible until loading finishes.
-- Hidden image entries and the selected-image footer are dimmed and retain the `[off]` marker.
-- Display windows remain compact (five decimal places); `m`, `M`, and `e` accept higher-precision values and show the stored value(s) while editing. Values are stored as f32.
-- Layout changes clear the previous footer even after a range or opacity edit that requested only a raster redraw.
-
-### v0.18.3: categorical status and safe quit
-
-Visible categorical (random LUT) filenames use a stable rainbow gradient in the
-footer and layer list; numerical display settings remain neutral. Hidden
-layers retain the dimmed text and `[off]` marker. This is text styling only.
-
-`q` closes the active help/info popup, layer list or numeric editor before it
-can quit the viewer. In file-search and scene-filename editors, `q` remains
-a literal character; use Esc to cancel. Ctrl+C bypasses modal key handlers
-and quits when the event loop can process it. Synchronous file loading may
-need to finish first. Reported q repeat events are ignored outside text fields.
-
-### v0.19: multi-image startup and per-image projection
-
-`niv template.nii.gz clusters.nii.gz` and `niv -i template.nii.gz clusters.nii.gz`
-are equivalent. The first image is the reference and top image (under the atlas); additional startup images are stacked below it in argument order. Quoted glob patterns expand in sorted order per
-pattern; multiple patterns or repeated `-i` groups are accepted.
-
-Select a layer and press X (maximum), A (average), or U (minimum positive). All visible images project
-along the same axis, each using its own method, with MAX as the default for
-other images. The layer list and selected-layer footer show [MAX], [AVG] or [MIN+].
-V returns to slices. The dedicated projection help is available with ?.
-Projection choices are retained in memory, but are not saved in scenes.
-Categorical filenames now use one interpolated RGB color per character.
-
-### v0.20: top-first startup order, projection outlines and shortcuts
-
-- `niv -v` prints the version; CLI `--help` lists options, and `?` opens mode-specific keyboard help.
-- Startup image arguments are top-to-bottom: layer 1 is the first image, under the fixed atlas. The original reference volume still defines the voxel grid. Reordering renumbers layers top-to-bottom and selection follows the moved image; `w` raises and `{` lowers. Newly loaded runtime images remain topmost beneath the atlas. Existing scenes retain their stored stack.
-- `x`, `c` (or `y`), `z` select X, Y, Z axes. Repeating x/z mirrors the displayed image horizontally; max/mean/min projections are depth-order invariant, so this is not a different depth projection. `l` cycles the color map (no longer vim-right; use the right arrow).
-- `u` or left click over a named atlas region requests clipboard copy of its abbreviation and name (OSC 52, subject to client permissions). Available in slice view only.
-- `i` describes the selected image.
-- `U` chooses the smallest finite positive intensity along a ray; an empty ray becomes zero. For positive size-ranked cluster IDs (1 = largest), MAX favors smaller clusters; MIN+ favors larger clusters. Neither resolves all overlaps: use multiple axes or montage to view all clusters.
-- In projection mode `T` cycles major divisions (default), broad group, brain silhouette, and none. Every group is projected as an independent binary mask and its voxel-face outline cached on demand. Groups may overlap; coincident strokes use deterministic draw priority. Group color is the LUT color of its lowest-ID member, except cerebellum uses a single pale yellow. These are display groups, not new Allen labels. If General_Region is missing, the brain silhouette is used; if the atlas is only a wireframe, companion solid labels are required. Normal slices and startup perform no grouped projection work.
-- Projection methods and outline detail are session-only; old scene files still load and maintain stored stack order.
-
-### v0.21: image registers, independent orientation and simpler outlines
-
-- `i` opens/closes information; `I` toggles keyboard probe vs mouse hover in slice mode.
-- `Y` copies the selected relative path where possible via OSC 52 and remembers its window, palette, opacity, visibility and projection method. Open the Tab layer list, select an insertion point, and use `p` below or `P` above. A yank paste reloads the image as an independent layer; no file is copied or modified on disk.
-- `X` in the layer list marks a layer `[cut]` without unloading it. Navigate to the target and paste below/above; this moves the existing layer with no voxel copy. Closing the list cancels the pending move. Outside the layer list, `X` still sets MAX. `A` and `U` still set projection methods in the list.
-- `d` unloads the selected image. If the original reference is unloaded, another aligned image becomes the reference, retaining all layer settings and projection cache identity. The last image cannot be unloaded; Space can hide it for an atlas-only view.
-- Each axis remembers its own rotation and flips for the current session. Scenes still store only the active axis transform.
-- `T` in projection mode cycles major divisions, broad regions, whole-brain silhouette, none. Major mode combines selected anatomical divisions; both grouped modes merge all cerebellar cortex/nuclei and omit ventricular and fiber-tract outlines. Enclosed holes in projected masks are filled before drawing their exterior faces. Disconnected components and overlapping groups can still have distinct outlines. This is a presentation-only simplification, not a modification of the atlas or a surface rendering. Contiguous collinear edges are merged to reduce stroke work, and masks use a direct lookup for compact label IDs. Group preparation is lazy and cached by axis and detail.
-
-### v0.22: opt-in projection atlas, compact numeric readouts, template and zoxide
-
-- Projection outlines start **off**. `a` toggles them without changing slice-view atlas visibility; `T` enables or cycles major, broad, and silhouette styles. The chosen style and visibility are remembered for the current session. Grouped projections contain only their regional contours; no extra brain silhouette is drawn or computed. Missing regional metadata requires selecting the silhouette explicitly. Existing cached outlines remain reusable.
-- Repeating `y` or its alias `c` flips the axial image horizontally, just like `x` and `z`. Axis transforms remain independent.
-- Integer-valued probe intensities and selected-layer bounds are displayed without trailing zeros. Fractional probe intensities retain seven decimal places; window settings retain five where appropriate, with additional precision for near-integer thresholds. The editor and stored f32 values are unchanged.
-- Set `TEMPLATE` to a registered grayscale volume in your sourced zsh configuration. `niv --template` opens it alone; `niv clusters.nii.gz --template` adds it as the bottom image. It is not loaded implicitly, and existing CLI and scene loading are unchanged.
-- In the `n` file picker, Ctrl+Z opens the ranked zoxide directory browser (see below).
-
-### v0.23: safe Escape and interactive directory preview
-
-Escape closes the innermost open menu or editor; outside menus it does nothing.
-Use `q` to quit from the normal viewer, or Ctrl+C from any input context.
-The `q` character continues to be accepted in filename and directory search fields.
-
-Press `n`, then Ctrl+Z to browse scored directories from `zoxide query --list --score`.
-The ranking is loaded once per opening; type case-insensitive keywords to filter
-paths, with substring matches preferred over fuzzy subsequence matches. Use
-Up/Down or Tab/Shift+Tab to select, PgUp/PgDn to page, Ctrl+Up/Down to scroll
-the selected directory's preview, Ctrl+U to clear the query, and Enter to jump.
-Esc or Ctrl+Z returns to the original file filter and selection. Marked images
-survive directory jumps. The preview lists visible entries from the selected
-directory only, up to 256 entries, with no NIfTI decoding or recursive scans.
-A plus sign in the entry count indicates a truncated preview. Zoxide is required
-on the host running niv; fzf is not required. The browser does not modify cwd.
-
-### v0.23.1: styled image and zoxide pickers
-
-Both pickers use a centered rounded terminal panel, a bordered search field,
-truecolor selection highlights with a `❯` marker, and separate status/help
-rows. The zoxide preview has a divider and color-coded directory names.
-Long paths preserve their ending with a leading ellipsis; Unicode cell widths
-are measured for alignment. Very small terminal panes retain the compact
-layout. Search, marking, directory jumps, preview scrolling, and keybindings
-are unchanged. The small `unicode-width` dependency is used only for text layout.
-
-### v0.24: picker line editing and unified viewer styling
-
-- In `n`, Left goes to the parent directory and Right enters the selected
-  directory (or completes a file path). Existing marks are preserved.
-- The file and zoxide filter lines both support Ctrl+A/E (start/end),
-  Ctrl+B/F (character movement), Ctrl+Left/Right and Alt+B/F (word movement),
-  Ctrl+U (clear the entire filter), Ctrl+W (delete back to previous whitespace),
-  Ctrl+G (delete previous alphanumeric/underscore word), Ctrl+K (delete to end),
-  Alt+D (delete next space-delimited word), Backspace and Delete. Bare Left/Right
-  move the cursor in the zoxide query. Space still marks a NIfTI file in `n`.
-- The selected path emphasizes its basename. The live Tab list uses a highlighted
-  row, `❯`, visible/hidden indicators, and a compact heading. The normal viewer
-  keeps two top rows and a single bottom information row; the top right shows
-  axis/slice or mode and help. Filename colors (including per-character rainbow)
-  are retained while numeric settings are muted.
-- `i` shows the region name and atlas label ID at the current probe, when solid
-  atlas labels are available. Projection mode has no unique voxel/region ID.
-  The help and info panels share the picker style and wrap long text.
-- Esc cancels menus but never quits; `q` quits from the normal viewer; Ctrl+C
-  remains the global exit. No new dependencies or changes to the rasterizer.
-
-### v0.25: optional atlas/template, recursive search, keymap and layer panel
-
-- `niv image.nii.gz` loads no atlas/template. `niv image.nii.gz -a -t`
-  uses `$ATLAS`/`$TEMPLATE`; `niv image.nii.gz -a atlas.nii.gz -t template.nii.gz`
-  overrides them. Bare flags should follow all input images, because the next
-  non-option argument is interpreted as a path. `--axis` replaces the former `-a`
-  axis shorthand. Scene loading remains self-contained.
-- `Z` opens the zoxide directory browser directly (outside montage); `F` opens
-  recursive `fd` search rooted at cwd. Inside `n`, use Ctrl+R to search recursively
-  from the current picker directory and Ctrl+Z for zoxide. `fd` (or `fdfind` on
-  Debian/Ubuntu) runs once per search opening; results are cached and filtered
-  as you type, with exact substring matches before fuzzy matches. The initial
-  scan is synchronous, so a huge or remote tree can delay opening; no file
-  contents are read. Space marks files; Ctrl+Space inserts a search space;
-  Enter loads; Esc returns to directory browsing. Ctrl+Y copies the highlighted
-  path via OSC 52. Hidden/ignored files follow fd's normal defaults.
-- Tab opens the rounded layer panel, subsequent Tab cycles downward (Shift+Tab
-  reverses). Shift+Up/Down changes compositing order; Enter/Esc/q closes.
-  `t` loads/reveals the default template or opens a picker. `f` fills the terminal; `h` flips horizontally; `v` flips
-  vertically. Old Kitty graphics are retained until the replacement is ready
-  on layout changes; no intermediate animation frames are generated.
-- Montage raster budget defaults to 4,000,000 pixels independently of the
-  1,000,000-pixel slice budget. `Q` edits whichever mode is active; 0 is native
-  resolution, not supersampling. `NIV_MONTAGE_PIXEL_BUDGET` sets the default;
-  saved scenes preserve the chosen montage budget.
-- Optional key aliases: copy `examples/keys.toml` to `~/.config/niv/keys.toml`
-  or set `NIV_KEYS` to a different file. Separate `[viewer]`, `[layers]`,
-  `[montage]`, `[projection]` tables map physical keys to built-in keys. They
-  do not alter text editors or the reserved Esc/Ctrl+C. Help shows default keys.
-
-
-### v0.26: reference images on demand
-
-- `a`: load `$ATLAS` if no atlas is loaded (open the atlas picker if the default is absent); afterward toggle its visibility (independent in projection mode).
-- `Ctrl+A`: choose a solid atlas, using the same picker as images. `Ctrl+Z` opens zoxide, `Ctrl+R` opens recursive fd. Enter loads a single atlas; Space multi-marking is disabled. Custom atlases use numeric labels without a LUT by default; `Ctrl+L` opens a custom CSV picker for the highlighted atlas. `Ctrl+O` enables the configured LUT (`$ATLAS_LUT`). Selecting the configured atlas automatically uses its configured LUT. Only use a LUT whose IDs match the atlas.
-- `t` or `Ctrl+T`: load/reveal `$TEMPLATE` below other layers, without duplicating an already loaded file; open a single-file template picker if the configured file is absent. New templates use grayscale and AVG when projecting.
-- All volumes must be aligned to the original voxel grid. A failed atlas replacement leaves the existing atlas intact. Runtime atlas paths/settings are included in saved scenes. No atlas/template is read at startup unless requested with `-a`/`-t` or a scene.
-- Filenames containing `cluster` (case-insensitive) or a separate `ci` token default to the categorical palette. Explicit overlay tint and scene palette take precedence. Change palettes with `l`.
-- The header uses one row in the common case, reclaiming a terminal row for the image. Additional rows are allocated for overflow; the footer remains at the last terminal row.
-
-### v0.26.1: custom LUT picker, fractional spacing and wheel modifiers
-
-- In Ctrl+A, highlight an atlas and press Ctrl+L to browse for a CSV. Ctrl+Z and Ctrl+R work in the CSV picker. Enter loads the atlas with the selected LUT; Esc returns (from recursive search or zoxide, Esc first closes that submode). CSVs must use the supported UNRAVEL schema: Region_ID, Region, Abbr, R, G, B; General_Region optional. Existing atlas stays intact if loading fails. Ctrl+O selects the configured LUT instead.
-- Normal view reserves one cell where room permits and splits the spare vertical space into sub-cell gaps using Kitty Y pixel placement. Mouse hit-testing accounts for the offset. Fullscreen and montage layouts are unchanged.
-- Requests Shift mouse capture with XTSHIFTESCAPE while active, releases on exit. Shift wheel uses the 3x stride, and horizontal wheel events also navigate at 3x (Ctrl overrides at 4x). Some terminal clients intercept these events before delivery; in Ghostty try mouse-shift-capture = true if needed.
-
-## v0.26.2
-
-`niv -a` (or `niv -a atlas.nii.gz`) opens an atlas-only wireframe using a hidden reference layer. `-a -t` shows the atlas over the template. In the normal viewer, a bracketed paste containing existing NIfTI paths loads aligned image layers, including Finder drops when the terminal supplies bracketed paths. Paste is not interpreted as shell commands. Remote paths must exist on the host running niv.
-
-## v0.26.3
-
-Successful pasted image loads are silent; failures still show a status message. Esc closes an open menu first, otherwise returns from projection to normal slices (like V), and never exits the application. The normal viewer retains its half-cell top inset but no longer reserves a whole extra row for it; image dimensions and mouse hit testing account for the inset. Montage and fill mode are unchanged.
-
-### v0.26.4
-
-- Tab is the layer-list shortcut; `t` (or Ctrl+T) loads/reveals the configured template below the intensity stack. If the configured path is unset or missing, a single-file template picker opens with zoxide and fd support.
-- `a` opens the atlas picker when no atlas is loaded and the configured path is unset or missing. Ctrl+A always opens the atlas picker.
-- The layer-list heading is bold and bright; numeric range editors show the actual finite data minimum/maximum alongside the current setting.
-- `b` toggles black/RGB and transparent/RGBA at runtime, as before. To prefer transparent on startup, set `export NIV_BACKGROUND=transparent` in `~/.config/niv/env.zsh`. `--background black` overrides that environment setting. Scenes continue to restore their saved background.
-
-### v0.26.5: montage navigation and wheel responsiveness
-
-Up/Down, j/k and wheel shift the montage start and stop together by the ordinary stride (including modifiers), clamped to the volume. Left/Right changes the gap. PageUp/PageDown still page within long manually spaced ranges. Hover or click a tile updates the text probe without selecting or paging to the tile. H toggles optional delayed dilation using the normal hover delay; this still sends a full montage frame when the region changes, so it defaults off. The selected slice is no longer shown in the montage footer.
-
-The gap's approximate micrometre equivalent is calculated from the displayed tile raster scale and the NIfTI voxel spacing, not from the slice interval. The interval also shows its physical axial distance. For NIfTI headers without spatial units, no physical conversion is displayed unless NIV_SPATIAL_UNITS=mm (or um/m) is configured. Only use this override when the header spacing is known to be in those units.
-
-Queued wheel events of the same direction and modifier are coalesced to one step per frame, preserving intervening non-motion input or a direction change. True OS-generated inertial wheel events may continue arriving after the physical gesture ends; terminal wheel events provide no gesture-release signal.
-
-### v0.26.6: montage preset and canvas alignment
-
-The 440-slice X-axis preset uses 81–433, interval 29, a 3×4 grid and zero tile gap. Other axes and grid lengths retain adaptive bounds, with zero gap. The canvas spans the footer width and uses the normal half-cell top inset, including consistent raster geometry for mouse inspection. Gap remains adjustable and is reported in the information panel rather than the footer. A zero pixel budget is labeled native. Saved montage settings take precedence.
+The screenshots are project documentation assets supplied by the developer. Review them for unpublished research data and obtain any necessary permissions before making the repository public.

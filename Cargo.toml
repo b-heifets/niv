@@ -1,10 +1,10 @@
 [package]
 name = "niv"
-version = "0.26.6"
+version = "0.27.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Fast keyboard-driven layered NIfTI viewer for Kitty graphics terminals"
-license = "MIT"
+license = "GPL-3.0-only"
 readme = "README.md"
 keywords = ["nifti", "terminal", "neuroimaging", "kitty", "tui"]
 

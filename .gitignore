@@ -1,25 +1,32 @@
-# Rust build artifacts
+# Rust builds
 /target/
 
-# NIfTI volumes (exclude large research datasets)
+# Large neuroimaging volumes: explicit bundled demos only
 *.nii
 *.nii.gz
-
-# Keep the sample volume for testing
 !data/sample.nii.gz
+!data/demo_atlas.nii.gz
+!data/demo_activation.nii.gz
 
-# macOS
+# macOS and editor
 .DS_Store
-
-# Editor temporary files
 *.swp
 *.swo
 *~
+*.pyc
+__pycache__/
 
-# Local environment and secrets
+# Environment secrets
 .env
 .env.*
 !.env.example
 
-*.pyc
-__pycache__/
+# Machine-specific niv environment exports from older update bundles.
+# Keep the documented, path-free examples/env.zsh under version control.
+/niv-env.zsh
+/niv-env-v*.zsh
+
+# IDE and local build artifacts
+/.idea/
+/.vscode/
+*.log
