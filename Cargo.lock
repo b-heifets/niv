@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "niv"
-version = "0.26.5"
+version = "0.26.6"
 dependencies = [
  "anyhow",
  "base64",

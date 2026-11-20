@@ -82,10 +82,11 @@ The screen has voxel coordinates and visible-layer values at the upper left, a c
 ### Montage mode (v0.15)
 
 Press **`p`** to open a montage for figure preparation. The default is a
-**3-row × 4-column** grid with 8-raster-pixel gaps and up to 12 evenly spaced
+**3-row × 4-column** grid with zero-raster-pixel gaps and up to 12 evenly spaced
 slices including the bounds. If a solid atlas (or companion solid labels) is
 loaded, bounds trim about 10% from each end of the occupied atlas along the
 current array axis. Otherwise the central 80% of the reference grid is used.
+For an X-axis grid with 440 slices, the preferred preset instead uses indices 81–433, interval 29 (12 tiles on the first page, 13 total).
 There are no gold selection borders or slice numbers by default.
 
 | Key | Effect |
@@ -459,3 +460,7 @@ Up/Down, j/k and wheel shift the montage start and stop together by the ordinary
 The gap's approximate micrometre equivalent is calculated from the displayed tile raster scale and the NIfTI voxel spacing, not from the slice interval. The interval also shows its physical axial distance. For NIfTI headers without spatial units, no physical conversion is displayed unless NIV_SPATIAL_UNITS=mm (or um/m) is configured. Only use this override when the header spacing is known to be in those units.
 
 Queued wheel events of the same direction and modifier are coalesced to one step per frame, preserving intervening non-motion input or a direction change. True OS-generated inertial wheel events may continue arriving after the physical gesture ends; terminal wheel events provide no gesture-release signal.
+
+### v0.26.6: montage preset and canvas alignment
+
+The 440-slice X-axis preset uses 81–433, interval 29, a 3×4 grid and zero tile gap. Other axes and grid lengths retain adaptive bounds, with zero gap. The canvas spans the footer width and uses the normal half-cell top inset, including consistent raster geometry for mouse inspection. Gap remains adjustable and is reported in the information panel rather than the footer. A zero pixel budget is labeled native. Saved montage settings take precedence.

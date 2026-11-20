@@ -67,7 +67,7 @@ impl Default for MontageState {
             stop: 0,
             interval: 0,
             columns: 4,
-            gap: 8,
+            gap: 0,
             rows: 3,
             show_numbers: false,
             show_clusters: false,
@@ -304,6 +304,16 @@ impl App {
     // Without a solid atlas, use the central 80% of the reference grid.
     fn montage_preset(&mut self, vol: &Volume, layers: &Layers) {
         self.reset_montage(vol);
+        // Match the preferred CCFv3 30 µm coronal montage; other axis
+        // lengths keep the adaptive occupied-atlas preset.
+        if self.axis == Axis::X && vol.depth(self.axis) == 440 {
+            self.montage.start = 81;
+            self.montage.stop = 433;
+            self.montage.interval = 29;
+            self.montage_preset_pending = false;
+            self.index = self.montage.start;
+            return;
+        }
         if let Some(solid) = layers.atlas.as_ref().and_then(|a| {
             if a.wireframe {
                 a.labels.as_ref()
@@ -3823,6 +3833,35 @@ mod tests {
         );
         assert!(parse_edit(EditField::Both, "5,1", (0., 10.)).is_err());
         assert!(parse_edit(EditField::Maximum, "NaN", (0., 10.)).is_err());
+    }
+
+    #[test]
+    fn coronal_montage_preset_matches_preferred_ccf_layout() {
+        let vol = Volume {
+            data: Array3::zeros((440, 2, 2)),
+            spacing: [0.03; 3],
+            spatial_units: 2,
+            sform: None,
+            datatype: 16,
+        };
+        let mut app = App::new(Axis::X, 220, 1, 90, (0., 1.), "test".into());
+        let mut layers = Layers::default();
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        );
+        let m = app.montage;
+        assert_eq!(
+            (m.start, m.stop, m.interval, m.rows, m.columns, m.gap),
+            (81, 433, 29, 3, 4, 0)
+        );
+        assert_eq!(m.count(), 13);
+        assert_eq!(m.slice_at(11), 400);
+        assert_eq!(m.slice_at(12), 429);
+        assert!(!m.show_numbers && !m.show_clusters);
     }
 
     #[test]

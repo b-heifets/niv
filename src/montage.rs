@@ -32,11 +32,35 @@ pub struct Plan {
 /// Fit aspect-correct thumbnails into one full-viewport raster, keeping the
 /// total pixel budget rather than allocating a budget for every tile.
 pub fn plan(vol: &Volume, app: &App, term_cols: u16, term_rows: u16, reserved_rows: usize) -> Plan {
-    let (cw, ch) = render::cell_pixels(term_cols, term_rows);
-    let columns_cells = term_cols.saturating_sub(1).max(1) as usize;
+    plan_with_cells(
+        vol,
+        app,
+        term_cols,
+        term_rows,
+        reserved_rows,
+        render::cell_pixels(term_cols, term_rows),
+    )
+}
+
+pub fn plan_with_cells(
+    vol: &Volume,
+    app: &App,
+    term_cols: u16,
+    term_rows: u16,
+    reserved_rows: usize,
+    cells: (usize, usize),
+) -> Plan {
+    let (cw, ch) = (cells.0.max(1), cells.1.max(1));
+    // Match the full-width footer, and the normal viewer's half-cell inset.
+    let columns_cells = term_cols.max(1) as usize;
     let rows_cells = (term_rows as usize).saturating_sub(reserved_rows).max(1);
+    let inset = if !app.fullscreen && rows_cells > 2 {
+        ch / 2
+    } else {
+        0
+    };
     let native_width = columns_cells.saturating_mul(cw).max(1);
-    let native_height = rows_cells.saturating_mul(ch).max(1);
+    let native_height = rows_cells.saturating_mul(ch).saturating_sub(inset).max(1);
     let native_pixels = native_width.saturating_mul(native_height);
     let scale = if app.montage_pixel_budget > 0 && native_pixels > app.montage_pixel_budget {
         (app.montage_pixel_budget as f64 / native_pixels as f64).sqrt()
@@ -394,6 +418,26 @@ mod tests {
             sform: None,
             datatype: 16,
         }
+    }
+    #[test]
+    fn montage_canvas_matches_footer_and_reserves_half_cell_at_top() {
+        let v = vol();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "test".into());
+        app.reset_montage(&v);
+        app.montage.enabled = true;
+        app.montage_pixel_budget = 0;
+        let p = plan_with_cells(&v, &app, 100, 40, 4, (8, 16));
+        assert_eq!((p.geom.cols, p.geom.rows), (100, 36));
+        assert_eq!((p.geom.width, p.geom.height), (800, 568));
+        assert_eq!(p.gap, 0);
+        for tile in &p.tiles {
+            assert!(
+                tile.x + p.tile_width <= p.geom.width && tile.y + p.tile_height <= p.geom.height
+            );
+        }
+        app.fullscreen = true;
+        let p = plan_with_cells(&v, &app, 100, 40, 0, (8, 16));
+        assert_eq!((p.geom.width, p.geom.height), (800, 640));
     }
     #[test]
     fn montage_pages_preserve_slice_order_spacing_and_budget() {

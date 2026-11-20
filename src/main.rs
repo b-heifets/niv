@@ -285,13 +285,13 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
         let cells = render::cell_pixels(cols, rows);
         // Keep the half-cell top inset, but reclaim the full row previously
         // reserved for it. Kitty's placement rectangle ends before the footer.
-        let y_offset = if !app.fullscreen && !app.montage.enabled && available > 2 {
+        let y_offset = if !app.fullscreen && available > 2 {
             cells.1 / 2
         } else {
             0
         };
         let geom = if app.montage.enabled {
-            montage::plan(vol, app, cols, rows, reserved).geom
+            montage::plan_with_cells(vol, app, cols, rows, reserved, cells).geom
         } else {
             render::geometry_with_inset(vol, app, cols, rows, reserved, cells, y_offset)
         };
@@ -775,9 +775,6 @@ fn draw_ui(
     if app.montage.enabled {
         let reserved = (view.head + rows.saturating_sub(view.footer)) as usize;
         let plan = montage::plan(vol, app, cols, rows, reserved);
-        let gap = montage::gap_micrometres(vol, app, &plan)
-            .map(|um| format!("{} px (≈{um:.0} µm)", plan.gap))
-            .unwrap_or_else(|| format!("{} px", plan.gap));
         let interval = if app.montage.interval == 0 {
             "auto".into()
         } else {
@@ -804,13 +801,25 @@ fn draw_ui(
         } else {
             String::new()
         };
-        let summary=format!("Montage {}–{} | interval {interval}{depth_spacing} | {}×{} | gap {gap} | {}/{} shown{page}",
-            app.montage.start,app.montage.stop,plan.rows,plan.columns,plan.tiles.len(),plan.total_slices);
+        let summary = format!(
+            "Montage {}–{} | interval {interval}{depth_spacing} | {}×{} | {}/{} shown{page}",
+            app.montage.start,
+            app.montage.stop,
+            plan.rows,
+            plan.columns,
+            plan.tiles.len(),
+            plan.total_slices
+        );
+        let budget = if app.montage_pixel_budget == 0 {
+            "native".to_owned()
+        } else {
+            format!("{} px", app.montage_pixel_budget)
+        };
         styled_layer_line(
             out,
             view.footer + 1,
             "",
-            &format!("{summary} | {} px", app.montage_pixel_budget),
+            &format!("{summary} | {budget}"),
             "",
             cols,
             PICKER_FG,
@@ -2201,13 +2210,15 @@ fn draw_popup(
                 }
             ));
             if app.montage.enabled {
+                let view = layout(vol, app, layers, cols, rows);
+                let reserved = (view.head + rows.saturating_sub(view.footer)) as usize;
+                let plan = montage::plan(vol, app, cols, rows, reserved);
+                let gap = montage::gap_micrometres(vol, app, &plan)
+                    .map(|um| format!("{} px (≈{um:.0} µm)", plan.gap))
+                    .unwrap_or_else(|| format!("{} px", plan.gap));
                 lines.push(format!(
-                    "Montage   {}..{} every {} | {} cols | gap {} px",
-                    app.montage.start,
-                    app.montage.stop,
-                    app.montage.interval,
-                    app.montage.columns,
-                    app.montage.gap
+                    "Montage   {}..{} every {} | {} cols | gap {gap}",
+                    app.montage.start, app.montage.stop, app.montage.interval, app.montage.columns
                 ));
             }
             if let Some(atlas) = &layers.atlas {
