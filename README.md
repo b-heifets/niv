@@ -10,7 +10,7 @@ cd ~/Documents/_GitHub/niv
 cargo fmt
 cargo test
 cargo install --path . --force
-niv --version       # 0.19.0
+niv --version       # 0.22.0
 ```
 
 Both ZIP files contain paths relative to their extraction directory. The full project ZIP includes sample data and examples; the source-only ZIP includes updated Rust source files, `Cargo.toml`, `README.md`, and an example scene, ready to extract into your existing repository. Don't apply the patch *and* extract the ZIP. Save a Git commit before upgrading if you've made local edits.
@@ -68,7 +68,7 @@ The screen has a colored region name at the upper left, `Press ? for help` at up
 | `t` | Show/hide layer list (top image first); ↑/↓ or `k`/`j` selects, Enter / q / Esc closes and retains the selection |
 | Space | Toggle selected image visibility (including the original base) |
 | `I` (Shift+i) | Toggle keyboard inspection crosshair / pointer hover |
-| `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat x/z to mirror horizontally |
+| `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat any axis key to mirror horizontally |
 | `r`,`R` | Rotate clockwise / counterclockwise |
 | `f`,`v` | Flip horizontally / vertically |
 | Tab | Hide/show viewer text, fill terminal |
@@ -330,3 +330,11 @@ Categorical filenames now use one interpolated RGB color per character.
 - `d` unloads the selected image. If the original reference is unloaded, another aligned image becomes the reference, retaining all layer settings and projection cache identity. The last image cannot be unloaded; Space can hide it for an atlas-only view.
 - Each axis remembers its own rotation and flips for the current session. Scenes still store only the active axis transform.
 - `T` in projection mode cycles major divisions, broad regions, whole-brain silhouette, none. Major mode combines selected anatomical divisions; both grouped modes merge all cerebellar cortex/nuclei and omit ventricular and fiber-tract outlines. Enclosed holes in projected masks are filled before drawing their exterior faces. Disconnected components and overlapping groups can still have distinct outlines. This is a presentation-only simplification, not a modification of the atlas or a surface rendering. Contiguous collinear edges are merged to reduce stroke work, and masks use a direct lookup for compact label IDs. Group preparation is lazy and cached by axis and detail.
+
+### v0.22: opt-in projection atlas, compact numeric readouts, template and zoxide
+
+- Projection outlines start **off**. `a` toggles them without changing slice-view atlas visibility; `T` enables or cycles major, broad, and silhouette styles. The chosen style and visibility are remembered for the current session. Grouped projections contain only their regional contours; no extra brain silhouette is drawn or computed. Missing regional metadata requires selecting the silhouette explicitly. Existing cached outlines remain reusable.
+- Repeating `y` or its alias `c` flips the axial image horizontally, just like `x` and `z`. Axis transforms remain independent.
+- Integer-valued probe intensities and selected-layer bounds are displayed without trailing zeros. Fractional probe intensities retain seven decimal places; window settings retain five where appropriate, with additional precision for near-integer thresholds. The editor and stored f32 values are unchanged.
+- Set `TEMPLATE` to a registered grayscale volume in your sourced zsh configuration. `niv --template` opens it alone; `niv clusters.nii.gz --template` adds it as the bottom image. It is not loaded implicitly, and existing CLI and scene loading are unchanged.
+- In the `n` file picker, press Ctrl+Z, type one or more zoxide directory keywords, then Enter. The best-ranked directory becomes the picker location. Escape cancels the jump; marked images survive directory changes. The external `zoxide` executable must be on PATH and its database must contain the desired directories. No shell evaluation, no interactive fzf requirement, no process-wide directory change.

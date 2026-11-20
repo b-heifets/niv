@@ -224,15 +224,37 @@ fn middle_ellipsis(s: &str, limit: usize) -> String {
     )
 }
 
+fn integer_display(v: f32) -> Option<String> {
+    // Don't round nearly-one probability thresholds to 1. Only exact stored
+    // integers get the short form; normalize negative zero for display.
+    if v.is_finite() && v.fract() == 0. && v.abs() < 1e12 {
+        Some(if v == 0. {
+            "0".into()
+        } else {
+            format!("{v:.0}")
+        })
+    } else {
+        None
+    }
+}
 fn intensity(v: f32) -> String {
     if !v.is_finite() {
         return v.to_string();
     }
-    format!("{v:.7}")
+    integer_display(v).unwrap_or_else(|| format!("{v:.7}"))
 }
 fn compact_number(v: f32) -> String {
+    if let Some(s) = integer_display(v) {
+        return s;
+    }
     if v.is_finite() && v.abs() < 100_000.0 {
-        format!("{v:.5}")
+        // Avoid displaying a fractional threshold as an integer after rounding.
+        let short = format!("{v:.5}");
+        if short.parse::<f32>().is_ok_and(|n| n.fract() == 0.) {
+            v.to_string()
+        } else {
+            short
+        }
     } else {
         format!("{v:.5e}")
     }
@@ -380,13 +402,13 @@ fn draw_ui(
     } else if app.projection != app::ProjectionMode::Slice {
         let outline = match &layers.atlas {
             Some(atlas)
-                if app.show_atlas
+                if app.show_projected_atlas
                     && atlas.opacity > 0.
                     && (!atlas.wireframe || atlas.labels.is_some()) =>
             {
                 match app.projected_atlas_detail {
                     0 | 1 if !atlas.regions.values().any(|r| !r.general_region.is_empty()) => {
-                        " · atlas silhouette (no groups in LUT)"
+                        " · regional LUT required"
                     }
                     0 => " · major region outlines",
                     1 => " · broad region outlines",
@@ -394,8 +416,10 @@ fn draw_ui(
                     _ => " · no outlines",
                 }
             }
-            Some(atlas) if app.show_atlas && atlas.wireframe && atlas.labels.is_none() => {
-                " · solid atlas required for silhouette"
+            Some(atlas)
+                if app.show_projected_atlas && atlas.wireframe && atlas.labels.is_none() =>
+            {
+                " · solid atlas required for outlines"
             }
             _ => "",
         };
@@ -659,10 +683,52 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
     let Some(editor) = &app.edit else {
         return Ok(());
     };
+    let x = if cols >= 70 { 3 } else { 1 };
+    if app.picker_jump_from.is_some() {
+        if rows > 0 {
+            line(out, 0, "Jump to directory · zoxide", cols, Color::White, x)?;
+        }
+        if rows > 1 {
+            line(
+                out,
+                1,
+                &format!("Directory query: {}_", editor.text),
+                cols,
+                Color::Yellow,
+                x,
+            )?;
+        }
+        if rows > 2 {
+            line(
+                out,
+                2,
+                "Type directory keywords · Enter jump · Esc cancel",
+                cols,
+                Color::Grey,
+                x,
+            )?;
+        }
+        if rows > 3 {
+            line(
+                out,
+                3,
+                &format!("{} marked images retained", editor.checked.len()),
+                cols,
+                Color::DarkGrey,
+                x,
+            )?;
+        }
+        if rows > 4 {
+            if let Some(e) = &editor.error {
+                line(out, 4, e, cols, Color::Red, x)?;
+            }
+        }
+        out.flush()?;
+        return Ok(());
+    }
     let Some(matches) = &editor.completion else {
         return Ok(());
     };
-    let x = if cols >= 70 { 3 } else { 1 };
     let width = cols.saturating_sub(x + 1) as usize;
     if rows == 0 {
         return Ok(());
@@ -766,7 +832,7 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
             line(
                 out,
                 rows - 2,
-                "Enter load selected/marked · Esc cancel · PgUp/PgDn page",
+                "Enter load · Esc cancel · Ctrl+Z zoxide jump · PgUp/PgDn page",
                 cols,
                 Color::DarkGrey,
                 x,
@@ -803,12 +869,12 @@ fn draw_popup(
                     "  Space     Hide/show selected image",
                     "  In t: Y copy · X cut · p/P paste below/above",
                     "  d unload · w raise · { lower · Y yank",
-                    "  x c z     Change axis; repeat x/z mirrors; r/R rotate",
+                    "  x c z     Change axis; repeat any axis key to mirror",
                     "  e/m/M/0  Edit/reset window; +/- contrast; ,/. brightness",
                     "  l palette · o opacity · a atlas on/off · O atlas opacity",
-                    "  T cycle atlas: major / broad / silhouette / none",
+                    "  T enable/cycle major / broad / silhouette; a hide/show",
                     "  g edge AA · G atlas blur · b background · Tab fill",
-                    "  n load images · i info · p montage (returns to slices)",
+                    "  n load images (Ctrl+Z jump) · i info · p montage",
                     "  AVG includes zeros; nonfinite values are ignored.",
                     "  MAX favors high IDs; MIN+ favors low positive IDs.",
                     "  Overlapping labels cannot all occupy the same pixel.",
@@ -825,7 +891,7 @@ fn draw_popup(
                     "NAVIGATION",
                     "  ↑↓←→ / hjk      Slices; wheel / trackpad also scroll",
                     "  Cmd ×2 · Shift ×3 · Ctrl ×4 · Alt ×2 fallback",
-                    "  PgUp / PgDn      ±25 slices    x c z   choose axis; repeat x/z mirrors",
+                    "  PgUp / PgDn      ±25 slices    x c z   choose axis; repeat axis key mirrors",
                     "  [ / ] stride   r / R rotate   f / v flip   Tab fill",
                     "  I      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
@@ -833,7 +899,7 @@ fn draw_popup(
                     "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
-                    "  n      File picker: filter filename by substring",
+                    "  n      File picker: substring filter · Ctrl+Z zoxide jump",
                     "  s      Save current scene (.niv.toml)",
                     "         ↑↓ select · Tab complete · Space mark · Enter load",
                     "  d unload · w raise · { lower · Y yank path",
@@ -1944,6 +2010,16 @@ mod mouse_tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+    #[test]
+    fn info_numbers_keep_integer_and_fractional_values_distinct() {
+        assert_eq!(intensity(20.), "20");
+        assert_eq!(intensity(-0.), "0");
+        assert_eq!(compact_number(1130.), "1130");
+        assert_eq!(intensity(0.9999999), "0.9999999");
+        assert_eq!(compact_number(0.99994), "0.99994");
+        assert_eq!(compact_number(0.9999999), "0.9999999");
+        assert_eq!(intensity(-1.25), "-1.2500000");
     }
     #[test]
     fn categorical_filename_gradient_is_deterministic_and_bounded() {

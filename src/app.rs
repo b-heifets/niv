@@ -140,8 +140,9 @@ pub struct App {
     pub pre_montage_slice: Option<(Axis, usize)>,
     pub atlas_blur: f32,
     pub projection: ProjectionMode,
-    /// 0 = major divisions, 1 = broad, 2 = silhouette, 3 = none.
+    /// 0 = major divisions, 1 = broad, 2 = silhouette. Visibility is independent.
     pub projected_atlas_detail: u8,
+    pub show_projected_atlas: bool,
     // Explicit choices keyed by stable image ID, not stack position.
     pub layer_projections: Vec<(usize, ProjectionMode)>,
     pub projection_cache: std::rc::Rc<crate::projection::ProjectionCache>,
@@ -177,6 +178,8 @@ pub struct App {
     pub inspect_mode: bool,
     pub probe: Option<(usize, usize)>,
     pub edit: Option<WindowEdit>,
+    /// Previous file filter while the picker is accepting a zoxide directory query.
+    pub picker_jump_from: Option<String>,
     pub popup: Option<Popup>,
     pub popup_scroll: usize,
     pub notice: Option<String>,
@@ -215,6 +218,7 @@ impl App {
             atlas_blur: 0.,
             projection: ProjectionMode::Slice,
             projected_atlas_detail: 0,
+            show_projected_atlas: false,
             layer_projections: Vec::new(),
             projection_cache: Default::default(),
             axis,
@@ -245,6 +249,7 @@ impl App {
             inspect_mode: false,
             probe: None,
             edit: None,
+            picker_jump_from: None,
             popup: None,
             popup_scroll: 0,
             notice: None,
@@ -522,10 +527,8 @@ impl App {
 
     fn set_axis(&mut self, vol: &Volume, axis: Axis) {
         if self.axis == axis {
-            if axis != Axis::Y {
-                self.flip_h = !self.flip_h;
-                self.probe = None;
-            }
+            self.flip_h = !self.flip_h;
+            self.probe = None;
             return;
         }
         let old_len = vol.depth(self.axis);
@@ -625,6 +628,55 @@ impl App {
 
     fn picker_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Action {
         let editor = self.edit.as_mut().expect("picker is open");
+        let jump_key = key == KeyCode::Char('\x1a')
+            || (matches!(key, KeyCode::Char('z' | 'Z'))
+                && modifiers.contains(KeyModifiers::CONTROL));
+        if self.picker_jump_from.is_some() {
+            if jump_key || key == KeyCode::Esc {
+                editor.text = self.picker_jump_from.take().unwrap();
+                editor.completion = Some(path_complete::search(&editor.text));
+                editor.error = None;
+                return Action::Layout;
+            }
+            match key {
+                KeyCode::Enter => match path_complete::zoxide_directory(&editor.text) {
+                    Ok(dir) => {
+                        self.picker_jump_from = None;
+                        editor.text = dir;
+                        editor.completion = Some(path_complete::search(&editor.text));
+                        editor.error = None;
+                    }
+                    Err(e) => editor.error = Some(e),
+                },
+                KeyCode::Backspace => {
+                    editor.text.pop();
+                    editor.error = None;
+                }
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        )
+                        && editor.text.len() < 4096 =>
+                {
+                    editor
+                        .text
+                        .push(if c == '-' && modifiers.contains(KeyModifiers::SHIFT) {
+                            '_'
+                        } else {
+                            c
+                        });
+                    editor.error = None;
+                }
+                _ => return Action::None,
+            }
+            return Action::Layout;
+        }
+        if jump_key {
+            self.picker_jump_from = Some(std::mem::take(&mut editor.text));
+            editor.error = None;
+            return Action::Layout;
+        }
         match key {
             KeyCode::Esc => {
                 self.edit = None;
@@ -1078,6 +1130,7 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('n') => {
+                self.picker_jump_from = None;
                 self.edit = Some(WindowEdit {
                     field: EditField::AddPath,
                     text: String::new(),
@@ -1127,8 +1180,11 @@ impl App {
                 if self.projection != ProjectionMode::Slice
                     && (key.code == KeyCode::Char('T') || m.contains(KeyModifiers::SHIFT)) =>
             {
-                self.projected_atlas_detail = (self.projected_atlas_detail + 1) % 4;
-                self.show_atlas = true;
+                if self.show_projected_atlas {
+                    self.projected_atlas_detail = (self.projected_atlas_detail + 1) % 3;
+                } else {
+                    self.show_projected_atlas = true;
+                }
                 Action::Redraw
             }
             KeyCode::Char('t') => {
@@ -1314,7 +1370,11 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('a') => {
-                self.show_atlas = !self.show_atlas;
+                if self.projection == ProjectionMode::Slice {
+                    self.show_atlas = !self.show_atlas;
+                } else {
+                    self.show_projected_atlas = !self.show_projected_atlas;
+                }
                 Action::Redraw
             }
             KeyCode::Char('g') => {
@@ -1986,6 +2046,42 @@ mod tests {
             other => panic!("{other:?}"),
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn picker_zoxide_prompt_preserves_marks_and_cancel_restores_filter() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        let none = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('n'), none);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('f'), none);
+        app.edit
+            .as_mut()
+            .unwrap()
+            .checked
+            .push(PathBuf::from("marked.nii.gz"));
+        key(
+            &mut app,
+            &vol,
+            &mut layers,
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!(app.picker_jump_from.as_deref(), Some("f"));
+        for ch in "two words".chars() {
+            key(&mut app, &vol, &mut layers, KeyCode::Char(ch), none);
+        }
+        assert_eq!(app.edit.as_ref().unwrap().text, "two words");
+        key(&mut app, &vol, &mut layers, KeyCode::Esc, none);
+        assert!(app.picker_jump_from.is_none());
+        assert_eq!(app.edit.as_ref().unwrap().text, "f");
+        assert_eq!(
+            app.edit.as_ref().unwrap().checked,
+            vec![PathBuf::from("marked.nii.gz")]
+        );
+        key(&mut app, &vol, &mut layers, KeyCode::Esc, none);
+        assert!(app.edit.is_none());
     }
 
     #[test]
@@ -2700,10 +2796,13 @@ mod tests {
         key(&mut app, &vol, &mut layers, KeyCode::Char('c'), none);
         assert_eq!(app.axis, Axis::Y);
         key(&mut app, &vol, &mut layers, KeyCode::Char('c'), none);
+        assert!(app.flip_h);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('y'), none);
         assert!(!app.flip_h);
         key(&mut app, &vol, &mut layers, KeyCode::Char('U'), none);
         assert_eq!(app.projection_for(1), ProjectionMode::MinPositive);
-        for detail in [1, 2, 3, 0] {
+        assert!(!app.show_projected_atlas);
+        for detail in [0, 1, 2, 0] {
             key(
                 &mut app,
                 &vol,
@@ -2713,7 +2812,13 @@ mod tests {
             );
             assert_eq!(app.projected_atlas_detail, detail);
             assert!(!app.show_layer_list);
+            assert!(app.show_projected_atlas);
         }
+        key(&mut app, &vol, &mut layers, KeyCode::Char('a'), none);
+        assert!(!app.show_projected_atlas);
+        assert!(app.show_atlas);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('a'), none);
+        assert!(app.show_projected_atlas);
         key(&mut app, &vol, &mut layers, KeyCode::Char('V'), none);
         assert_eq!(
             key(&mut app, &vol, &mut layers, KeyCode::Char('u'), none),

@@ -398,7 +398,12 @@ pub fn composite_with_map(
             }
         }
     }
-    if app.show_atlas {
+    let atlas_visible = if app.projection == ProjectionMode::Slice {
+        app.show_atlas
+    } else {
+        app.show_projected_atlas
+    };
+    if atlas_visible {
         if let Some(atlas) = &layers.atlas {
             if atlas.opacity > 0.0 {
                 if app.projection != ProjectionMode::Slice {
@@ -978,27 +983,23 @@ fn draw_projected_atlas(
     let Some(solid) = solid else {
         return;
     };
-    if app.projected_atlas_detail == 3 {
-        return;
-    }
     let mut strokes = StrokeCanvas::new(width, height);
-    let faces = app.projection_cache.silhouette(solid, app.axis);
-    for &(p, q) in faces.iter() {
-        stroke_face(
-            &mut strokes,
-            app,
-            sw,
-            sh,
-            p,
-            q,
-            atlas.fallback,
-            atlas.width,
-            false,
-        );
-    }
-    if app.projected_atlas_detail < 2
-        && atlas.regions.values().any(|r| !r.general_region.is_empty())
-    {
+    if app.projected_atlas_detail == 2 {
+        let faces = app.projection_cache.silhouette(solid, app.axis);
+        for &(p, q) in faces.iter() {
+            stroke_face(
+                &mut strokes,
+                app,
+                sw,
+                sh,
+                p,
+                q,
+                atlas.fallback,
+                atlas.width,
+                false,
+            );
+        }
+    } else if atlas.regions.values().any(|r| !r.general_region.is_empty()) {
         let grouped = app.projection_cache.grouped_faces(
             solid,
             app.axis,
@@ -1238,16 +1239,86 @@ mod layer_tests {
             .iter()
             .all(|&v| v == 0));
         app.projection = ProjectionMode::Max;
+        assert!(composite_format(&base, &app, &layers, 30, 30, false)
+            .iter()
+            .all(|&v| v == 0));
+        app.show_projected_atlas = true;
+        app.projected_atlas_detail = 2;
         let pixels = composite_format(&base, &app, &layers, 30, 30, false);
         assert!(pixels.chunks_exact(3).any(|p| p == [255, 0, 0]));
         assert_eq!(
             &pixels[(15 * 30 + 15) * 3..(15 * 30 + 15) * 3 + 3],
             &[0, 0, 0]
         );
-        app.show_atlas = false;
+        app.show_projected_atlas = false;
         assert!(composite_format(&base, &app, &layers, 30, 30, false)
             .iter()
             .all(|&v| v == 0));
+    }
+
+    #[test]
+    fn regional_projection_never_adds_white_brain_silhouette() {
+        let base = Volume {
+            data: Array3::zeros((4, 4, 2)),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let labels = Volume {
+            data: Array3::from_shape_fn(
+                (4, 4, 2),
+                |(x, y, _)| if x == 1 && y == 1 { 1. } else { 2. },
+            ),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let mut regions = HashMap::new();
+        regions.insert(
+            1,
+            crate::layers::RegionInfo {
+                color: [0, 255, 0],
+                name: "Thalamus".into(),
+                abbr: "TH".into(),
+                general_region: "Thalamus".into(),
+            },
+        );
+        regions.insert(
+            2,
+            crate::layers::RegionInfo {
+                color: [255, 255, 255],
+                name: "Ventricular".into(),
+                abbr: "V".into(),
+                general_region: "Ventricular".into(),
+            },
+        );
+        let layers = Layers {
+            overlays: vec![],
+            atlas: Some(Atlas {
+                vol: labels,
+                wireframe: false,
+                labels: None,
+                fallback: [255, 255, 255],
+                width: 1,
+                opacity: 1.,
+                regions,
+            }),
+        };
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        app.projection = ProjectionMode::Max;
+        assert!(composite_format(&base, &app, &layers, 40, 40, false)
+            .iter()
+            .all(|&v| v == 0));
+        app.show_projected_atlas = true;
+        for detail in [0, 1] {
+            app.projected_atlas_detail = detail;
+            let frame = composite_format(&base, &app, &layers, 40, 40, false);
+            assert!(frame.chunks_exact(3).any(|p| p == [0, 255, 0]));
+            assert!(frame.chunks_exact(3).all(|p| p[0] == 0 && p[2] == 0));
+        }
+        app.projected_atlas_detail = 2;
+        let frame = composite_format(&base, &app, &layers, 40, 40, false);
+        assert!(frame.chunks_exact(3).any(|p| p == [255, 255, 255]));
     }
 
     #[test]

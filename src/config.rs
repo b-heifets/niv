@@ -47,7 +47,7 @@ const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE/GLOB ... [OPTIONS]
        niv -i FILE/GLOB ... [OPTIONS]
        niv --scene FILE.niv.toml
-Defaults: --axis x --rotate 90; $ATLAS and $ATLAS_LUT are supported.
+Defaults: --axis x --rotate 90; $ATLAS, $ATLAS_LUT; --template uses $TEMPLATE.
 Press ? in the viewer for keyboard help.  -v shows version.
 Use --help for full CLI options.
 "#;
@@ -93,6 +93,7 @@ LAYERS AND ATLAS
                                    quoted globs, and repeated -i groups.
                                    Matched files are sorted; all images are
                                    aligned to the base volume. Default grayscale.
+      --template                  Append $TEMPLATE as the bottom grayscale layer
       --overlay FILE              Additional image with fixed warm tint; repeatable
       --overlay-window MIN,MAX    Most recently supplied overlay range
       --overlay-color RRGGBB      Most recent overlay fixed tint
@@ -132,6 +133,13 @@ pub fn parse() -> Result<Option<Config>> {
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
+    parse_args_with_template(argv, env::var_os("TEMPLATE"))
+}
+
+fn parse_args_with_template(
+    argv: Vec<String>,
+    template_env: Option<std::ffi::OsString>,
+) -> Result<Option<Config>> {
     // Help/version can be requested even when --scene is also on the command line.
     if argv.iter().any(|a| a == "--help") {
         print!("{HELP}");
@@ -164,6 +172,7 @@ fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
     )?;
     let mut rotation = parse_rotation(&env::var("NIV_ROTATE").unwrap_or_else(|_| "90".to_owned()))?;
     let mut path = None;
+    let mut use_template = false;
     let mut initial_slice = None;
     let mut step = 1;
     let mut window = None;
@@ -221,6 +230,10 @@ fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
         }
         if arg == "--profile" {
             profile = true;
+            continue;
+        }
+        if arg == "--template" {
+            use_template = true;
             continue;
         }
         if arg == "--atlas-aa" {
@@ -363,6 +376,13 @@ fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
                 append_image(&mut path, &mut overlays, found);
             }
         }
+    }
+    // Explicit opt-in: no extra template loading during normal startup.
+    if use_template {
+        let template = template_env
+            .filter(|v| !v.is_empty())
+            .context("--template requires the TEMPLATE environment variable")?;
+        append_image(&mut path, &mut overlays, PathBuf::from(template));
     }
     // Explicit --atlas/--atlas-wireframe takes precedence over environment defaults.
     if atlas_path.is_none() {
@@ -570,6 +590,29 @@ mod tests {
             assert!(cfg.overlays[0].grayscale);
             assert_eq!(cfg.overlays[0].opacity, 1.0);
         }
+    }
+    #[test]
+    fn template_is_opt_in_and_appended_to_bottom() {
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect();
+        let template = || Some(std::ffi::OsString::from("template.nii.gz"));
+        let cfg = parse_args_with_template(args(&["a.nii.gz"]), template())
+            .unwrap()
+            .unwrap();
+        assert!(cfg.overlays.is_empty());
+        let cfg =
+            parse_args_with_template(args(&["--template", "a.nii.gz", "b.nii.gz"]), template())
+                .unwrap()
+                .unwrap();
+        assert_eq!(cfg.path, PathBuf::from("a.nii.gz"));
+        assert_eq!(cfg.overlays.len(), 2);
+        assert_eq!(cfg.overlays[1].path, PathBuf::from("template.nii.gz"));
+        assert!(cfg.overlays[1].grayscale);
+        assert_eq!(cfg.overlays[1].opacity, 1.0);
+        assert!(parse_args_with_template(args(&["a.nii.gz", "--template"]), None).is_err());
+        let cfg = parse_args_with_template(args(&["--template"]), template())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.path, PathBuf::from("template.nii.gz"));
     }
     #[test]
     fn multiple_glob_patterns_expand_in_sorted_order() {

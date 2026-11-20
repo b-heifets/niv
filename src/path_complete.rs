@@ -61,6 +61,36 @@ pub fn resolve(path: &str) -> PathBuf {
     expand_home(path)
 }
 
+/// Query zoxide only on explicit Enter, never during filename filtering.
+/// No shell evaluation and no process-wide current-directory changes.
+pub fn zoxide_directory(query: &str) -> Result<String, String> {
+    let keywords: Vec<_> = query.split_whitespace().collect();
+    if keywords.is_empty() {
+        return Err("Type at least one directory keyword".into());
+    }
+    let output = std::process::Command::new("zoxide")
+        .args(["query", "--"])
+        .args(&keywords)
+        .output()
+        .map_err(|e| format!("Cannot run zoxide: {e}"))?;
+    if !output.status.success() {
+        return Err("No matching zoxide directory (or zoxide database unavailable)".into());
+    }
+    directory_filter(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn directory_filter(result: &str) -> Result<String, String> {
+    let dir = PathBuf::from(result.trim_end_matches(['\r', '\n']));
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err("Zoxide did not return an existing absolute directory".into());
+    }
+    let mut text = dir.to_string_lossy().into_owned();
+    if !text.ends_with('/') {
+        text.push('/');
+    }
+    Ok(text)
+}
+
 fn dir_and_fragment(input: &str) -> (String, &str) {
     match input.rsplit_once('/') {
         Some((dir, frag)) => (format!("{dir}/"), frag),
@@ -238,6 +268,20 @@ mod tests {
         }
         fs::create_dir(path.join("groupA")).unwrap();
         path
+    }
+    #[test]
+    fn zoxide_result_must_be_an_existing_absolute_directory() {
+        let root = test_directory();
+        let filter = directory_filter(&format!("{}\n", root.display())).unwrap();
+        assert!(filter.ends_with('/'));
+        assert!(search(&filter)
+            .values
+            .iter()
+            .any(|m| m.path.ends_with("posterior-Brain.nii")));
+        assert!(directory_filter("relative/path").is_err());
+        assert!(directory_filter("").is_err());
+        assert!(zoxide_directory("  ").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn substring_anywhere_is_case_insensitive_and_directories_are_browsable() {
