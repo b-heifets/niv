@@ -1384,6 +1384,12 @@ impl App {
             }
         }
         if key.code == KeyCode::Esc {
+            // Editors, popups and the layer menu have already handled Esc.
+            if self.projection != ProjectionMode::Slice {
+                self.projection = ProjectionMode::Slice;
+                self.highlighted_region = None;
+                return Action::Redraw;
+            }
             return Action::None;
         }
         if key.code == KeyCode::Char('q') && !m.contains(KeyModifiers::SHIFT) {
@@ -3218,6 +3224,34 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert!(app.layer_visible(&layers, 0));
+    }
+
+    #[test]
+    fn escape_exits_projection_after_closing_menus_and_never_quits() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 30, 1, 90, (0., 1.), "test".into());
+        let n = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('A'), n);
+        assert_eq!(app.projection_for(0), ProjectionMode::Mean);
+        key(&mut app, &vol, &mut layers, KeyCode::Tab, n);
+        assert!(app.show_layer_list);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Esc, n),
+            Action::Layout
+        );
+        assert!(!app.show_layer_list);
+        assert_eq!(app.projection_for(0), ProjectionMode::Mean);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Esc, n),
+            Action::Redraw
+        );
+        assert_eq!(app.projection, ProjectionMode::Slice);
+        assert_eq!(app.index, 30);
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Esc, n),
+            Action::None
+        );
     }
 
     #[test]

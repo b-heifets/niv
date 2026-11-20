@@ -438,3 +438,7 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
 ## v0.26.2
 
 `niv -a` (or `niv -a atlas.nii.gz`) opens an atlas-only wireframe using a hidden reference layer. `-a -t` shows the atlas over the template. In the normal viewer, a bracketed paste containing existing NIfTI paths loads aligned image layers, including Finder drops when the terminal supplies bracketed paths. Paste is not interpreted as shell commands. Remote paths must exist on the host running niv.
+
+## v0.26.3
+
+Successful pasted image loads are silent; failures still show a status message. Esc closes an open menu first, otherwise returns from projection to normal slices (like V), and never exits the application. The normal viewer retains its half-cell top inset but no longer reserves a whole extra row for it; image dimensions and mouse hit testing account for the inset. Montage and fill mode are unchanged.

@@ -22,15 +22,38 @@ pub fn geometry(
     term_rows: u16,
     reserved_rows: usize,
 ) -> Geometry {
+    geometry_with_inset(
+        vol,
+        app,
+        term_cols,
+        term_rows,
+        reserved_rows,
+        cell_pixels(term_cols, term_rows),
+        0,
+    )
+}
+
+/// Fit the image within its cell rectangle, whose first row has a pixel inset.
+/// Kitty's Y offset consumes part of the placement rectangle, not a whole row.
+pub fn geometry_with_inset(
+    vol: &Volume,
+    app: &App,
+    term_cols: u16,
+    term_rows: u16,
+    reserved_rows: usize,
+    cells: (usize, usize),
+    inset: usize,
+) -> Geometry {
     let (_, _, mut aspect) = vol.plane(app.axis);
     if app.rotation % 180 != 0 {
         aspect = 1.0 / aspect;
     }
     let usable_cols = term_cols.saturating_sub(1).max(1) as usize;
     let usable_rows = (term_rows as usize).saturating_sub(reserved_rows).max(1);
-    let (cell_w, cell_h) = cell_pixels(term_cols, term_rows);
+    let (cell_w, cell_h) = (cells.0.max(1), cells.1.max(1));
+    let inset = inset.min(cell_h - 1);
     let viewport_w = usable_cols * cell_w;
-    let viewport_h = usable_rows * cell_h;
+    let viewport_h = (usable_rows * cell_h).saturating_sub(inset).max(1);
 
     let (wanted_w, wanted_h) = if viewport_w as f64 / viewport_h as f64 > aspect {
         (
@@ -44,9 +67,9 @@ pub fn geometry(
         )
     };
     let cols = ((wanted_w / cell_w).max(1)).min(usable_cols) as u16;
-    let rows = ((wanted_h / cell_h).max(1)).min(usable_rows) as u16;
+    let rows = (((wanted_h + inset) / cell_h).max(1)).min(usable_rows) as u16;
     let view_w = cols as usize * cell_w;
-    let view_h = rows as usize * cell_h;
+    let view_h = (rows as usize * cell_h).saturating_sub(inset).max(1);
     Geometry {
         cols,
         rows,

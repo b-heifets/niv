@@ -280,26 +280,24 @@ fn layout(vol: &Volume, app: &App, layers: &Layers, cols: u16, rows: u16) -> Vie
     // Cap header growth so small panes always retain a usable image area.
     let max_head = rows.saturating_sub(footer_rows + 1).max(head).min(8);
     loop {
-        let gap = usize::from(
-            !app.fullscreen && !app.montage.enabled && rows.saturating_sub(head + footer_rows) > 2,
-        );
-        let reserved = (head + footer_rows) as usize + gap;
-        let geom = if app.montage.enabled {
-            montage::plan(vol, app, cols, rows, reserved).geom
-        } else {
-            render::geometry(vol, app, cols, rows, reserved)
-        };
+        let reserved = (head + footer_rows) as usize;
         let available = rows.saturating_sub(head + footer_rows);
-        let x = cols.saturating_sub(geom.cols) / 2;
-        let spare = available.saturating_sub(geom.rows);
-        let y = head + spare / 2;
-        // Split one spare cell into a half-cell gap at either end. No padding
-        // pixels are encoded; Kitty Y places the image below the text.
-        let y_offset = if gap > 0 && spare % 2 == 1 {
-            render::cell_pixels(cols, rows).1 / 2
+        let cells = render::cell_pixels(cols, rows);
+        // Keep the half-cell top inset, but reclaim the full row previously
+        // reserved for it. Kitty's placement rectangle ends before the footer.
+        let y_offset = if !app.fullscreen && !app.montage.enabled && available > 2 {
+            cells.1 / 2
         } else {
             0
         };
+        let geom = if app.montage.enabled {
+            montage::plan(vol, app, cols, rows, reserved).geom
+        } else {
+            render::geometry_with_inset(vol, app, cols, rows, reserved, cells, y_offset)
+        };
+        let x = cols.saturating_sub(geom.cols) / 2;
+        let spare = available.saturating_sub(geom.rows);
+        let y = head + spare / 2;
         if app.fullscreen
             || head >= max_head
             || pack_header(&estimate, &header_widths(first, head, cols, x, geom.rows)).1
@@ -1881,7 +1879,7 @@ fn draw_popup(
                 [
                     "PROJECTION · full depth, per image",
                     "  X / A / U  Set selected layer MAX / AVG / MIN+",
-                    "  V         Return to normal slices",
+                    "  Esc / V   Return to normal slices",
                     "  Other images default to MAX; choices follow image IDs.",
                     "",
                     "LAYERS",
@@ -1959,7 +1957,7 @@ fn draw_popup(
                     "  In filename prompts q is typed; Esc cancels",
                     "",
                     "? / help · i info · q close/quit · Ctrl+C quit",
-                    "Esc cancels menus only; never quits the viewer",
+                    "Esc closes menus or exits projection; never quits the viewer",
                     "Shortcuts shown are defaults; optional NIV_KEYS remaps viewer keys.",
                 ]
                 .into_iter()
@@ -2425,7 +2423,10 @@ fn mouse_raster(
         )
     };
     let box_w = geom.cols as f64 * cw as f64;
-    let box_h = geom.rows as f64 * ch as f64;
+    let box_h = (geom.rows as usize * ch).saturating_sub(view.y_offset) as f64;
+    if box_h <= 0. {
+        return None;
+    }
     let scale = (box_w / geom.width as f64).min(box_h / geom.height as f64);
     let display_w = geom.width as f64 * scale;
     let display_h = geom.height as f64 * scale;
@@ -2745,6 +2746,19 @@ fn reveal_template(
         }
     }
     Ok(())
+}
+
+// Successful file drops need no status row; retain useful partial-failure details.
+fn paste_load_notice(loaded: usize, errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Loaded {loaded}; {} failed: {}",
+            errors.len(),
+            errors[0]
+        ))
+    }
 }
 
 /// Decode literal or shell-escaped paths from a terminal paste, never execute them.
@@ -3180,7 +3194,7 @@ fn run() -> Result<()> {
                         // Never interpret pasted text as viewer shortcuts. In ordinary
                         // viewing mode, a file drop can load aligned intensity layers.
                         if app.edit.is_none() && app.popup.is_none() {
-                            app.notice = Some(match pasted_image_paths(&text) {
+                            app.notice = match pasted_image_paths(&text) {
                                 Ok(paths) => {
                                     let mut loaded = 0;
                                     let mut errors = Vec::new();
@@ -3196,18 +3210,10 @@ fn run() -> Result<()> {
                                     if loaded > 0 {
                                         app.selected = app.layer_order.len() - 1;
                                     }
-                                    if errors.is_empty() {
-                                        format!("Loaded {loaded} pasted image(s)")
-                                    } else {
-                                        format!(
-                                            "Loaded {loaded}; {} failed: {}",
-                                            errors.len(),
-                                            errors[0]
-                                        )
-                                    }
+                                    paste_load_notice(loaded, &errors)
                                 }
-                                Err(err) => format!("Paste: {err:#}"),
-                            });
+                                Err(err) => Some(format!("Paste: {err:#}")),
+                            };
                             pending_layout = true;
                             pending_frame = true;
                         } else if let Some(editor) = app.edit.as_mut() {
@@ -3360,6 +3366,16 @@ mod mouse_tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     #[test]
+    fn successful_file_drops_are_silent_but_errors_are_reported() {
+        assert_eq!(paste_load_notice(2, &[]), None);
+        let errors = vec!["bad.nii.gz: grid mismatch".to_string()];
+        assert_eq!(
+            paste_load_notice(1, &errors).as_deref(),
+            Some("Loaded 1; 1 failed: bad.nii.gz: grid mismatch")
+        );
+    }
+
+    #[test]
     fn pasted_paths_accept_spaces_and_multiple_files() {
         let dir = std::env::temp_dir().join(format!("niv-drop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3495,6 +3511,10 @@ mod mouse_tests {
         assert_eq!(mouse_raster(view, mouse(1, 3), false, 8, 16), None);
         let shifted = ViewLayout {
             y_offset: 8,
+            geom: render::Geometry {
+                height: 72,
+                ..view.geom
+            },
             ..view
         };
         assert_eq!(
@@ -3586,6 +3606,25 @@ mod layout_invalidation_tests {
         assert_eq!(header_estimate(&vol, &app, &layers).len(), 2);
         app.base_visible = false;
         assert_eq!(header_estimate(&vol, &app, &layers).len(), 1);
+    }
+
+    #[test]
+    fn half_cell_inset_reclaims_the_previously_reserved_row() {
+        let vol = Volume {
+            data: ndarray::Array3::zeros((10, 10, 10)),
+            spacing: [1.; 3],
+            sform: None,
+            datatype: 16,
+        };
+        let app = App::new(volume::Axis::X, 3, 1, 90, (0., 1.), "test".into());
+        // 100 columns x 40 rows, 8x16 pixel cells; one header and three footer rows.
+        let old = render::geometry_with_inset(&vol, &app, 100, 40, 5, (8, 16), 0);
+        let new = render::geometry_with_inset(&vol, &app, 100, 40, 4, (8, 16), 8);
+        assert_eq!(old.rows, 35);
+        assert_eq!(new.rows, 36);
+        assert_eq!(new.height, 36 * 16 - 8);
+        assert_eq!(new.width, new.height); // Square volume stays square.
+        assert_eq!(1 + new.rows, 37); // Footer starts at row 37, not overlapped.
     }
 
     #[test]
