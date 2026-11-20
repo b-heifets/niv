@@ -185,6 +185,7 @@ pub struct App {
     pub directory_picker: Option<DirectoryPicker>,
     pub picker_cursor: Option<usize>,
     pub picker_atlas: bool,
+    pub picker_template: bool,
     pub picker_atlas_lut: bool,
     pub picker_lut_atlas: Option<PathBuf>,
     pub picker_lut_path: Option<PathBuf>,
@@ -204,7 +205,7 @@ pub enum Action {
     Layout,
     LoadOverlays(Vec<PathBuf>),
     LoadAtlas(Option<PathBuf>),
-    LoadTemplate,
+    LoadTemplate(Option<PathBuf>),
     SaveScene(PathBuf),
     CopyRegion,
     CopyPath(PathBuf),
@@ -266,6 +267,7 @@ impl App {
             directory_picker: None,
             picker_cursor: None,
             picker_atlas: false,
+            picker_template: false,
             picker_atlas_lut: false,
             picker_lut_atlas: None,
             picker_lut_path: None,
@@ -666,6 +668,7 @@ impl App {
 
     fn open_picker(&mut self) -> Action {
         self.picker_atlas = false;
+        self.picker_template = false;
         self.picker_atlas_lut = false;
         self.picker_lut_atlas = None;
         self.picker_lut_path = None;
@@ -680,6 +683,16 @@ impl App {
             completion: Some(path_complete::search("")),
             checked: Vec::new(),
         });
+        Action::Layout
+    }
+    pub fn open_atlas_picker(&mut self) -> Action {
+        self.open_picker();
+        self.picker_atlas = true;
+        Action::Layout
+    }
+    pub fn open_template_picker(&mut self) -> Action {
+        self.open_picker();
+        self.picker_template = true;
         Action::Layout
     }
     fn open_recursive(&mut self) -> Action {
@@ -967,7 +980,7 @@ impl App {
                 Action::Layout
             }
             KeyCode::Char(' ') => {
-                if self.picker_atlas {
+                if self.picker_atlas || self.picker_template {
                     return Action::None;
                 }
                 if let Some(m) = editor.completion.as_ref().and_then(|m| m.selected()) {
@@ -983,7 +996,7 @@ impl App {
                 Action::Layout
             }
             KeyCode::Enter => {
-                if !self.picker_atlas && !editor.checked.is_empty() {
+                if !self.picker_atlas && !self.picker_template && !editor.checked.is_empty() {
                     let paths = editor.checked.clone();
                     return Action::LoadOverlays(paths);
                 }
@@ -1029,6 +1042,8 @@ impl App {
                 editor.checked.push(path.clone());
                 if self.picker_atlas {
                     Action::LoadAtlas(Some(path))
+                } else if self.picker_template {
+                    Action::LoadTemplate(Some(path))
                 } else {
                     Action::LoadOverlays(vec![path])
                 }
@@ -1296,15 +1311,13 @@ impl App {
                     if key.kind == KeyEventKind::Repeat {
                         return Action::None;
                     }
-                    self.open_picker();
-                    self.picker_atlas = true;
-                    return Action::Layout;
+                    return self.open_atlas_picker();
                 }
                 KeyCode::Char('t' | 'T' | '\x14') => {
                     return if key.kind == KeyEventKind::Repeat {
                         Action::None
                     } else {
-                        Action::LoadTemplate
+                        Action::LoadTemplate(None)
                     };
                 }
                 _ => {}
@@ -1501,14 +1514,12 @@ impl App {
                 }
                 Action::Redraw
             }
-            KeyCode::Char('t') => {
-                self.show_layer_list = !self.show_layer_list;
-                if self.show_layer_list {
-                    self.fullscreen = false;
+            KeyCode::Char('t') if !m.contains(KeyModifiers::SHIFT) => {
+                if key.kind == KeyEventKind::Repeat {
+                    Action::None
                 } else {
-                    self.cut_layer = None;
+                    Action::LoadTemplate(None)
                 }
-                Action::Layout
             }
             KeyCode::Char(c @ '1'..='9') => {
                 let number = (c as u8 - b'0') as usize;
@@ -1985,7 +1996,7 @@ mod tests {
                 KeyCode::Char('t'),
                 KeyModifiers::CONTROL
             ),
-            Action::LoadTemplate
+            Action::LoadTemplate(None)
         );
         assert_eq!(
             key(
@@ -2092,6 +2103,38 @@ mod tests {
         );
         assert!(!app.picker_atlas);
         assert!(!app.picker_atlas_lut);
+    }
+    #[test]
+    fn template_shortcut_and_single_file_picker() {
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::X, 0, 1, 90, (0., 1.), "test".into());
+        let none = KeyModifiers::NONE;
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none),
+            Action::LoadTemplate(None)
+        );
+        assert!(!app.show_layer_list);
+        assert_eq!(app.open_template_picker(), Action::Layout);
+        assert!(app.picker_template && !app.picker_atlas);
+        let root = std::env::temp_dir().join(format!("niv-template-picker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("template.nii.gz");
+        std::fs::write(&path, b"").unwrap();
+        let text = path.to_string_lossy().into_owned();
+        let editor = app.edit.as_mut().unwrap();
+        editor.text = text.clone();
+        editor.completion = Some(path_complete::search(&text));
+        key(&mut app, &vol, &mut layers, KeyCode::Char(' '), none);
+        assert!(app.edit.as_ref().unwrap().checked.is_empty());
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Enter, none),
+            Action::LoadTemplate(Some(path))
+        );
+        key(&mut app, &vol, &mut layers, KeyCode::Esc, none);
+        key(&mut app, &vol, &mut layers, KeyCode::Char('n'), none);
+        assert!(!app.picker_template);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn modifiers_stride_and_new_atlas_toggle() {
@@ -3001,7 +3044,7 @@ mod tests {
         let order = app.layer_order.clone();
         let none = KeyModifiers::NONE;
         assert_eq!(
-            key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none),
+            key(&mut app, &vol, &mut layers, KeyCode::Tab, none),
             Action::Layout
         );
         assert_eq!(
@@ -3054,7 +3097,7 @@ mod tests {
         let mut layers = Layers::default();
         let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
         let none = KeyModifiers::NONE;
-        key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none);
+        key(&mut app, &vol, &mut layers, KeyCode::Tab, none);
         key(&mut app, &vol, &mut layers, KeyCode::Char('?'), none);
         assert_eq!(
             key(&mut app, &vol, &mut layers, KeyCode::Char('q'), none),
@@ -3087,7 +3130,7 @@ mod tests {
         let none = KeyModifiers::NONE;
         for mode in [
             None,
-            Some('t'),
+            Some('\t'),
             Some('?'),
             Some('I'),
             Some('m'),
@@ -3096,7 +3139,17 @@ mod tests {
         ] {
             let mut app = App::new(Axis::Z, 30, 1, 0, (0., 20.), "base".into());
             if let Some(c) = mode {
-                key(&mut app, &vol, &mut layers, KeyCode::Char(c), none);
+                key(
+                    &mut app,
+                    &vol,
+                    &mut layers,
+                    if c == '\t' {
+                        KeyCode::Tab
+                    } else {
+                        KeyCode::Char(c)
+                    },
+                    none,
+                );
             }
             if matches!(mode, Some('n' | 's')) {
                 let before = app.edit.as_ref().unwrap().text.clone();
@@ -3124,7 +3177,7 @@ mod tests {
         let none = KeyModifiers::NONE;
         key(&mut app, &vol, &mut layers, KeyCode::Char('f'), none);
         assert!(app.fullscreen);
-        key(&mut app, &vol, &mut layers, KeyCode::Char('t'), none);
+        key(&mut app, &vol, &mut layers, KeyCode::Tab, none);
         assert!(app.show_layer_list && !app.fullscreen);
         key(&mut app, &vol, &mut layers, KeyCode::Char('f'), none);
         assert!(app.fullscreen && !app.show_layer_list);
@@ -3759,7 +3812,7 @@ mod layer_list_escape_tests {
             app.key(
                 &volume,
                 &mut layers,
-                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
             ),
             Action::Layout
         );
@@ -3804,7 +3857,7 @@ mod layer_list_escape_tests {
         app.key(
             &volume,
             &mut layers,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
         );
         app.key(
             &volume,

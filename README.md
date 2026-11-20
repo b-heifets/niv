@@ -31,7 +31,7 @@ niv brain.nii.gz -a --atlas-aa                 # optional smoother atlas edges
 niv brain.nii.gz --fps 20 --profile        # if Rex still queues images after key release
 ```
 
-The screen has voxel coordinates and visible-layer values at the upper left, a centered colored region name, and `Press ? for help` at upper right on the same line. Overflow uses the empty left image gutter where possible, or additional header rows in narrow panes; long region names are clipped to avoid collisions. The reserved header size is based on the loaded layer ranges rather than hovered values to avoid image resizing during inspection. A blank row separates the header from the image. Axis and slice information remain available with `i`. The **full-width rounded selected-layer panel below the image** shows `1: image | min: … | max: … | α: …`. Names use a middle ellipsis if space is tight; Tab (or `t`) reveals a list of layers in **top-to-bottom order**, while `i` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
+The screen has voxel coordinates and visible-layer values at the upper left, a centered colored region name, and `Press ? for help` at upper right on the same line. Overflow uses the empty left image gutter where possible, or additional header rows in narrow panes; long region names are clipped to avoid collisions. The reserved header size is based on the loaded layer ranges rather than hovered values to avoid image resizing during inspection. A fractional-cell inset separates the header from the image. Axis and slice information remain available with `i`. The **full-width rounded selected-layer panel below the image** shows `1: image | min: … | max: … | α: …`. Names use a middle ellipsis if space is tight; Tab reveals a list of layers in **top-to-bottom order**, while `i` shows full metadata. No persistent shortcut footer is shown. Loading messages/errors or typed range/opacity editors temporarily appear at the bottom. The `n` file picker temporarily replaces the image with a filterable list, without continually redrawing the NIfTI raster.
 
 ### Keys
 
@@ -59,13 +59,13 @@ The screen has voxel coordinates and visible-layer values at the upper left, a c
 | `w` / `{` (or `{` / `}`) | Raise / lower selected image |
 | `d` | Unload selected image (keep at least one reference image) |
 | `Y` | Copy selected image path to clipboard and yank display settings |
-| `X` in `t` | Mark selected image for a move |
-| `p` / `P` in `t` | Paste below / above selected image (move if cut; duplicate if yanked) |
+| `X` in the layer list | Mark selected image for a move |
+| `p` / `P` in the layer list | Paste below / above selected image (move if cut; duplicate if yanked) |
 | `e`, `m`, `M` | Edit selected-layer range / only min / only max |
 | `0` | Reset range to actual finite min/max |
 | `o`; `O` | Edit selected-layer opacity; edit atlas opacity |
 | `l` | Cycle gray → warm → cool → categorical integer-ID palette |
-| Tab / `t` | Open layer list (top image first); Tab or ↑/↓ selects; Shift+↑/↓ reorders; Enter/q/Esc closes |
+| Tab | Open layer list (top image first); Tab or ↑/↓ selects; Shift+↑/↓ reorders; Enter/q/Esc closes |
 | Space | Toggle selected image visibility (including the original base) |
 | `I` (Shift+i) | Toggle keyboard inspection crosshair / pointer hover |
 | `x`,`c`,`z` (`y` alias) | Change array slicing axis; repeat any axis key to mirror horizontally |
@@ -209,7 +209,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 ### Reordering image layers
 
-Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`{`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; further Esc presses do nothing; use q or Ctrl+C to exit `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`{`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press Tab for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; further Esc presses do nothing; use q or Ctrl+C to exit `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
 ## Save and reload scenes (v0.15)
 
@@ -235,7 +235,7 @@ ordering**, each layer's visibility, grayscale/color palette, display window
 and opacity, the atlas/LUT and atlas settings, slice/axis/rotation/flips,
 selected layer, inspection state, montage range/layout, and performance defaults.
 
-`[[layers]]` entries are stored **top-to-bottom**, matching `t`; exactly one has `role = "base"`.
+`[[layers]]` entries are stored **top-to-bottom**, matching the Tab layer list; exactly one has `role = "base"`.
 The atlas is represented separately and always remains the topmost layer.
 `view.selected` is zero-based (0 is the top image).
 File paths below the scene directory are saved as **relative paths**, so moving
@@ -327,8 +327,8 @@ Categorical filenames now use one interpolated RGB color per character.
 ### v0.21: image registers, independent orientation and simpler outlines
 
 - `i` opens/closes information; `I` toggles keyboard probe vs mouse hover in slice mode.
-- `Y` copies the selected relative path where possible via OSC 52 and remembers its window, palette, opacity, visibility and projection method. Open `t`, select an insertion point, and use `p` below or `P` above. A yank paste reloads the image as an independent layer; no file is copied or modified on disk.
-- `X` in `t` marks a layer `[cut]` without unloading it. Navigate to the target and paste below/above; this moves the existing layer with no voxel copy. Closing the list cancels the pending move. Outside `t`, `X` still sets MAX. `A` and `U` still set projection methods in the list.
+- `Y` copies the selected relative path where possible via OSC 52 and remembers its window, palette, opacity, visibility and projection method. Open the Tab layer list, select an insertion point, and use `p` below or `P` above. A yank paste reloads the image as an independent layer; no file is copied or modified on disk.
+- `X` in the layer list marks a layer `[cut]` without unloading it. Navigate to the target and paste below/above; this moves the existing layer with no voxel copy. Closing the list cancels the pending move. Outside the layer list, `X` still sets MAX. `A` and `U` still set projection methods in the list.
 - `d` unloads the selected image. If the original reference is unloaded, another aligned image becomes the reference, retaining all layer settings and projection cache identity. The last image cannot be unloaded; Space can hide it for an atlas-only view.
 - Each axis remembers its own rotation and flips for the current session. Scenes still store only the active axis transform.
 - `T` in projection mode cycles major divisions, broad regions, whole-brain silhouette, none. Major mode combines selected anatomical divisions; both grouped modes merge all cerebellar cortex/nuclei and omit ventricular and fiber-tract outlines. Enclosed holes in projected masks are filled before drawing their exterior faces. Disconnected components and overlapping groups can still have distinct outlines. This is a presentation-only simplification, not a modification of the atlas or a surface rendering. Contiguous collinear edges are merged to reduce stroke work, and masks use a direct lookup for compact label IDs. Group preparation is lazy and cached by axis and detail.
@@ -378,7 +378,7 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
   Ctrl+G (delete previous alphanumeric/underscore word), Ctrl+K (delete to end),
   Alt+D (delete next space-delimited word), Backspace and Delete. Bare Left/Right
   move the cursor in the zoxide query. Space still marks a NIfTI file in `n`.
-- The selected path emphasizes its basename. The live `t` list uses a highlighted
+- The selected path emphasizes its basename. The live Tab list uses a highlighted
   row, `❯`, visible/hidden indicators, and a compact heading. The normal viewer
   keeps two top rows and a single bottom information row; the top right shows
   axis/slice or mode and help. Filename colors (including per-character rainbow)
@@ -407,7 +407,7 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
   path via OSC 52. Hidden/ignored files follow fd's normal defaults.
 - Tab opens the rounded layer panel, subsequent Tab cycles downward (Shift+Tab
   reverses). Shift+Up/Down changes compositing order; Enter/Esc/q closes.
-  `t` remains a toggle. `f` fills the terminal; `h` flips horizontally; `v` flips
+  `t` loads/reveals the default template or opens a picker. `f` fills the terminal; `h` flips horizontally; `v` flips
   vertically. Old Kitty graphics are retained until the replacement is ready
   on layout changes; no intermediate animation frames are generated.
 - Montage raster budget defaults to 4,000,000 pixels independently of the
@@ -422,9 +422,9 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
 
 ### v0.26: reference images on demand
 
-- `a`: load `$ATLAS` if no atlas is loaded; afterward toggle its visibility (independent in projection mode).
+- `a`: load `$ATLAS` if no atlas is loaded (open the atlas picker if the default is absent); afterward toggle its visibility (independent in projection mode).
 - `Ctrl+A`: choose a solid atlas, using the same picker as images. `Ctrl+Z` opens zoxide, `Ctrl+R` opens recursive fd. Enter loads a single atlas; Space multi-marking is disabled. Custom atlases use numeric labels without a LUT by default; `Ctrl+L` opens a custom CSV picker for the highlighted atlas. `Ctrl+O` enables the configured LUT (`$ATLAS_LUT`). Selecting the configured atlas automatically uses its configured LUT. Only use a LUT whose IDs match the atlas.
-- `Ctrl+T`: load/reveal `$TEMPLATE` below other layers, without duplicating an already loaded file. New templates use grayscale and AVG when projecting.
+- `t` or `Ctrl+T`: load/reveal `$TEMPLATE` below other layers, without duplicating an already loaded file; open a single-file template picker if the configured file is absent. New templates use grayscale and AVG when projecting.
 - All volumes must be aligned to the original voxel grid. A failed atlas replacement leaves the existing atlas intact. Runtime atlas paths/settings are included in saved scenes. No atlas/template is read at startup unless requested with `-a`/`-t` or a scene.
 - Filenames containing `cluster` (case-insensitive) or a separate `ci` token default to the categorical palette. Explicit overlay tint and scene palette take precedence. Change palettes with `l`.
 - The header uses one row in the common case, reclaiming a terminal row for the image. Additional rows are allocated for overflow; the footer remains at the last terminal row.
@@ -442,3 +442,10 @@ are unchanged. The small `unicode-width` dependency is used only for text layout
 ## v0.26.3
 
 Successful pasted image loads are silent; failures still show a status message. Esc closes an open menu first, otherwise returns from projection to normal slices (like V), and never exits the application. The normal viewer retains its half-cell top inset but no longer reserves a whole extra row for it; image dimensions and mouse hit testing account for the inset. Montage and fill mode are unchanged.
+
+### v0.26.4
+
+- Tab is the layer-list shortcut; `t` (or Ctrl+T) loads/reveals the configured template below the intensity stack. If the configured path is unset or missing, a single-file template picker opens with zoxide and fd support.
+- `a` opens the atlas picker when no atlas is loaded and the configured path is unset or missing. Ctrl+A always opens the atlas picker.
+- The layer-list heading is bold and bright; numeric range editors show the actual finite data minimum/maximum alongside the current setting.
+- `b` toggles black/RGB and transparent/RGBA at runtime, as before. To prefer transparent on startup, set `export NIV_BACKGROUND=transparent` in `~/.config/niv/env.zsh`. `--background black` overrides that environment setting. Scenes continue to restore their saved background.

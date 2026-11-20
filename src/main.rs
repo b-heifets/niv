@@ -406,6 +406,16 @@ fn compact_number(v: f32) -> String {
         format!("{v:.5e}")
     }
 }
+fn range_edit_hint(field: EditField, window: (f32, f32), data: (f32, f32)) -> String {
+    let (lo, hi) = window;
+    let (data_lo, data_hi) = data;
+    let current = match field {
+        EditField::Minimum => format!("{lo}"),
+        EditField::Maximum => format!("{hi}"),
+        _ => format!("{lo},{hi}"),
+    };
+    format!("Data: {data_lo}..{data_hi} | current: {current}")
+}
 fn rgb_color(rgb: [u8; 3]) -> Color {
     Color::Rgb {
         r: rgb[0],
@@ -550,7 +560,7 @@ fn draw_ui(
     vol: &Volume,
     layers: &Layers,
     app: &App,
-    _base_range: (f32, f32),
+    base_range: (f32, f32),
     view: ViewLayout,
 ) -> Result<()> {
     if app.fullscreen {
@@ -738,6 +748,17 @@ fn draw_ui(
         "─".repeat(panel_width.saturating_sub(2 + title.width()))
     );
     line(out, view.footer, &border, cols, PICKER_MUTED, 0)?;
+    if view.list_count > 0 && title.starts_with(" Layers") {
+        queue!(
+            out,
+            MoveTo(2, view.footer),
+            SetForegroundColor(PICKER_FG),
+            SetAttribute(Attribute::Bold),
+            Print("Layers"),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )?;
+    }
     if app.montage.enabled {
         let reserved = (view.head + rows.saturating_sub(view.footer)) as usize;
         let plan = montage::plan(vol, app, cols, rows, reserved);
@@ -875,9 +896,15 @@ fn draw_ui(
             } else {
                 // Display the shortest round-trippable f32, not the five-decimal footer.
                 match edit.field {
-                    EditField::Minimum => format!("current: {lo}"),
-                    EditField::Maximum => format!("current: {hi}"),
-                    EditField::Both => format!("current: {lo},{hi}"),
+                    EditField::Minimum | EditField::Maximum | EditField::Both => {
+                        let id = app.selected_layer_id();
+                        let (data_lo, data_hi) = if id == 0 {
+                            base_range
+                        } else {
+                            layers.overlays[id - 1].data_range
+                        };
+                        range_edit_hint(edit.field, (lo, hi), (data_lo, data_hi))
+                    }
                     _ => edit
                         .completion
                         .as_ref()
@@ -886,7 +913,20 @@ fn draw_ui(
                 }
             };
             let cols_available = cols.saturating_sub(footer_x) as usize;
-            let hint = middle_ellipsis(&hint, (cols_available / 3).max(12));
+            let hint = middle_ellipsis(
+                &hint,
+                if matches!(
+                    edit.field,
+                    EditField::Minimum | EditField::Maximum | EditField::Both
+                ) {
+                    cols_available
+                        .saturating_sub(what.width() + 24)
+                        .max(12)
+                        .min(hint.width())
+                } else {
+                    (cols_available / 3).max(12)
+                },
+            );
             let overhead = what.chars().count() + err.chars().count() + hint.chars().count() + 24;
             let shown = middle_ellipsis(&edit.text, cols_available.saturating_sub(overhead).max(8));
             let txt = format!("{what} > {shown}_  {err}  {hint}    Enter apply · Esc cancel");
@@ -1352,6 +1392,8 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
             out,
             if app.picker_lut_atlas.is_some() {
                 "Choose atlas LUT CSV"
+            } else if app.picker_template {
+                "Load anatomical template"
             } else {
                 match (app.picker_atlas, app.recursive_files.is_some()) {
                     (true, true) => "fd · Find atlas",
@@ -1388,6 +1430,8 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
                     "auto / IDs"
                 }
             )
+        } else if app.picker_template {
+            format!("{} matches · bottom layer · ", matches.values.len())
         } else {
             format!("{} · {} marked · ", matches.status(), editor.checked.len())
         };
@@ -1413,7 +1457,13 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
             let prefix = format!(
                 "{} {} ",
                 if active { "❯" } else { " " },
-                if marked { "[✓]" } else { "[ ]" }
+                if app.picker_template && !marked {
+                    "   "
+                } else if marked {
+                    "[✓]"
+                } else {
+                    "[ ]"
+                }
             );
             let label = item
                 .path
@@ -1463,6 +1513,8 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
                 "↑↓ choose CSV · Ctrl+Y copy path · Esc back"
             } else if app.picker_atlas {
                 "↑↓ choose · Ctrl+L choose CSV · Ctrl+O configured LUT"
+            } else if app.picker_template {
+                "↑↓ choose template · Ctrl+Y copy path"
             } else if app.recursive_files.is_some() {
                 "↑↓ / Tab select · Space mark · Ctrl+Space query space · Ctrl+Y copy"
             } else {
@@ -1490,6 +1542,8 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
                 "Enter load atlas + LUT · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
             } else if app.picker_atlas {
                 "Enter load atlas · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
+            } else if app.picker_template {
+                "Enter load template · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
             } else {
                 "Enter load · Esc back · Ctrl+Z zoxide · Ctrl+R fd · Ctrl+Y copy"
             },
@@ -1695,6 +1749,8 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
             "Choose atlas LUT CSV"
         } else if app.picker_atlas {
             "Load solid label atlas"
+        } else if app.picker_template {
+            "Load anatomical template"
         } else {
             "Load NIfTI images"
         },
@@ -1732,6 +1788,12 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
                     },
                     directory
                 )
+            } else if app.picker_template {
+                format!(
+                    "{} matches · bottom layer · in {}",
+                    matches.values.len(),
+                    directory
+                )
             } else {
                 format!(
                     "{} · marked {} · in {}",
@@ -1760,7 +1822,13 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
         let prefix = format!(
             "{} {} ",
             if active { ">" } else { " " },
-            if marked { "[x]" } else { "[ ]" }
+            if app.picker_template && !marked {
+                "   "
+            } else if marked {
+                "[x]"
+            } else {
+                "[ ]"
+            }
         );
         let label = item
             .path
@@ -1795,7 +1863,11 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
             line(
                 out,
                 rows - 3,
-                "↑↓ choose · Tab complete · ←→ parent/child · Space mark",
+                if app.picker_template || app.picker_atlas {
+                    "↑↓ choose · Tab complete · ←→ parent/child"
+                } else {
+                    "↑↓ choose · Tab complete · ←→ parent/child · Space mark"
+                },
                 cols,
                 Color::DarkGrey,
                 x,
@@ -1809,6 +1881,8 @@ fn draw_picker_plain(out: &mut impl Write, app: &App) -> Result<()> {
                     "Enter atlas + LUT · Esc back · Ctrl+Z zoxide · Ctrl+R fd"
                 } else if app.picker_atlas {
                     "Enter atlas · Ctrl+L CSV · Ctrl+O configured LUT · Ctrl+Z zoxide"
+                } else if app.picker_template {
+                    "Enter template · Esc cancel · Ctrl+Z zoxide · Ctrl+R fd"
                 } else {
                     "Enter load · Esc cancel · Ctrl+Z zoxide browser · PgUp/PgDn page"
                 },
@@ -1884,9 +1958,9 @@ fn draw_popup(
                     "",
                     "LAYERS",
                     "  1–9 / ;  Select image; Tab opens ordered layer list",
-                    "  In t: ↑↓ / jk select; A/U set method; Enter closes",
+                    "  In layer list: ↑↓ / jk select; A/U set method; Enter closes",
                     "  Space     Hide/show selected image",
-                    "  In t: Y copy · X cut · p/P paste below/above",
+                    "  In layer list: Y copy · X cut · p/P paste below/above",
                     "  d unload · w raise · { lower · Y yank",
                     "",
                     "VIEW",
@@ -1895,9 +1969,9 @@ fn draw_popup(
                     "  l palette · o opacity",
                     "",
                     "ATLAS & APPEARANCE",
-                    "  a load/toggle atlas · O atlas opacity",
+                    "  a load/toggle atlas (pick if missing) · O atlas opacity",
                     "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L choose CSV)",
-                    "  Ctrl+T  Load/reveal configured template below images",
+                    "  t / Ctrl+T  Load/reveal template; pick if default missing",
                     "  T enable/cycle major / broad / silhouette; a hide/show",
                     "  g edge AA · G atlas blur · b background · f fill",
                     "  n load images · Z zoxide · F fd · i info · p montage",
@@ -1934,9 +2008,9 @@ fn draw_popup(
                     "         ↑↓ select · Tab complete · Space mark · Enter load",
                     "  d unload · w raise · { lower · Y yank path",
                     "  Reload saved scene: niv --scene FILE.niv.toml",
-                    "         Atlas always stays on top; t shows stack order",
+                    "         Atlas always stays on top; Tab shows stack order",
                     "  Space  Toggle selected image",
-                    "  In t: X cut (move); p/P paste below/above; Y copy",
+                    "  In layer list: X cut (move); p/P paste below/above; Y copy",
                     "",
                     "DISPLAY SETTINGS",
                     "  e      Edit min,max     m / M   Edit just min / max",
@@ -1944,14 +2018,14 @@ fn draw_popup(
                     "  o      Image opacity    O       Atlas opacity",
                     "",
                     "ATLAS & PROJECTION",
-                    "  a      Load/toggle atlas    X / A / U  Projection max/avg/min+",
+                    "  a      Load/toggle atlas (pick if missing) · X/A/U projections",
                     "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L choose CSV)",
-                    "  Ctrl+T  Load/reveal configured template below images",
+                    "  t / Ctrl+T  Load/reveal template; pick if default missing",
                     "  g      Edge AA (optional)    V   Return to slices",
                     "  u or left click: copy hovered atlas region; OSC 52",
                     "  G      Atlas Gaussian blur (0 = off)",
                     "  b      Black / transparent",
-                    "  Tab/t  Layer list: Tab / ↑↓ / jk select; Shift+↑↓ reorder",
+                    "  Tab    Layer list: Tab / ↑↓ / jk select; Shift+↑↓ reorder",
                     "         Enter / q / Esc close; f fill; Q pixel budget",
                     "  + / -  Contrast         , / .   Brightness",
                     "  In filename prompts q is typed; Esc cancels",
@@ -1985,7 +2059,7 @@ fn draw_popup(
                     "  g   Edge AA    G   Atlas Gaussian blur (0..4 px)",
                     "  a   Load/toggle atlas    O   Atlas opacity",
                     "  Ctrl+A  Pick atlas (Ctrl+Z zoxide / Ctrl+R fd; Ctrl+L choose CSV)",
-                    "  Ctrl+T  Load/reveal configured template below images",
+                    "  t / Ctrl+T  Load/reveal template; pick if default missing",
                     "",
                     "LAYERS",
                     "  1–9 select layer · e window · l palette · o opacity",
@@ -1993,7 +2067,7 @@ fn draw_popup(
                     "  n   Load images    Tab Layer list    s   Save scene",
                     "  In layer list: Tab / ↑↓ select · Shift+↑↓ reorder · Enter close",
                     "  In picker: Ctrl+Z zoxide · Ctrl+R fd · Ctrl+Y copy path",
-                    "  In t: Y copy · X cut · p/P paste · d unload",
+                    "  In layer list: Y copy · X cut · p/P paste · d unload",
                     "  i   Info   q / ? / Esc close help · Ctrl+C quit",
                 ]
                 .into_iter()
@@ -3062,81 +3136,111 @@ fn run() -> Result<()> {
                             Action::LoadAtlas(chosen) => {
                                 let default = env_path("ATLAS");
                                 let from_picker = chosen.is_some();
-                                let use_lut = !from_picker
-                                    || app.picker_atlas_lut
-                                    || chosen
-                                        .as_ref()
-                                        .zip(default.as_ref())
-                                        .is_some_and(|(a, b)| same_file(a, b));
-                                let lut = if from_picker && app.picker_lut_atlas.is_some() {
-                                    app.picker_lut_path.clone()
-                                } else if use_lut {
-                                    env_path("ATLAS_LUT")
+                                if !from_picker && !default.as_ref().is_some_and(|p| p.is_file()) {
+                                    app.open_atlas_picker();
+                                    app.notice = None;
                                 } else {
-                                    None
-                                };
-                                let path = chosen.or(default);
-                                let result = if let Some(path) = path {
-                                    app.notice =
-                                        Some(format!("Loading atlas: {} ...", path.display()));
-                                    if from_picker {
-                                        draw_picker(&mut out, &app)?;
-                                    }
-                                    replace_atlas(
-                                        &path,
-                                        lut,
-                                        &vol,
-                                        &mut config,
-                                        &mut app,
-                                        &mut layers,
-                                    )
-                                } else {
-                                    Err(anyhow::anyhow!(
-                                        "ATLAS is not set; Ctrl+A opens atlas picker"
-                                    ))
-                                };
-                                match result {
-                                    Ok(()) => {
-                                        app.edit = None;
-                                        app.recursive_files = None;
-                                        app.directory_picker = None;
-                                        app.picker_atlas = false;
-                                        app.picker_lut_atlas = None;
-                                        app.picker_lut_path = None;
-                                        app.notice = Some("Atlas loaded".into());
-                                        hover_candidate = None;
-                                        hover_deadline = None;
-                                    }
-                                    Err(err) => {
-                                        let msg = format!("Atlas load failed: {err:#}");
-                                        if let Some(editor) = app.edit.as_mut() {
-                                            editor.error = Some(msg);
-                                            editor.checked.clear();
-                                            app.notice = None;
-                                        } else {
-                                            app.notice = Some(msg);
+                                    let use_lut = !from_picker
+                                        || app.picker_atlas_lut
+                                        || chosen
+                                            .as_ref()
+                                            .zip(default.as_ref())
+                                            .is_some_and(|(a, b)| same_file(a, b));
+                                    let lut = if from_picker && app.picker_lut_atlas.is_some() {
+                                        app.picker_lut_path.clone()
+                                    } else if use_lut {
+                                        env_path("ATLAS_LUT")
+                                    } else {
+                                        None
+                                    };
+                                    let path = chosen.or(default);
+                                    let result = if let Some(path) = path {
+                                        app.notice =
+                                            Some(format!("Loading atlas: {} ...", path.display()));
+                                        if from_picker {
+                                            draw_picker(&mut out, &app)?;
+                                        }
+                                        replace_atlas(
+                                            &path,
+                                            lut,
+                                            &vol,
+                                            &mut config,
+                                            &mut app,
+                                            &mut layers,
+                                        )
+                                    } else {
+                                        Err(anyhow::anyhow!(
+                                            "ATLAS is not set; Ctrl+A opens atlas picker"
+                                        ))
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            app.edit = None;
+                                            app.recursive_files = None;
+                                            app.directory_picker = None;
+                                            app.picker_atlas = false;
+                                            app.picker_lut_atlas = None;
+                                            app.picker_lut_path = None;
+                                            app.notice = Some("Atlas loaded".into());
+                                            hover_candidate = None;
+                                            hover_deadline = None;
+                                        }
+                                        Err(err) => {
+                                            let msg = format!("Atlas load failed: {err:#}");
+                                            if let Some(editor) = app.edit.as_mut() {
+                                                editor.error = Some(msg);
+                                                editor.checked.clear();
+                                                app.notice = None;
+                                            } else {
+                                                app.notice = Some(msg);
+                                            }
                                         }
                                     }
                                 }
                                 pending_layout = true;
                                 pending_frame = true;
                             }
-                            Action::LoadTemplate => {
-                                let result = env_path("TEMPLATE")
-                                    .ok_or_else(|| anyhow::anyhow!("TEMPLATE is not set"))
-                                    .and_then(|path| {
-                                        reveal_template(
-                                            &path,
-                                            &vol,
-                                            &config.path,
-                                            &mut app,
-                                            &mut layers,
-                                        )
-                                    });
-                                app.notice = Some(match result {
-                                    Ok(()) => "Template visible at bottom".into(),
-                                    Err(err) => format!("Template load failed: {err:#}"),
-                                });
+                            Action::LoadTemplate(chosen) => {
+                                let from_picker = chosen.is_some();
+                                let path =
+                                    chosen.or_else(|| env_path("TEMPLATE").filter(|p| p.is_file()));
+                                if let Some(path) = path {
+                                    if from_picker {
+                                        app.notice = Some(format!(
+                                            "Loading template: {} ...",
+                                            path.display()
+                                        ));
+                                        draw_picker(&mut out, &app)?;
+                                    }
+                                    match reveal_template(
+                                        &path,
+                                        &vol,
+                                        &config.path,
+                                        &mut app,
+                                        &mut layers,
+                                    ) {
+                                        Ok(()) => {
+                                            app.edit = None;
+                                            app.recursive_files = None;
+                                            app.directory_picker = None;
+                                            app.picker_template = false;
+                                            app.notice = None;
+                                        }
+                                        Err(err) => {
+                                            let msg = format!("Template load failed: {err:#}");
+                                            if let Some(editor) = app.edit.as_mut() {
+                                                editor.error = Some(msg);
+                                                editor.checked.clear();
+                                                app.notice = None;
+                                            } else {
+                                                app.notice = Some(msg);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    app.open_template_picker();
+                                    app.notice = None;
+                                }
                                 pending_layout = true;
                                 pending_frame = true;
                             }
@@ -3834,5 +3938,21 @@ mod runtime_reference_tests {
         .is_err());
         assert_eq!(app.layer_order, vec![0]);
         assert!(layers.overlays.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod range_hint_tests {
+    use super::*;
+    #[test]
+    fn hint_reports_data_range_not_display_window() {
+        assert_eq!(
+            range_edit_hint(EditField::Minimum, (0.9999001, 1.), (0., 1.)),
+            "Data: 0..1 | current: 0.9999001"
+        );
+        assert_eq!(
+            range_edit_hint(EditField::Both, (2., 8.), (-3., 12.)),
+            "Data: -3..12 | current: 2,8"
+        );
     }
 }
