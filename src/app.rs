@@ -1,4 +1,4 @@
-use crate::path_complete::{self, PathMatches};
+use crate::path_complete::{self, DirectoryPicker, PathMatches};
 use crate::{
     layers::{Layers, Palette},
     volume::{Axis, Volume},
@@ -180,6 +180,7 @@ pub struct App {
     pub edit: Option<WindowEdit>,
     /// Previous file filter while the picker is accepting a zoxide directory query.
     pub picker_jump_from: Option<String>,
+    pub directory_picker: Option<DirectoryPicker>,
     pub popup: Option<Popup>,
     pub popup_scroll: usize,
     pub notice: Option<String>,
@@ -250,6 +251,7 @@ impl App {
             probe: None,
             edit: None,
             picker_jump_from: None,
+            directory_picker: None,
             popup: None,
             popup_scroll: 0,
             notice: None,
@@ -634,22 +636,52 @@ impl App {
         if self.picker_jump_from.is_some() {
             if jump_key || key == KeyCode::Esc {
                 editor.text = self.picker_jump_from.take().unwrap();
-                editor.completion = Some(path_complete::search(&editor.text));
+                // The original file-list selection and marks were never changed.
+                self.directory_picker = None;
                 editor.error = None;
                 return Action::Layout;
             }
+            let picker = self
+                .directory_picker
+                .as_mut()
+                .expect("directory picker is open");
             match key {
-                KeyCode::Enter => match path_complete::zoxide_directory(&editor.text) {
+                KeyCode::Enter => match picker.destination() {
                     Ok(dir) => {
                         self.picker_jump_from = None;
+                        self.directory_picker = None;
                         editor.text = dir;
                         editor.completion = Some(path_complete::search(&editor.text));
                         editor.error = None;
                     }
                     Err(e) => editor.error = Some(e),
                 },
+                KeyCode::Up | KeyCode::Down if modifiers.contains(KeyModifiers::CONTROL) => {
+                    picker.scroll_preview(if key == KeyCode::Up { -1 } else { 1 });
+                }
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Tab
+                | KeyCode::BackTab => {
+                    picker.move_by(match key {
+                        KeyCode::Up | KeyCode::BackTab => -1,
+                        KeyCode::PageUp => -10,
+                        KeyCode::PageDown => 10,
+                        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => -1,
+                        _ => 1,
+                    });
+                    editor.error = None;
+                }
                 KeyCode::Backspace => {
                     editor.text.pop();
+                    picker.filter(&editor.text);
+                    editor.error = None;
+                }
+                KeyCode::Char('u' | 'U') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.text.clear();
+                    picker.filter("");
                     editor.error = None;
                 }
                 KeyCode::Char(c)
@@ -666,6 +698,7 @@ impl App {
                         } else {
                             c
                         });
+                    picker.filter(&editor.text);
                     editor.error = None;
                 }
                 _ => return Action::None,
@@ -674,6 +707,7 @@ impl App {
         }
         if jump_key {
             self.picker_jump_from = Some(std::mem::take(&mut editor.text));
+            self.directory_picker = Some(DirectoryPicker::load());
             editor.error = None;
             return Action::Layout;
         }
@@ -1092,7 +1126,10 @@ impl App {
                 _ => {}
             }
         }
-        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
+        if key.code == KeyCode::Esc {
+            return Action::None;
+        }
+        if key.code == KeyCode::Char('q') {
             return Action::Quit;
         }
         match key.code {
@@ -1131,6 +1168,7 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.picker_jump_from = None;
+                self.directory_picker = None;
                 self.edit = Some(WindowEdit {
                     field: EditField::AddPath,
                     text: String::new(),
@@ -2069,12 +2107,14 @@ mod tests {
             KeyModifiers::CONTROL,
         );
         assert_eq!(app.picker_jump_from.as_deref(), Some("f"));
+        assert!(app.directory_picker.is_some());
         for ch in "two words".chars() {
             key(&mut app, &vol, &mut layers, KeyCode::Char(ch), none);
         }
         assert_eq!(app.edit.as_ref().unwrap().text, "two words");
         key(&mut app, &vol, &mut layers, KeyCode::Esc, none);
         assert!(app.picker_jump_from.is_none());
+        assert!(app.directory_picker.is_none());
         assert_eq!(app.edit.as_ref().unwrap().text, "f");
         assert_eq!(
             app.edit.as_ref().unwrap().checked,
@@ -2082,6 +2122,79 @@ mod tests {
         );
         key(&mut app, &vol, &mut layers, KeyCode::Esc, none);
         assert!(app.edit.is_none());
+    }
+
+    #[test]
+    fn directory_jump_enter_uses_highlighted_path_and_preserves_marks() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "niv-jump-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let second = root.join("target with spaces");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("example.nii.gz"), b"").unwrap();
+        let vol = example();
+        let mut layers = Layers::default();
+        let mut app = App::new(Axis::Z, 0, 1, 0, (0., 1.), "base".into());
+        let none = KeyModifiers::NONE;
+        key(&mut app, &vol, &mut layers, KeyCode::Char('n'), none);
+        app.edit
+            .as_mut()
+            .unwrap()
+            .checked
+            .push(PathBuf::from("marked.nii.gz"));
+        // Inject a ranked fixture; no installed zoxide or personal database needed.
+        app.picker_jump_from = Some(String::new());
+        app.directory_picker = Some(DirectoryPicker::from_output(&format!(
+            "20 {}\n10 {}",
+            root.display(),
+            second.display()
+        )));
+        key(&mut app, &vol, &mut layers, KeyCode::Down, none);
+        assert_eq!(
+            app.directory_picker
+                .as_ref()
+                .unwrap()
+                .selected_dir()
+                .unwrap()
+                .path,
+            second
+        );
+        assert_eq!(
+            key(
+                &mut app,
+                &vol,
+                &mut layers,
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ),
+            Action::Quit
+        );
+        assert_eq!(
+            key(&mut app, &vol, &mut layers, KeyCode::Enter, none),
+            Action::Layout
+        );
+        assert!(app.directory_picker.is_none());
+        assert!(app.picker_jump_from.is_none());
+        let editor = app.edit.as_ref().unwrap();
+        assert!(editor.text.ends_with("target with spaces/"));
+        assert_eq!(editor.checked, vec![PathBuf::from("marked.nii.gz")]);
+        assert!(editor
+            .completion
+            .as_ref()
+            .unwrap()
+            .values
+            .iter()
+            .any(|m| m.path.ends_with("example.nii.gz")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3068,7 +3181,7 @@ mod layer_list_escape_tests {
     use ndarray::Array3;
 
     #[test]
-    fn escape_closes_list_then_exits() {
+    fn escape_closes_list_but_never_exits() {
         let volume = Volume {
             data: Array3::zeros((4, 4, 4)),
             spacing: [1.0; 3],
@@ -3100,6 +3213,14 @@ mod layer_list_escape_tests {
                 &volume,
                 &mut layers,
                 KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Action::None
+        );
+        assert_eq!(
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
             ),
             Action::Quit
         );
@@ -3150,6 +3271,14 @@ mod layer_list_escape_tests {
                 &volume,
                 &mut layers,
                 KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Action::None
+        );
+        assert_eq!(
+            app.key(
+                &volume,
+                &mut layers,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
             ),
             Action::Quit
         );

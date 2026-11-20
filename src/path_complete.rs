@@ -61,22 +61,193 @@ pub fn resolve(path: &str) -> PathBuf {
     expand_home(path)
 }
 
-/// Query zoxide only on explicit Enter, never during filename filtering.
-/// No shell evaluation and no process-wide current-directory changes.
-pub fn zoxide_directory(query: &str) -> Result<String, String> {
-    let keywords: Vec<_> = query.split_whitespace().collect();
-    if keywords.is_empty() {
-        return Err("Type at least one directory keyword".into());
+/// Ranked directory entries returned by zoxide. Paths (including spaces) are
+/// preserved separately from the displayed score.
+#[derive(Debug, Clone)]
+pub struct RankedDirectory {
+    pub score: f64,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryPicker {
+    entries: Vec<RankedDirectory>,
+    matches: Vec<usize>,
+    pub selected: usize,
+    pub preview: Vec<PreviewEntry>,
+    pub preview_offset: usize,
+    pub preview_truncated: bool,
+    pub preview_error: Option<String>,
+    pub source_error: Option<String>,
+    preview_path: Option<PathBuf>,
+}
+
+impl DirectoryPicker {
+    /// One subprocess per opening. Filtering and moving the selection never
+    /// invoke zoxide again or change the current working directory.
+    pub fn load() -> Self {
+        let output = std::process::Command::new("zoxide")
+            .args(["query", "--list", "--score"])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                Self::from_output(&String::from_utf8_lossy(&output.stdout))
+            }
+            Ok(output) => Self {
+                source_error: Some(format!(
+                    "zoxide query failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                ..Self::default()
+            },
+            Err(err) => Self {
+                source_error: Some(format!("Cannot run zoxide: {err}")),
+                ..Self::default()
+            },
+        }
     }
-    let output = std::process::Command::new("zoxide")
-        .args(["query", "--"])
-        .args(&keywords)
-        .output()
-        .map_err(|e| format!("Cannot run zoxide: {e}"))?;
-    if !output.status.success() {
-        return Err("No matching zoxide directory (or zoxide database unavailable)".into());
+    pub(crate) fn from_output(output: &str) -> Self {
+        let mut entries = Vec::new();
+        for line in output.lines() {
+            let line = line.trim_start();
+            let Some(split) = line.find(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(score) = line[..split].parse::<f64>() else {
+                continue;
+            };
+            let path = PathBuf::from(line[split..].trim_start());
+            if score.is_finite() && path.is_absolute() {
+                entries.push(RankedDirectory { score, path });
+            }
+        }
+        // Stable sort retains zoxide order among equal scores.
+        entries.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut picker = Self {
+            entries,
+            ..Self::default()
+        };
+        picker.filter("");
+        picker
     }
-    directory_filter(&String::from_utf8_lossy(&output.stdout))
+    pub fn len(&self) -> usize {
+        self.matches.len()
+    }
+    pub fn total(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn get(&self, index: usize) -> Option<&RankedDirectory> {
+        self.matches.get(index).and_then(|&i| self.entries.get(i))
+    }
+    pub fn selected_dir(&self) -> Option<&RankedDirectory> {
+        self.get(self.selected)
+    }
+    pub fn filter(&mut self, query: &str) {
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        self.matches.clear();
+        let mut fuzzy = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            let path = entry.path.to_string_lossy().to_lowercase();
+            if terms.iter().all(|term| path.contains(term.as_str())) {
+                self.matches.push(i);
+            } else if terms.iter().all(|term| subsequence(term, &path)) {
+                fuzzy.push(i);
+            }
+        }
+        // Prefer substring hits, and preserve the original rank within each tier.
+        self.matches.extend(fuzzy);
+        self.selected = 0;
+        self.refresh_preview();
+    }
+    pub fn move_by(&mut self, delta: isize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.matches.len() - 1);
+        self.refresh_preview();
+    }
+    pub fn scroll_preview(&mut self, delta: isize) {
+        self.preview_offset = self
+            .preview_offset
+            .saturating_add_signed(delta)
+            .min(self.preview.len().saturating_sub(1));
+    }
+    pub fn destination(&self) -> Result<String, String> {
+        let dir = self
+            .selected_dir()
+            .ok_or_else(|| "No matching directory selected".to_owned())?;
+        directory_filter(&dir.path.to_string_lossy())
+    }
+    fn refresh_preview(&mut self) {
+        let path = self.selected_dir().map(|d| d.path.clone());
+        if path == self.preview_path {
+            return;
+        }
+        self.preview_path = path;
+        self.preview.clear();
+        self.preview_offset = 0;
+        self.preview_truncated = false;
+        self.preview_error = None;
+        let Some(path) = self.preview_path.as_ref() else {
+            return;
+        };
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.preview_error = Some(format!("Cannot preview directory: {err}"));
+                return;
+            }
+        };
+        // Limit directory I/O. Only the selected directory is read, with no
+        // recursion, file contents, image decoding, or stats for regular files.
+        const LIMIT: usize = 256;
+        for (i, entry) in entries.enumerate() {
+            if i >= LIMIT {
+                self.preview_truncated = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry
+                .file_type()
+                .map(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+                .unwrap_or(false);
+            self.preview.push(PreviewEntry { name, is_dir });
+        }
+        self.preview.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+}
+
+fn subsequence(needle: &str, haystack: &str) -> bool {
+    let mut chars = needle.chars();
+    let mut next = chars.next();
+    for c in haystack.chars() {
+        if next == Some(c) {
+            next = chars.next();
+        }
+        if next.is_none() {
+            return true;
+        }
+    }
+    next.is_none()
 }
 
 fn directory_filter(result: &str) -> Result<String, String> {
@@ -270,6 +441,60 @@ mod tests {
         path
     }
     #[test]
+    fn directory_picker_ranks_filters_and_previews_without_zoxide() {
+        let root = test_directory();
+        let second = root.join("Research folder with spaces");
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("sample.nii.gz"), b"").unwrap();
+        let mut picker = DirectoryPicker::from_output(&format!(
+            "  4.5 {}\n  30.0 {}\ninvalid line\n",
+            second.display(),
+            root.display()
+        ));
+        assert_eq!(picker.total(), 2);
+        assert_eq!(picker.selected_dir().unwrap().path, root);
+        assert!(picker
+            .preview
+            .iter()
+            .any(|e| e.name == "groupA" && e.is_dir));
+        assert!(picker
+            .preview
+            .iter()
+            .any(|e| e.name == "brain_anterior_01.nii.gz"));
+        picker.move_by(1);
+        assert_eq!(picker.selected_dir().unwrap().path, second);
+        assert_eq!(picker.preview[0].name, "sample.nii.gz");
+        assert!(picker
+            .destination()
+            .unwrap()
+            .ends_with("Research folder with spaces/"));
+        picker.filter("RESEARCH spaces");
+        assert_eq!(picker.len(), 1);
+        assert_eq!(picker.selected_dir().unwrap().path, second);
+        picker.filter("rsrch");
+        assert_eq!(picker.len(), 1);
+        picker.filter("zzzz-no-match");
+        assert_eq!(picker.len(), 0);
+        assert!(picker.preview.is_empty());
+        assert!(picker.destination().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn directory_preview_is_bounded_and_scrollable() {
+        let root = test_directory();
+        for i in 0..300 {
+            fs::write(root.join(format!("file-{i}")), b"").unwrap();
+        }
+        let mut picker = DirectoryPicker::from_output(&format!("10 {}", root.display()));
+        assert!(picker.preview_truncated);
+        assert!(picker.preview.len() <= 256);
+        picker.scroll_preview(5);
+        assert_eq!(picker.preview_offset, 5);
+        picker.scroll_preview(-999);
+        assert_eq!(picker.preview_offset, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn zoxide_result_must_be_an_existing_absolute_directory() {
         let root = test_directory();
         let filter = directory_filter(&format!("{}\n", root.display())).unwrap();
@@ -280,7 +505,7 @@ mod tests {
             .any(|m| m.path.ends_with("posterior-Brain.nii")));
         assert!(directory_filter("relative/path").is_err());
         assert!(directory_filter("").is_err());
-        assert!(zoxide_directory("  ").is_err());
+        assert!(DirectoryPicker::default().destination().is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

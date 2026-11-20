@@ -677,6 +677,12 @@ fn draw_ui(
 /// Visible file picker, rather than blind cycling of one filename at a time.
 /// This hides the Kitty placement while the picker is open, so selections only
 /// redraw terminal text (not an expensive NIfTI raster).
+fn safe_terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '�' } else { c })
+        .collect()
+}
+
 fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     queue!(out, Clear(ClearType::All))?;
@@ -684,44 +690,174 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
         return Ok(());
     };
     let x = if cols >= 70 { 3 } else { 1 };
-    if app.picker_jump_from.is_some() {
-        if rows > 0 {
-            line(out, 0, "Jump to directory · zoxide", cols, Color::White, x)?;
+    if let Some(picker) = &app.directory_picker {
+        let width = cols.saturating_sub(x + 1) as usize;
+        if rows == 0 {
+            return Ok(());
         }
+        line(
+            out,
+            0,
+            "Zoxide navigation · choose directory",
+            cols,
+            Color::White,
+            x,
+        )?;
         if rows > 1 {
             line(
                 out,
                 1,
-                &format!("Directory query: {}_", editor.text),
+                &format!(
+                    "Filter: {}_  ·  {}/{} directories  ·  {} marked images",
+                    editor.text,
+                    picker.len(),
+                    picker.total(),
+                    editor.checked.len()
+                ),
                 cols,
                 Color::Yellow,
                 x,
             )?;
         }
-        if rows > 2 {
+        // Give most of the screen to ranked paths; reserve the lower section
+        // for the selected directory's contents (like zi's preview).
+        let available = (rows as usize).saturating_sub(6);
+        let preview_rows = available / 3;
+        let list_rows = available - preview_rows;
+        let start = picker
+            .selected
+            .saturating_sub(list_rows.saturating_sub(1))
+            .min(picker.len().saturating_sub(list_rows));
+        for offset in 0..list_rows {
+            let index = start + offset;
+            let Some(dir) = picker.get(index) else {
+                break;
+            };
+            let active = index == picker.selected;
+            let prefix = format!("{} {:>7.1}  ", if active { ">" } else { " " }, dir.score);
+            let path = safe_terminal_text(&dir.path.to_string_lossy());
+            let txt = format!(
+                "{prefix}{}",
+                middle_ellipsis(&path, width.saturating_sub(prefix.chars().count()))
+            );
             line(
                 out,
-                2,
-                "Type directory keywords · Enter jump · Esc cancel",
+                2 + offset as u16,
+                &txt,
                 cols,
-                Color::Grey,
+                if active { Color::Cyan } else { Color::Grey },
                 x,
             )?;
         }
-        if rows > 3 {
+        if rows > 2 && list_rows > 0 && picker.len() == 0 {
+            let msg = picker
+                .source_error
+                .as_deref()
+                .unwrap_or("No matching directories");
+            line(out, 2, &safe_terminal_text(msg), cols, Color::DarkGrey, x)?;
+        }
+        if rows >= 7 {
+            let divider = 2 + list_rows as u16;
+            let path = picker
+                .selected_dir()
+                .map(|d| safe_terminal_text(&d.path.to_string_lossy()))
+                .unwrap_or_default();
+            let heading = format!("Contents · {}", path);
             line(
                 out,
-                3,
-                &format!("{} marked images retained", editor.checked.len()),
+                divider,
+                &middle_ellipsis(&heading, width),
+                cols,
+                Color::White,
+                x,
+            )?;
+            if let Some(err) = &picker.preview_error {
+                if preview_rows > 0 {
+                    line(
+                        out,
+                        divider + 1,
+                        &safe_terminal_text(err),
+                        cols,
+                        Color::Yellow,
+                        x,
+                    )?;
+                }
+            } else if preview_rows > 0
+                && picker.preview.is_empty()
+                && picker.selected_dir().is_some()
+            {
+                line(
+                    out,
+                    divider + 1,
+                    "(No visible entries)",
+                    cols,
+                    Color::DarkGrey,
+                    x,
+                )?;
+            } else {
+                let first = picker
+                    .preview_offset
+                    .min(picker.preview.len().saturating_sub(preview_rows));
+                for (idx, entry) in picker
+                    .preview
+                    .iter()
+                    .skip(first)
+                    .take(preview_rows)
+                    .enumerate()
+                {
+                    let name = safe_terminal_text(&entry.name);
+                    let label = format!("  {}{}", name, if entry.is_dir { "/" } else { "" });
+                    line(
+                        out,
+                        divider + 1 + idx as u16,
+                        &middle_ellipsis(&label, width),
+                        cols,
+                        if entry.is_dir {
+                            Color::Cyan
+                        } else {
+                            Color::Grey
+                        },
+                        x,
+                    )?;
+                }
+            }
+            let end = divider + 1 + preview_rows as u16;
+            let first = picker
+                .preview_offset
+                .min(picker.preview.len().saturating_sub(preview_rows));
+            let last = (first + preview_rows).min(picker.preview.len());
+            let status = format!(
+                "{}–{} of {}{} entries · Ctrl+↑↓ scroll preview",
+                if last == 0 { 0 } else { first + 1 },
+                last,
+                picker.preview.len(),
+                if picker.preview_truncated { "+" } else { "" }
+            );
+            line(out, end, &status, cols, Color::DarkGrey, x)?;
+        }
+        if rows >= 2 {
+            if let Some(e) = &editor.error {
+                line(out, rows - 2, e, cols, Color::Red, x)?;
+            } else {
+                line(
+                    out,
+                    rows - 2,
+                    "↑↓ / Tab select · PgUp/PgDn page · Enter jump",
+                    cols,
+                    Color::DarkGrey,
+                    x,
+                )?;
+            }
+        }
+        if rows >= 1 {
+            line(
+                out,
+                rows - 1,
+                "Esc / Ctrl+Z back · Ctrl+U clear filter · Ctrl+C quit",
                 cols,
                 Color::DarkGrey,
                 x,
             )?;
-        }
-        if rows > 4 {
-            if let Some(e) = &editor.error {
-                line(out, 4, e, cols, Color::Red, x)?;
-            }
         }
         out.flush()?;
         return Ok(());
@@ -832,7 +968,7 @@ fn draw_picker(out: &mut impl Write, app: &App) -> Result<()> {
             line(
                 out,
                 rows - 2,
-                "Enter load · Esc cancel · Ctrl+Z zoxide jump · PgUp/PgDn page",
+                "Enter load · Esc cancel · Ctrl+Z zoxide browser · PgUp/PgDn page",
                 cols,
                 Color::DarkGrey,
                 x,
@@ -874,12 +1010,12 @@ fn draw_popup(
                     "  l palette · o opacity · a atlas on/off · O atlas opacity",
                     "  T enable/cycle major / broad / silhouette; a hide/show",
                     "  g edge AA · G atlas blur · b background · Tab fill",
-                    "  n load images (Ctrl+Z jump) · i info · p montage",
+                    "  n load images (Ctrl+Z browse dirs) · i info · p montage",
                     "  AVG includes zeros; nonfinite values are ignored.",
                     "  MAX favors high IDs; MIN+ favors low positive IDs.",
                     "  Overlapping labels cannot all occupy the same pixel.",
                     "  Projections cached on demand; choices not saved in scenes.",
-                    "  q / Esc close help · Ctrl+C quit",
+                    "  q / Esc close help · Ctrl+C quit; Esc never quits",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -899,7 +1035,7 @@ fn draw_popup(
                     "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
-                    "  n      File picker: substring filter · Ctrl+Z zoxide jump",
+                    "  n      File picker: substring filter · Ctrl+Z zoxide browser",
                     "  s      Save current scene (.niv.toml)",
                     "         ↑↓ select · Tab complete · Space mark · Enter load",
                     "  d unload · w raise · { lower · Y yank path",
@@ -919,7 +1055,8 @@ fn draw_popup(
                     "  + / -  Contrast         , / .   Brightness",
                     "  In filename prompts q is typed; Esc cancels",
                     "",
-                    "? /  help · i info · q close/quit · Ctrl+C quit",
+                    "? / help · i info · q close/quit · Ctrl+C quit",
+                    "Esc cancels menus only; never quits the viewer",
                 ]
                 .into_iter()
                 .map(str::to_owned),

@@ -207,7 +207,7 @@ niv data/sample.nii.gz --background transparent --bench 100
 
 ### Reordering image layers
 
-Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`d`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; a further Esc exits `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
+Select an image with its current stack number (`1` is top), or cycle with `;`. Press **`w`** to raise the selected image one position, or **`d`** to lower it (braces also work). The selection follows the moved image; its color map, opacity, display window, and visibility state remain attached to it. Press `t` for the top-to-bottom layer list (atlas remains above all images). Use ↑/↓ or `k`/`j` to select a layer without moving the slice. Press Enter, q or Esc to close the list, retaining the selected image; further Esc presses do nothing; use q or Ctrl+C to exit `niv`. The original base image can move above other intensity images, but the **atlas always stays on top**. Reordering does not copy or reload any image volume; it only changes compositing order and redraws the image. Newly loaded images are appended immediately below the atlas.
 
 ## Save and reload scenes (v0.15)
 
@@ -337,4 +337,21 @@ Categorical filenames now use one interpolated RGB color per character.
 - Repeating `y` or its alias `c` flips the axial image horizontally, just like `x` and `z`. Axis transforms remain independent.
 - Integer-valued probe intensities and selected-layer bounds are displayed without trailing zeros. Fractional probe intensities retain seven decimal places; window settings retain five where appropriate, with additional precision for near-integer thresholds. The editor and stored f32 values are unchanged.
 - Set `TEMPLATE` to a registered grayscale volume in your sourced zsh configuration. `niv --template` opens it alone; `niv clusters.nii.gz --template` adds it as the bottom image. It is not loaded implicitly, and existing CLI and scene loading are unchanged.
-- In the `n` file picker, press Ctrl+Z, type one or more zoxide directory keywords, then Enter. The best-ranked directory becomes the picker location. Escape cancels the jump; marked images survive directory changes. The external `zoxide` executable must be on PATH and its database must contain the desired directories. No shell evaluation, no interactive fzf requirement, no process-wide directory change.
+- In the `n` file picker, Ctrl+Z opens the ranked zoxide directory browser (see below).
+
+### v0.23: safe Escape and interactive directory preview
+
+Escape closes the innermost open menu or editor; outside menus it does nothing.
+Use `q` to quit from the normal viewer, or Ctrl+C from any input context.
+The `q` character continues to be accepted in filename and directory search fields.
+
+Press `n`, then Ctrl+Z to browse scored directories from `zoxide query --list --score`.
+The ranking is loaded once per opening; type case-insensitive keywords to filter
+paths, with substring matches preferred over fuzzy subsequence matches. Use
+Up/Down or Tab/Shift+Tab to select, PgUp/PgDn to page, Ctrl+Up/Down to scroll
+the selected directory's preview, Ctrl+U to clear the query, and Enter to jump.
+Esc or Ctrl+Z returns to the original file filter and selection. Marked images
+survive directory jumps. The preview lists visible entries from the selected
+directory only, up to 256 entries, with no NIfTI decoding or recursive scans.
+A plus sign in the entry count indicates a truncated preview. Zoxide is required
+on the host running niv; fzf is not required. The browser does not modify cwd.
