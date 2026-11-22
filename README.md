@@ -12,7 +12,7 @@
 
 ## Features
 
-- **Responsive slice browsing** in the X, Y or Z array axis, with independent orientation settings and a keyboard, trackpad or wheel.
+- **Responsive slice browsing** in the X, Y or Z voxel-index axis with raw/CCF viewing presets and independent rotation/flip settings. NIfTI sform/qform metadata never reorders the voxel array.
 - **Multiple image layers** with reorder, hide/show, adjustable intensity windows, opacity, and grayscale, warm, cool, or deterministic categorical colors.
 - **Anatomical atlas wireframes** from a solid label volume, with region names/IDs from an optional CSV lookup table (LUT), hover inspection, and color-coded contours.
 - **Per-layer projections**: maximum, average, and minimum-positive projections; cached after first calculation.
@@ -67,7 +67,9 @@ For a development checkout, use `cargo build --release` and run `./target/releas
 ## Quick start
 
 ```bash
-niv image.nii.gz                              # single image, no atlas by default
+niv image.nii.gz                              # raw voxel index view (Z, rotation 0°)
+niv --view-preset ccf clusters.nii.gz -a -t    # CCFv3 X, rotation 90°
+niv --view-preset raw reg_inputs/autofl_50um.nii.gz
 niv template.nii.gz clusters.nii.gz -a         # cluster layer + configured atlas
 niv -i image_1.nii.gz image_2.nii.gz           # multiple images
 niv image.nii.gz -a -t                        # add configured atlas and template
@@ -115,8 +117,9 @@ Environment settings can be kept in `~/.config/niv/env.zsh`, sourced from `~/.zs
 Start from [`examples/env.zsh`](examples/env.zsh). Example settings:
 
 ```zsh
-export NIV_AXIS=x
-export NIV_ROTATE=90
+export NIV_VIEW_PRESET=raw       # raw: Z/0°; ccf: X/90°
+# No RAS/sform/qform canonicalization is applied by either preset.
+# CLI --axis and --rotate override the chosen preset.
 export NIV_BACKGROUND=transparent
 export NIV_PIXEL_BUDGET=1000000
 export NIV_MONTAGE_PIXEL_BUDGET=4000000
@@ -131,6 +134,10 @@ export ATLAS='/path/to/atlas.nii.gz'
 export ATLAS_LUT='/path/to/atlas_regions.csv'
 export TEMPLATE='/path/to/template.nii.gz'
 ```
+
+**Scrolling modifiers:** Shift ×4, Control ×3, Option/Alt ×2, and Command/Super ×1 (unmodified). Multiple modifiers use the strongest. Some terminals convert Shift+vertical wheel into horizontal wheel events; niv treats unmodified horizontal wheel as a Shift fallback.
+
+**Raw versus CCF:** Both viewing presets preserve voxel storage order; they differ only in initial slice axis and screen rotation. Use `NIV_VIEW_PRESET=raw` in your existing `~/.config/niv/env.zsh` to supersede its older `NIV_AXIS=x` and `NIV_ROTATE=90` defaults. Existing `.niv.toml` scenes restore their saved orientation independently.
 
 **Trackpads versus mouse wheels:** terminals typically send both as mouse-scroll events, so they share `NIV_SCROLL_WHEEL`; `niv` cannot reliably distinguish the physical input device. The `normal` setting preserves the historical `niv` scroll direction. The direction settings only reverse *slice navigation* (including montage scrolling), not menu selection, pointer movement, or montage gap controls.
 

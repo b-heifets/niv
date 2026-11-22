@@ -2028,7 +2028,7 @@ fn draw_popup(
                 [
                     "NAVIGATION",
                     "  ↑↓←→ / jk      Slices; wheel / trackpad also scroll",
-                    "  Cmd ×2 · Shift ×3 · Ctrl ×4 · Alt ×2 fallback",
+                    "  Shift ×4 · Ctrl ×3 · Alt ×2 · Cmd ×1",
                     "  PgUp / PgDn      ±25 slices    x c z   choose axis; repeat axis key mirrors",
                     "  [ / ] stride   r / R rotate   h / v flip   f fill",
                     "  I      Keyboard probe (arrows move probe; PgUp/Dn slices)",
@@ -2476,7 +2476,14 @@ fn wheel_step(kind: MouseEventKind, mods: KeyModifiers) -> Option<(isize, usize)
         MouseEventKind::ScrollRight => (-1, true),
         _ => return None,
     };
-    Some((direction, App::multiplier(mods, horizontal)))
+    // Some terminals convert Shift+wheel to horizontal events without
+    // preserving the SHIFT bit. Treat unmodified horizontal input as Shift.
+    let multiplier = if horizontal && mods.is_empty() {
+        4
+    } else {
+        App::multiplier(mods, false)
+    };
+    Some((direction, multiplier))
 }
 
 fn mouse_montage_tile(
@@ -3814,15 +3821,23 @@ mod mouse_tests {
         );
         assert_eq!(
             wheel_step(MouseEventKind::ScrollDown, KeyModifiers::SHIFT),
-            Some((-1, 3))
+            Some((-1, 4))
         );
         assert_eq!(
             wheel_step(MouseEventKind::ScrollLeft, KeyModifiers::NONE),
-            Some((1, 3))
+            Some((1, 4))
         );
         assert_eq!(
             wheel_step(MouseEventKind::ScrollRight, KeyModifiers::CONTROL),
-            Some((-1, 4))
+            Some((-1, 3))
+        );
+        assert_eq!(
+            wheel_step(MouseEventKind::ScrollDown, KeyModifiers::SUPER),
+            Some((-1, 1))
+        );
+        assert_eq!(
+            wheel_step(MouseEventKind::ScrollUp, KeyModifiers::ALT),
+            Some((1, 2))
         );
         assert_eq!(wheel_step(MouseEventKind::Moved, KeyModifiers::NONE), None);
     }

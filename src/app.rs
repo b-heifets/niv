@@ -666,11 +666,12 @@ impl App {
     }
 
     pub fn multiplier(m: KeyModifiers, uppercase: bool) -> usize {
-        if m.contains(KeyModifiers::CONTROL) {
+        // The strongest modifier wins. Command/Super is deliberately unmodified.
+        if m.contains(KeyModifiers::SHIFT) || uppercase {
             4
-        } else if m.contains(KeyModifiers::SHIFT) || uppercase {
+        } else if m.contains(KeyModifiers::CONTROL) {
             3
-        } else if m.intersects(KeyModifiers::SUPER | KeyModifiers::ALT) {
+        } else if m.contains(KeyModifiers::ALT) {
             2
         } else {
             1
@@ -2236,6 +2237,24 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn scroll_modifiers_use_shift_four_control_three_alt_two_and_ignore_super() {
+        assert_eq!(App::multiplier(KeyModifiers::NONE, false), 1);
+        assert_eq!(App::multiplier(KeyModifiers::ALT, false), 2);
+        assert_eq!(App::multiplier(KeyModifiers::CONTROL, false), 3);
+        assert_eq!(App::multiplier(KeyModifiers::SHIFT, false), 4);
+        assert_eq!(App::multiplier(KeyModifiers::SUPER, false), 1);
+        assert_eq!(
+            App::multiplier(KeyModifiers::SHIFT | KeyModifiers::CONTROL, false),
+            4
+        );
+        assert_eq!(
+            App::multiplier(KeyModifiers::CONTROL | KeyModifiers::ALT, false),
+            3
+        );
+        // Uppercase Vim navigation can arrive without a SHIFT modifier in terminals.
+        assert_eq!(App::multiplier(KeyModifiers::NONE, true), 4);
+    }
+    #[test]
     fn modifiers_stride_and_new_atlas_toggle() {
         let vol = example();
         let mut layers = Layers::default();
@@ -2265,7 +2284,7 @@ mod tests {
             KeyCode::Char('H'),
             KeyModifiers::SHIFT,
         );
-        assert_eq!(app.index, 48); // shift -3
+        assert_eq!(app.index, 47); // shift -4
         key(
             &mut app,
             &vol,
@@ -2273,7 +2292,7 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::CONTROL,
         );
-        assert_eq!(app.index, 52); // control +4
+        assert_eq!(app.index, 50); // control +3
         key(
             &mut app,
             &vol,
@@ -2281,7 +2300,7 @@ mod tests {
             KeyCode::Left,
             KeyModifiers::ALT,
         );
-        assert_eq!(app.index, 50); // alt -2
+        assert_eq!(app.index, 48); // alt -2
         key(
             &mut app,
             &vol,
@@ -2289,7 +2308,7 @@ mod tests {
             KeyCode::Right,
             KeyModifiers::SUPER,
         );
-        assert_eq!(app.index, 52); // Command +2 when forwarded
+        assert_eq!(app.index, 49); // Command has no multiplier
         key(
             &mut app,
             &vol,

@@ -51,7 +51,8 @@ Usage: niv FILE/GLOB ... [OPTIONS]
        niv -i FILE/GLOB ... [OPTIONS]
        niv -a [ATLAS.nii.gz]
        niv --scene FILE.niv.toml
-Defaults: --axis x --rotate 90; no atlas or template unless requested.
+Defaults: raw voxel-index view (z, 0°); --view-preset ccf gives x, 90°.
+No RAS reorientation; no atlas/template unless requested.
 -a [FILE] atlas ($ATLAS); -t [FILE] template ($TEMPLATE). Put bare flags last.
 Press ? in the viewer for keyboard help.  -v shows version.
 Use --help for full CLI options.
@@ -73,8 +74,12 @@ SCENES
                           and --bench may be supplied as overrides.
 
 VIEW
-      --axis x|y|z       Slice axis (default x; NIV_AXIS or NII_AXIS)
-  -r, --rotate DEGREES  Clockwise 0,90,180,270 (default 90; NIV_ROTATE)
+      --view-preset raw|ccf  Raw voxel index (z,0°), or CCFv3 (x,90°).
+                             Default raw; NIV_VIEW_PRESET can set the default.
+                             Neither mode applies affine/RAS reorientation.
+      --axis x|y|z       Slice index axis (override preset)
+  -r, --rotate DEGREES  Clockwise 0,90,180,270 (override preset)
+                             Explicit --axis and --rotate override --view-preset.
       --slice N          Starting slice (zero based; default center)
       --step N           Starting slice stride (default 1)
   -w, --window MIN,MAX  Initial display range (default finite voxel min,max)
@@ -127,6 +132,8 @@ INTERACTIVE HELP
   -v, -V, --version       Show version.
 
 EXAMPLES
+  niv --view-preset raw reg_inputs/autofl_50um.nii.gz
+  niv --view-preset ccf clusters.nii.gz -a -t
   niv mean_IF.nii.gz
   niv template.nii.gz clusters.nii.gz
   niv -i template.nii.gz "*clusters*.nii.gz"
@@ -177,12 +184,29 @@ fn parse_args_with_template(
         return Ok(Some(crate::scene::config_from_args(&argv)?));
     }
     let mut args = argv.into_iter().peekable();
-    let mut axis = Axis::parse(
-        &env::var("NIV_AXIS")
-            .or_else(|_| env::var("NII_AXIS"))
-            .unwrap_or_else(|_| "x".to_owned()),
-    )?;
-    let mut rotation = parse_rotation(&env::var("NIV_ROTATE").unwrap_or_else(|_| "90".to_owned()))?;
+    // The stored array is never reoriented from NIfTI sform/qform. Presets
+    // only select the initial index axis and screen-space rotation.
+    let env_preset = env::var("NIV_VIEW_PRESET")
+        .ok()
+        .map(|v| parse_view_preset(&v))
+        .transpose()?;
+    // An explicit environment preset takes precedence over legacy axis/rotation
+    // defaults so existing env.zsh files can opt in without editing two lines.
+    let (mut axis, mut rotation) = if let Some(preset) = env_preset {
+        preset
+    } else {
+        (
+            Axis::parse(
+                &env::var("NIV_AXIS")
+                    .or_else(|_| env::var("NII_AXIS"))
+                    .unwrap_or_else(|_| "z".to_owned()),
+            )?,
+            parse_rotation(&env::var("NIV_ROTATE").unwrap_or_else(|_| "0".to_owned()))?,
+        )
+    };
+    let mut cli_preset = None;
+    let mut cli_axis = None;
+    let mut cli_rotation = None;
     let mut path = None;
     let mut template_path: Option<PathBuf> = None;
     let mut use_atlas = false;
@@ -331,7 +355,8 @@ fn parse_args_with_template(
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
         let needs_value = matches!(
             flag,
-            "--axis"
+            "--view-preset"
+                | "--axis"
                 | "--slice"
                 | "--step"
                 | "-w"
@@ -365,7 +390,8 @@ fn parse_args_with_template(
                     .with_context(|| format!("{flag} needs a value"))?
             };
             match flag {
-                "--axis" => axis = Axis::parse(&val)?,
+                "--view-preset" => cli_preset = Some(parse_view_preset(&val)?),
+                "--axis" => cli_axis = Some(Axis::parse(&val)?),
                 "--slice" => {
                     initial_slice = Some(
                         val.parse()
@@ -373,7 +399,7 @@ fn parse_args_with_template(
                     )
                 }
                 "--step" => step = parse_range(&val, flag, 1, 256)?,
-                "-r" | "--rotate" => rotation = parse_rotation(&val)?,
+                "-r" | "--rotate" => cli_rotation = Some(parse_rotation(&val)?),
                 "-w" | "--window" => window = Some(parse_window(&val)?),
                 "--opacity" => base_opacity = parse_opacity(&val)?,
                 "--background" => transparent_background = parse_background(&val)?,
@@ -429,6 +455,17 @@ fn parse_args_with_template(
                 append_image(&mut path, &mut overlays, found);
             }
         }
+    }
+    // Order-independent CLI precedence: preset, then explicit axis/rotation.
+    if let Some((a, r)) = cli_preset {
+        axis = a;
+        rotation = r;
+    }
+    if let Some(a) = cli_axis {
+        axis = a;
+    }
+    if let Some(r) = cli_rotation {
+        rotation = r;
     }
     // Explicit opt-in: no extra template loading during normal startup.
     if let Some(template) = template_path {
@@ -563,6 +600,14 @@ fn parse_scroll_direction(s: &str) -> Result<bool> {
     }
 }
 
+fn parse_view_preset(s: &str) -> Result<(Axis, u16)> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "raw" => Ok((Axis::Z, 0)),
+        "ccf" => Ok((Axis::X, 90)),
+        _ => bail!("View preset must be raw or ccf"),
+    }
+}
+
 fn parse_background(s: &str) -> Result<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
         "black" | "rgb" => Ok(false),
@@ -644,6 +689,34 @@ fn parse_window(s: &str) -> Result<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_and_ccf_view_presets_are_display_only_and_order_independent() {
+        let c = parse_args(vec![
+            "x.nii.gz".into(),
+            "--view-preset".into(),
+            "raw".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!((c.axis, c.rotation), (Axis::Z, 0));
+        let c = parse_args(vec!["x.nii.gz".into(), "--view-preset=ccf".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.axis, c.rotation), (Axis::X, 90));
+        let c = parse_args(vec![
+            "--axis".into(),
+            "y".into(),
+            "x.nii.gz".into(),
+            "--view-preset".into(),
+            "ccf".into(),
+            "--rotate".into(),
+            "180".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!((c.axis, c.rotation), (Axis::Y, 180));
+        assert!(parse_view_preset("anatomical").is_err());
+    }
     #[test]
     fn positional_and_i_only_loading_preserve_order() {
         for args in [
