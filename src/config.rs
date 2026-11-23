@@ -48,6 +48,7 @@ pub struct Config {
 
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
 Usage: niv FILE/GLOB ... [OPTIONS]
+       niv edit --masked IMAGE.nii.gz --mask MASK.nii.gz [--raw IMAGE.nii.gz]
        niv -i FILE/GLOB ... [OPTIONS]
        niv -a [ATLAS.nii.gz]
        niv --scene FILE.niv.toml
@@ -61,6 +62,7 @@ Use --help for full CLI options.
 const HELP: &str = r#"niv — keyboard-driven NIfTI viewer using Kitty graphics
 
 USAGE
+  niv edit --masked IMAGE --mask MASK [--raw IMAGE] [--out DIRECTORY]
   niv FILE/GLOB ... [OPTIONS]
   niv -i FILE/GLOB ... [OPTIONS]
   niv --scene FILE.niv.toml [--pixel-budget N] [--fps N] [--profile]

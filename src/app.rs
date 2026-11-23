@@ -3718,6 +3718,7 @@ mod tests {
             KeyModifiers::NONE,
         );
         let before = app.montage;
+        let expected_shift = app.stride * App::multiplier(KeyModifiers::SHIFT, false);
         let old: Vec<_> = (0..before.count()).map(|i| before.slice_at(i)).collect();
         key(
             &mut app,
@@ -3726,10 +3727,10 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::SHIFT,
         );
-        assert_eq!(app.montage.start, before.start + 3);
-        assert_eq!(app.montage.stop, before.stop + 3);
+        assert_eq!(app.montage.start, before.start + expected_shift);
+        assert_eq!(app.montage.stop, before.stop + expected_shift);
         for (i, slice) in old.iter().enumerate() {
-            assert_eq!(app.montage.slice_at(i), *slice + 3);
+            assert_eq!(app.montage.slice_at(i), *slice + expected_shift);
         }
         assert!(app.shift_montage(&vol, 999));
         assert_eq!(app.montage.stop, 99);

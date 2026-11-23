@@ -1,6 +1,7 @@
 //! NIfTI slice viewer. Direct Kitty graphics, no libghostty or Rex dependency.
 mod app;
 mod config;
+mod edit;
 mod keymap;
 mod kitty;
 mod layers;
@@ -2033,7 +2034,7 @@ fn draw_popup(
                     "  [ / ] stride   r / R rotate   h / v flip   f fill",
                     "  I      Keyboard probe (arrows move probe; PgUp/Dn slices)",
                     "",
-                    "  p      Montage mode (press ? there for controls)",
+                    "  Ctrl+E Edit loaded image · p montage (press ? for controls)",
                     "",
                     "LAYERS",
                     "  1–9    Select layer      ;       Next layer",
@@ -3017,6 +3018,9 @@ fn pasted_image_paths(text: &str) -> Result<Vec<std::path::PathBuf>> {
 }
 
 fn run() -> Result<()> {
+    if edit::maybe_run()? {
+        return Ok(());
+    }
     let Some(mut config) = config::parse()? else {
         return Ok(());
     };
@@ -3133,6 +3137,31 @@ fn run() -> Result<()> {
                 match evt {
                     Event::Key(key) => {
                         let key = keymap.remap(&app, key);
+                        // Edit an already-loaded NIfTI directly, without requiring a mask.
+                        // Keep the viewer's terminal guard and restore its state afterwards.
+                        if app.edit.is_none()
+                            && app.popup.is_none()
+                            && !app.show_layer_list
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, crossterm::event::KeyCode::Char('e' | 'E'))
+                        {
+                            frames.clear(&mut out)?;
+                            out.flush()?;
+                            let result = edit::run_from_viewer(
+                                &config.path,
+                                app.axis.index(),
+                                app.index,
+                                &mut out,
+                            );
+                            queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+                            result?;
+                            app.notice=Some("Returned from segmentation editing; saved files can be loaded with n".into());
+                            pending_layout = true;
+                            pending_frame = true;
+                            last_draw = Instant::now() - frame_interval;
+                            break;
+                        }
+
                         if app.notice.take().is_some() {
                             pending_layout = true;
                             pending_frame = true;

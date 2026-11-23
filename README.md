@@ -12,6 +12,8 @@
 
 ## Features
 
+- **Experimental mask editing** (`Ctrl+E` or `niv edit`): synchronized X/Y/Z planes, 3D sphere painting/erasing, separate trim/fill segmentations, raw-image comparison, and non-destructive NIfTI output. See [Mask editing](docs/mask-editing.md).
+
 - **Responsive slice browsing** in the X, Y or Z voxel-index axis with raw/CCF viewing presets and independent rotation/flip settings. NIfTI sform/qform metadata never reorders the voxel array.
 - **Multiple image layers** with reorder, hide/show, adjustable intensity windows, opacity, and grayscale, warm, cool, or deterministic categorical colors.
 - **Anatomical atlas wireframes** from a solid label volume, with region names/IDs from an optional CSV lookup table (LUT), hover inspection, and color-coded contours.
@@ -63,6 +65,24 @@ niv -v
 ```
 
 For a development checkout, use `cargo build --release` and run `./target/release/niv`. You can install that build with `cargo install --path .`. Commit `Cargo.lock` when publishing an executable application; `--locked` requires it.
+
+## Interactive segmentation editor (experimental)
+
+Load your registration-preparation image as usual, then press **Ctrl+E** to enter the editor. You do not need to load a brain mask or create a segmentation until you're ready.
+
+```sh
+niv autofluo_50um_masked.nii.gz    # Ctrl+E enters 3-plane edit mode
+```
+
+Or start directly in the editor, with an optional brain mask and raw reference:
+
+```sh
+niv edit autofluo_50um_masked.nii.gz
+niv edit autofluo_50um_masked.nii.gz \
+  --mask autofluo_50um_brain_mask.nii.gz --raw autofluo_50um.nii.gz
+```
+
+Press `n` to create and name a green Trim segmentation, or `N` for a Fill segmentation. Use a 3D spherical brush, inspect three synchronized orthogonal panes, and save new NIfTI images without changing the source. `z/x/c` focuses planes, `Z/X/C` toggles their visibility; Shift+wheel adjusts brush diameter and Ctrl+wheel zooms only the active pane. The segmentation list (`l`) supports selection and show/hide. A brain mask is optional and can be derived from positive image intensities when saving (`B`). See [the mask-editing guide](docs/mask-editing.md) for the complete controls and file format.
 
 ## Quick start
 
