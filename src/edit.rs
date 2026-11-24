@@ -1540,7 +1540,7 @@ fn draw(
     Ok(canvas)
 }
 // Clickable footer entries use the same label geometry as the bottom image bar.
-fn footer_image_at(editor: &Editor, canvas: &Canvas, col: usize) -> Option<usize> {
+fn footer_image_at(editor: &Editor, _canvas: &Canvas, col: usize) -> Option<usize> {
     let mut cursor = 2usize;
     for i in 0..=editor.extra_images.len() {
         let path = if i == 0 {
