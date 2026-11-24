@@ -47,15 +47,15 @@ pub struct Config {
 }
 
 const SHORT_HELP: &str = r#"niv — terminal NIfTI viewer
-Usage: niv FILE/GLOB ... [OPTIONS]
-       niv edit --masked IMAGE.nii.gz --mask MASK.nii.gz [--raw IMAGE.nii.gz]
+Usage: niv [FILE/GLOB ...] [OPTIONS]
+       niv edit IMAGE.nii.gz [--mask MASK.nii.gz] [--raw IMAGE.nii.gz]
        niv -i FILE/GLOB ... [OPTIONS]
        niv -a [ATLAS.nii.gz]
        niv --scene FILE.niv.toml
 Defaults: raw voxel-index view (z, 0°); --view-preset ccf gives x, 90°.
 No RAS reorientation; no atlas/template unless requested.
 -a [FILE] atlas ($ATLAS); -t [FILE] template ($TEMPLATE). Put bare flags last.
-Press ? in the viewer for keyboard help.  -v shows version.
+Run bare niv to open the NIfTI picker. ? shows help. -v shows version.
 Use --help for full CLI options.
 "#;
 
@@ -153,7 +153,7 @@ pub fn parse() -> Result<Option<Config>> {
     parse_args(env::args().skip(1).collect())
 }
 
-fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
+pub(crate) fn parse_args(argv: Vec<String>) -> Result<Option<Config>> {
     parse_args_with_template(argv, env::var_os("TEMPLATE"))
 }
 

@@ -3021,7 +3021,15 @@ fn run() -> Result<()> {
     if edit::maybe_run()? {
         return Ok(());
     }
-    let Some(mut config) = config::parse()? else {
+    let selected = if std::env::args_os().len() == 1 {
+        match edit::pick_first_nifti()? {
+            Some(path) => config::parse_args(vec![path.to_string_lossy().into_owned()])?,
+            None => return Ok(()),
+        }
+    } else {
+        config::parse()?
+    };
+    let Some(mut config) = selected else {
         return Ok(());
     };
     let mut vol = Volume::load(&config.path)?;
@@ -3147,10 +3155,20 @@ fn run() -> Result<()> {
                         {
                             frames.clear(&mut out)?;
                             out.flush()?;
+                            let id = app.selected_layer_id();
+                            let path = if id == 0 {
+                                &config.path
+                            } else {
+                                &layers.overlays[id - 1].path
+                            };
+                            let mut transforms = app.axis_transforms;
+                            transforms[app.axis.index()] = (app.rotation, app.flip_h, app.flip_v);
                             let result = edit::run_from_viewer(
-                                &config.path,
+                                path,
                                 app.axis.index(),
                                 app.index,
+                                app.selected_window(&layers),
+                                transforms,
                                 &mut out,
                             );
                             queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;

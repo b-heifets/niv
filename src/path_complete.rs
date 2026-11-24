@@ -622,7 +622,6 @@ fn common_prefix(values: &[PathMatch]) -> String {
 
 /// Tab extends a true common *prefix* if one exists, otherwise cycles the
 /// visible selection. A unique match completes directly. Shift-Tab reverses.
-#[cfg(test)]
 pub fn advance(text: &mut String, matches: &mut PathMatches, reverse: bool) {
     advance_kind(text, matches, reverse, false);
 }

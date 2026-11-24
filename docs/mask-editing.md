@@ -1,92 +1,104 @@
-# Interactive NIfTI editing (`niv edit`)
+# Interactive segmentation editor (`niv` v0.30.0, experimental)
 
-`niv` provides a **non-destructive** spherical segmentation editor for correcting registration-preparation autofluorescence images. It works in original voxel-index coordinates; no automatic RAS canonicalization, resampling, or reorientation is performed. This experimental editor is not a full 3D Slicer replacement.
+`niv` can paint 3D spherical **segmentations** over NIfTI images in three synchronized orthogonal views. Painting is non-destructive: the original intensity image remains visible under translucent segmentations, and an optional derived output preview shows the intensity modification. Voxel arrays are never reoriented or resampled.
 
-## Enter from the viewer
+## Start and load images
 
-```sh
-niv autofluo_50um_masked.nii.gz
-# Press Ctrl+E in the normal viewer to enter Edit mode.
+```bash
+niv                                       # open NIfTI picker
+niv autofluo_50um_masked.nii.gz          # Ctrl+E to enter edit mode
+niv edit autofluo_50um_masked.nii.gz     # open editor directly
+niv edit autofluo_50um_masked.nii.gz --mask autofluo_50um_brain_mask.nii.gz
 ```
 
-`Ctrl+E` edits the image originally loaded as the reference volume. The viewer remains open and is restored when you leave the editor with `q`. Original file contents remain unchanged; saved derived files can be loaded separately using the normal viewer's `n` picker.
+Press **Ctrl+E** from normal viewing to edit the currently selected image, retaining its slice axis, slice index, and display range. Press **q** to return (twice if there are unsaved edits).
 
-Alternatively, start in Edit mode and optionally provide an existing brain mask or original autofluorescence reference:
+Inside the editor, **`n`** opens a searchable NIfTI picker to add another aligned image, such as `autofluo_50um.nii.gz`. Select the displayed image by clicking its name in the bottom image bar, or cycle with **`\`**. Additional images must have the same voxel grid; they are display/reference images and do not replace the original image being edited. Each image has an independent grayscale display window.
 
-```sh
-niv edit autofluo_50um_masked.nii.gz
-niv edit autofluo_50um_masked.nii.gz --mask autofluo_50um_brain_mask.nii.gz --raw autofluo_50um.nii.gz
-```
+## Make a segmentation
 
-The previous `--masked IMAGE` syntax also works. `--mask` and `--raw` require matching voxel grids. No segmentation is automatically created. The unmodified input is displayed in grayscale; press `n` for a **Trim** (green) segmentation or `N` for a **Fill** (cyan) segmentation. Name it when prompted (Enter accepts its generated default).
+Press **`a`** to create and name a segmentation. Nothing is created automatically. The first segmentation is green; subsequent ones use other colors, and all start at 22% opacity. Paint the segmentation with the left mouse button and erase with the right mouse button. The brush is a physical 3D sphere, accounting for anisotropic voxel spacing.
 
-Trim segmentations assign zero intensity to the painted voxels and remove them from the derived brain mask. Fill segmentations assign a user-defined intensity and mark those voxels as brain. Painting uses a **3D physical sphere** respecting voxel spacing (not a flat 2D disk). Multiple segments can have different fill intensities and colors. Later segments take precedence where they overlap.
+Creating or painting a segmentation **does not change output intensity values by itself**. To decide how the segment affects the saved intensity image, press **`t`** to cycle:
 
-## Editing controls
+- **Off:** segment is a visual and exportable label mask only.
+- **Inside:** set voxel intensity *inside* painted voxels to the chosen target value.
+- **Outside:** set voxel intensity *outside* painted voxels to that value.
+
+Use **`I`** to enter an exact target intensity, or **`=`** to sample the value near the cursor. The initial target intensity is 0, so `t` once enables zeroing inside a segmentation (trimming); set a nonzero intensity to fill missing tissue. **Later segments take precedence** when intensity operations overlap. Press **`p`** to switch between the original grayscale image (the default while painting) and the proposed edited output. The color overlay remains translucent in both modes.
+
+Segments are independent masks, no longer intrinsically named Trim or Fill. Older `--trim` and `--fill` files are still supported, and previous TOML sidecars remain readable.
+
+## Keybindings
 
 | Control | Action |
 |---|---|
-| `Ctrl+E` (normal viewer) | Enter editor using currently loaded reference image |
-| `z`, `x`, `c` or `y` | Focus Z, X, or Y orthoplane (same mapping as viewer) |
-| `Z`, `X`, `C` or `Y` | Show/hide the corresponding orthoplane; at least one stays visible |
-| `1`, `2`, `3` / `Tab` | Focus X/Y/Z directly or cycle visible planes |
-| `f` | Toggle focused view fullscreen / multiview |
-| Up/Down or mouse wheel | Scroll focused plane, using the chosen stride |
-| `[` / `]` | Reduce/increase slice stride |
-| Shift + mouse wheel | Reduce/increase 3D brush diameter (50 µm increments) |
-| `,` / `.` | Reduce/increase brush diameter (25 µm increments) |
-| Ctrl + mouse wheel, `+` / `-` | Zoom **only the focused plane** |
-| `0` | Reset focused-plane zoom |
-| Shift + arrow keys | Pan the focused plane (especially useful when zoomed) |
-| Shift + left-drag | Pan the focused plane |
-| Shift + hover | Move orthogonal crosshair intersections without painting |
+| `Tab` / Shift+Tab | Cycle focused view forward / backward |
+| `z`, `x`, `c` or `y` | Toggle that orthogonal view's visibility (case-insensitive) |
+| `f` or Enter | Show only focused view; press again to show all three |
+| Up/Down / mouse wheel | Scroll focused view, respecting stride |
+| Left/Right | Move linked plane index using the same stride |
+| `[` / `]` | Decrease / increase stride |
+| Shift+arrows | Pan selected view by the configured stride |
+| Middle-button drag, Shift+left-drag | Pan the corresponding view |
+| Ctrl+wheel, `+` / `-` | Zoom selected view in smaller 0.1× steps |
+| `0` | Reset focused view zoom and center |
+| `r`, `h`, `v` | Rotate 90°, flip horizontally, flip vertically (focused view only) |
+| Shift+hover | Update crosshair positions without painting (voxel-precise) |
 | Left-drag / right-drag | Paint / erase a 3D sphere |
-| `p` / `e`, then Space | Paint / erase at crosshair with keyboard |
-| `n` / `N` | Create and name new Trim / Fill segment |
-| `l` | Open segment list; Up/Down select, Space toggle visibility, Enter/Esc close |
-| `;` or `S` | Select next segment |
-| `r` / `V` | Rename / toggle visibility of selected segment |
-| `o` / `O` | Decrease / increase segmentation opacity (default 22%) |
-| `i` / `I` | Sample / enter constant fill intensity for selected Fill segment |
-| `m` | Toggle display of derived binary brain mask |
-| `B` | Enable/disable saving a binary brain mask |
-| `u` or Cmd+Z | Undo brush stroke |
-| `U` or Ctrl+R | Redo brush stroke |
-| `s` | Save derived NIfTI(s) and all segmentation masks |
-| `?` | Open in-editor help; Esc or `?` closes it |
-| `q` | Exit editor (requires second press if unsaved); returns to viewer when entered with Ctrl+E |
+| Shift+wheel, `,` / `.` | Adjust brush diameter |
+| `a`, F2 | New named segmentation / rename selected segment |
+| `1`–`9` | Select a segment by number |
+| Shift+`1`–`9` | Toggle visibility of numbered segment (also works with `!@#...`) |
+| `;` | Cycle to next segment |
+| `l` | Segmentation menu (arrows select, Space show/hide) |
+| `o` / `O` | Decrease / increase segmentation opacity |
+| `t`, `I`, `=` | Cycle segment operation; set value; sample value |
+| `e`, then Space | Toggle keyboard paint/erase brush, apply at crosshair |
+| `n` | Load additional aligned NIfTI with in-app picker |
+| `\` or click image bar | Cycle / select displayed image |
+| `m` / `M`, `w` | Edit image min / max; or both together |
+| `i` | Selected image information, including dimensions and spacing |
+| `p` | Toggle edited output preview for the base image |
+| `u`, `Ctrl+Z`, `Cmd+Z` | Undo paint stroke |
+| `U`, `Ctrl+R`, `Ctrl+Shift+Z`, `Cmd+Shift+Z` | Redo paint stroke |
+| `b` / `B` | Toggle loaded mask display / binary brain-mask export |
+| `s` | Save derived image, optional mask, and all segmentations |
+| `?` | Centered, sectioned help menu |
+| `q` | Return to normal view, with unsaved-changes warning |
 
-**Terminal caveat:** Cmd+Z, Shift+hover, and Shift+wheel depend on keyboard/mouse modifier events from Ghostty/Rex. The simple `u`, `U`, `,`, `.`, and arrow-key alternatives remain available.
+**Mouse modifier note:** Whether Shift+hover and Shift+drag reach the application depends on the terminal and OS mouse handling. Middle-drag and keyboard panning are alternatives.
 
-## Saving and mask derivation
+## Saving and resuming
 
-The default save location is a new directory next to the input (`autofluo_50um_masked_niv_edits/`, with numeric suffix if needed). `s` writes the derived intensity image, every segmentation as an individual binary `.nii.gz`, and a `.nii.gz.toml` sidecar containing its role, color, visibility and fill intensity. Source images are never overwritten.
+By default, `s` creates a new directory next to the source image. Files include an edited copy of the source, every named binary segmentation, and a `.toml` sidecar per segment with its color, visibility, target intensity, and **off/inside/outside** operation. The source image is never overwritten.
 
-When `--mask` is provided, an edited brain mask is saved by default. **When no brain mask was loaded**, an optional mask can be created from positive finite intensities of the input (`>0`), then altered by the paint/erase segments. Press `B` to enable mask export before saving, or start the CLI with `--binarize-mask`. Mask export can also be turned off with `B`.
+Press **`B`** before saving to write a binary brain mask as well. The baseline mask is either your optional `--mask` image or a binary image from positive finite intensity values of the original image. Segmentation operations are applied to both the intensity copy and binary mask, setting the mask to 1 for positive output intensities and 0 for zeroed intensities. This is an output convenience, not anatomical segmentation; check the result against your original brain mask.
 
-```sh
-niv edit autofluo_50um_masked.nii.gz --binarize-mask --out registration_edits
-```
-
-A typical output is:
+For example:
 
 ```text
 autofluo_50um_masked_niv_edits/
 ├── autofluo_50um_masked_niv_edited.nii.gz
-├── autofluo_50um_masked_niv_brain_mask.nii.gz    # only if exporting mask
-├── 01_exterior_trim.nii.gz
-├── 01_exterior_trim.nii.gz.toml
-├── 02_tissue_fill.nii.gz
-└── 02_tissue_fill.nii.gz.toml
+├── autofluo_50um_masked_niv_brain_mask.nii.gz  # only with B/--binarize-mask
+├── 01_trim_exterior.nii.gz
+├── 01_trim_exterior.nii.gz.toml
+├── 02_fill_gap.nii.gz
+└── 02_fill_gap.nii.gz.toml
 ```
 
-Continue editing by supplying previously saved `--trim FILE.nii.gz` and `--fill FILE.nii.gz` arguments. Sidecars restore colors, visibility, and fill intensities. Reopen the **original** autofluorescence image to avoid applying saved segments twice. Add `--overwrite` only when intentionally updating existing output files.
+Resume by reopening the **original source image** and supplying saved segment paths with `--segment` (repeatable):
 
-## Limitations and verification
+```bash
+niv edit autofluo_50um_masked.nii.gz \
+  --segment autofluo_50um_masked_niv_edits/01_trim_exterior.nii.gz \
+  --segment autofluo_50um_masked_niv_edits/02_fill_gap.nii.gz
+```
 
-- The initial implementation has a maximum of 64 stroke-level undo operations. Undo history is not persisted.
-- Saved overlays are binary segmentations; the current editor supports one intensity image at a time, plus optional raw comparison.
-- `B` derives the brain mask with a `>0` threshold rather than sophisticated tissue segmentation. Verify it against the original brain mask if you have one.
-- NIfTI headers are used as write references to preserve the spatial metadata; the written datatype matches the output volume. Always verify header, voxel alignment, intensity values, and saved masks before registration.
-- Large inputs are loaded in memory. For full-resolution LSFM, use existing image viewers/converters for now.
-- `NIV_EDIT_PIXEL_BUDGET` sets the image raster budget (default 1,000,000). This does not affect source voxel precision.
+Older `--trim` and `--fill` inputs and metadata remain supported. Do not reopen the derived edited image and reapply the same segment operations: this would apply those operations twice. Use `--overwrite` intentionally if updating files in an existing output directory.
+
+## Current limitations
+
+The editor displays one grayscale image at a time rather than compositing the normal viewer's full layer stack. It cannot create or merge more advanced Slicer segmentation effects, and it does not yet save a complete interactive editor session (view orientations, crosshair, zoom, and window settings) separately. Intensity operations are constant-value replacements without interpolation from surrounding voxels. The initial `niv` file picker and edit picker support directory browsing and text filtering; some normal viewer picker conveniences are not yet implemented in the editor picker.
+
+All segments can be exported even if their intensity operation is off. Brush undo history is limited to 64 strokes and isn't saved between sessions. Validate intensity values, NIfTI metadata, orientations, binary masks, and saved segment alignment on copies before using them for registration.

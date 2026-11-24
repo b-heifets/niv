@@ -1,7 +1,7 @@
 //! Experimental, non-destructive three-plane NIfTI segmentation editor.
 //! `niv IMAGE` then Ctrl+E, or `niv edit IMAGE [--mask MASK] [--out DIR]`.
 //! All coordinates are original voxel indices; this mode never reorients data.
-use crate::{kitty, render::Geometry, volume::Volume};
+use crate::{kitty, path_complete, render::Geometry, volume::Volume};
 use anyhow::{bail, Context, Result};
 use crossterm::{
     cursor::MoveTo,
@@ -22,7 +22,7 @@ use std::{
 };
 
 const HEADER_ROWS: u16 = 2;
-const FOOTER_ROWS: u16 = 3;
+const FOOTER_ROWS: u16 = 5;
 const MAX_HISTORY: usize = 64;
 const MAX_RADIUS_UM: f32 = 10_000.;
 
@@ -48,16 +48,62 @@ enum Tool {
 enum EntryKind {
     Fill,
     Window,
+    Minimum,
+    Maximum,
     Name,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ApplyRegion {
+    Off,
+    Inside,
+    Outside,
+}
+impl ApplyRegion {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Inside,
+            Self::Inside => Self::Outside,
+            Self::Outside => Self::Off,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Inside => "inside",
+            Self::Outside => "outside",
+        }
+    }
 }
 #[derive(Clone)]
 struct Segment {
-    role: Role,
     name: String,
     color: [u8; 3],
     voxels: Array3<u8>,
     fill_value: f32,
     visible: bool,
+    region: ApplyRegion,
+}
+struct ImageLayer {
+    path: PathBuf,
+    volume: Volume,
+    window: (f32, f32),
+}
+struct PickerState {
+    text: String,
+    matches: path_complete::PathMatches,
+}
+impl PickerState {
+    fn open() -> Self {
+        let text = String::new();
+        Self {
+            matches: path_complete::search(&text),
+            text,
+        }
+    }
+    fn refresh(&mut self) {
+        self.matches = path_complete::search(&self.text);
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct SegmentMetadata {
@@ -67,6 +113,8 @@ struct SegmentMetadata {
     color: [u8; 3],
     #[serde(default = "default_true")]
     visible: bool,
+    #[serde(default)]
+    region: Option<ApplyRegion>,
 }
 fn default_true() -> bool {
     true
@@ -85,21 +133,27 @@ struct Editor {
     mask_path: Option<PathBuf>,
     export_mask: bool,
     raw: Option<Volume>,
+    extra_images: Vec<ImageLayer>,
+    selected_image: usize,
+    picker: Option<PickerState>,
+    info_open: bool,
+    preview_output: bool,
     work: Array3<f32>,
     binary: Array3<u8>,
     segments: Vec<Segment>,
     active_seg: usize,
     coordinates: [usize; 3],
     active_view: usize,
-    solo: bool,
     visible_views: [bool; 3],
     zoom: [f32; 3],
     centers: [[f64; 2]; 3],
+    rotation: [u8; 3],
+    flip_h: [bool; 3],
+    flip_v: [bool; 3],
     stride: usize,
     brush_um: f32,
     brush_offsets: Vec<[isize; 3]>,
     tool: Tool,
-    show_raw: bool,
     show_mask: bool,
     overlay_opacity: f32,
     seg_list_open: bool,
@@ -125,6 +179,7 @@ struct Args {
     out: Option<PathBuf>,
     trims: Vec<PathBuf>,
     fills: Vec<PathBuf>,
+    generic: Vec<PathBuf>,
     radius_um: f32,
     overwrite: bool,
     binarize_mask: bool,
@@ -133,15 +188,17 @@ struct Args {
 fn edit_usage() -> &'static str {
     r#"niv edit — NIfTI spherical segmentation editor
 
+
 Usage: niv image.nii.gz   (Ctrl+E to edit an already loaded image)
        niv edit IMAGE.nii.gz [--mask brain_mask.nii.gz] [--raw image.nii.gz]
        niv edit --masked IMAGE.nii.gz [--mask brain_mask.nii.gz]
                [--binarize-mask] [--out DIR] [--trim SEG.nii.gz]...
-               [--fill SEG.nii.gz]... [--radius-um 150] [--overwrite]
+               [--fill SEG.nii.gz]... [--segment SEG.nii.gz]...
+               [--radius-um 150] [--overwrite]
 
 A brain mask is optional. With no mask, the image is the input and a brain
 mask can be derived on save by toggling B or specifying --binarize-mask.
-No segments are created automatically: press n (Trim) or N (Fill).
+No segments are created automatically: press a to add a segmentation.
 Original files are never overwritten. Press ? in the editor for help.
 "#
 }
@@ -152,6 +209,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>> {
     let mut out = None;
     let mut trims = Vec::new();
     let mut fills = Vec::new();
+    let mut generic = Vec::new();
     let mut radius_um = 150f32;
     let mut overwrite = false;
     let mut binarize_mask = false;
@@ -190,6 +248,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>> {
             "--out" => out = Some(PathBuf::from(next)),
             "--trim" => trims.push(PathBuf::from(next)),
             "--fill" => fills.push(PathBuf::from(next)),
+            "--segment" => generic.push(PathBuf::from(next)),
             "--radius-um" => {
                 radius_um = next
                     .parse::<f32>()
@@ -209,13 +268,21 @@ fn parse_args(args: &[String]) -> Result<Option<Args>> {
         out,
         trims,
         fills,
+        generic,
         radius_um,
         overwrite,
         binarize_mask,
     }))
 }
 
-pub fn run_from_viewer(path: &Path, axis: usize, slice: usize, out: &mut impl Write) -> Result<()> {
+pub fn run_from_viewer(
+    path: &Path,
+    axis: usize,
+    slice: usize,
+    window: (f32, f32),
+    transforms: [(u16, bool, bool); 3],
+    out: &mut impl Write,
+) -> Result<()> {
     let args = Args {
         masked: path.to_path_buf(),
         mask: None,
@@ -223,11 +290,20 @@ pub fn run_from_viewer(path: &Path, axis: usize, slice: usize, out: &mut impl Wr
         out: None,
         trims: Vec::new(),
         fills: Vec::new(),
+        generic: Vec::new(),
         radius_um: 150.,
         overwrite: false,
         binarize_mask: false,
     };
     let mut editor = Editor::load(args)?;
+    if window.0.is_finite() && window.1.is_finite() && window.0 < window.1 {
+        editor.windows = window;
+    }
+    for (a, (rotation, h, v)) in transforms.into_iter().enumerate() {
+        editor.rotation[a] = ((rotation / 90) % 4) as u8;
+        editor.flip_h[a] = h;
+        editor.flip_v[a] = v;
+    }
     editor.active_view = axis.min(2);
     let focused = editor.active_view;
     editor.coordinates[focused] = slice.min(editor.dims()[focused].saturating_sub(1));
@@ -257,6 +333,7 @@ fn name(path: &Path) -> String {
 fn palette(role: Role, i: usize) -> [u8; 3] {
     let trim = [[80, 218, 124], [92, 202, 150], [158, 222, 93]];
     let fill = [
+        [80, 218, 124],
         [53, 221, 196],
         [111, 189, 255],
         [199, 143, 255],
@@ -363,18 +440,24 @@ impl Editor {
             mask_path: args.mask.clone(),
             export_mask: args.mask.is_some() || args.binarize_mask,
             raw,
+            extra_images: Vec::new(),
+            selected_image: 0,
+            picker: None,
+            info_open: false,
+            preview_output: false,
             work,
             binary,
             segments: Vec::new(),
             active_seg: 0,
             active_view: 0,
-            solo: false,
             visible_views: [true; 3],
             zoom: [1.; 3],
             centers: [[0.; 2]; 3],
+            rotation: [0; 3],
+            flip_h: [false; 3],
+            flip_v: [false; 3],
             stride: 1,
             tool: Tool::Paint,
-            show_raw: false,
             show_mask: args.mask.is_some(),
             overlay_opacity: 0.22,
             seg_list_open: false,
@@ -391,10 +474,21 @@ impl Editor {
             edit_value: None,
         };
         for path in args.trims {
-            editor.load_segment(Role::Trim, &path)?;
+            editor.load_segment(Role::Trim, &path, false)?;
         }
         for path in args.fills {
-            editor.load_segment(Role::Fill, &path)?;
+            editor.load_segment(Role::Fill, &path, false)?;
+        }
+        for path in args.generic {
+            editor.load_segment(Role::Fill, &path, true)?;
+        }
+        if let (Some(path), Some(vol)) = (args.raw.as_ref(), editor.raw.take()) {
+            let window = vol.auto_window();
+            editor.extra_images.push(ImageLayer {
+                path: path.clone(),
+                volume: vol,
+                window,
+            });
         }
         for axis in 0..3 {
             let (h, v) = axes(axis);
@@ -408,14 +502,17 @@ impl Editor {
         }
         Ok(editor)
     }
-    fn load_segment(&mut self, role: Role, path: &Path) -> Result<()> {
+    fn load_segment(&mut self, role: Role, path: &Path, generic: bool) -> Result<()> {
         let vol = Volume::load(path)?;
         self.source.validate_grid(&vol)?;
-        let count = self.segments.iter().filter(|s| s.role == role).count();
+        let count = self.segments.len();
         let metadata = if metadata_path(path).is_file() {
             let metadata: SegmentMetadata =
                 toml::from_str(&fs::read_to_string(metadata_path(path))?)?;
-            if metadata.version != 1 || metadata.role.to_lowercase() != role.name().to_lowercase() {
+            if metadata.version != 1
+                || (metadata.role.to_lowercase() != role.name().to_lowercase()
+                    && metadata.role.to_lowercase() != "segment")
+            {
                 bail!(
                     "Segmentation metadata at {} does not match the selected --{} role",
                     metadata_path(path).display(),
@@ -448,13 +545,25 @@ impl Editor {
         } else {
             stem
         };
+        let region = metadata
+            .as_ref()
+            .and_then(|m| m.region)
+            .unwrap_or(if generic {
+                ApplyRegion::Off
+            } else {
+                ApplyRegion::Inside
+            }); // legacy --trim/--fill semantics
         self.segments.push(Segment {
-            role,
             name: stem,
             color,
             voxels: vol.data.mapv(|v| u8::from(v.is_finite() && v > 0.5)),
-            fill_value,
+            fill_value: if generic || (role == Role::Trim && metadata.is_none()) {
+                0.
+            } else {
+                fill_value
+            },
             visible,
+            region,
         });
         Ok(())
     }
@@ -471,24 +580,22 @@ impl Editor {
             .find(|v| v.is_finite() && *v > 0.)
             .unwrap_or(1.)
     }
-    fn new_segment(&mut self, role: Role) {
+    fn new_segment(&mut self) {
         self.finish_stroke();
-        let count = self.segments.iter().filter(|s| s.role == role).count() + 1;
+        let count = self.segments.len() + 1;
         let shape = self.source.data.raw_dim();
-        let fill_value = self.default_fill_value();
         self.segments.push(Segment {
-            role,
-            name: format!("{}_{count:02}", role.name().to_lowercase()),
-            color: palette(role, count - 1),
+            name: format!("seg_{count:02}"),
+            color: palette(Role::Fill, count - 1),
             voxels: Array3::zeros(shape),
-            fill_value,
+            fill_value: 0.,
             visible: true,
+            region: ApplyRegion::Off,
         });
         self.active_seg = self.segments.len() - 1;
         self.dirty = true;
         self.notice = format!(
-            "New {} segment · {}",
-            role.name(),
+            "New segmentation · {} · press t to enable intensity application",
             self.segments[self.active_seg].name
         );
     }
@@ -499,18 +606,15 @@ impl Editor {
         let mut value = self.source.data[pos];
         let mut inside = u8::from(self.mask_source.data[pos] > 0.5);
         for seg in &self.segments {
-            if seg.voxels[pos] == 0 {
-                continue;
-            }
-            match seg.role {
-                Role::Trim => {
-                    value = 0.;
-                    inside = 0;
-                }
-                Role::Fill => {
-                    value = seg.fill_value;
-                    inside = 1;
-                }
+            let selected = seg.voxels[pos] > 0;
+            let applies = match seg.region {
+                ApplyRegion::Off => false,
+                ApplyRegion::Inside => selected,
+                ApplyRegion::Outside => !selected,
+            };
+            if applies {
+                value = seg.fill_value;
+                inside = u8::from(value.is_finite() && value > 0.);
             }
         }
         self.work[pos] = value;
@@ -534,7 +638,7 @@ impl Editor {
         let mut edited = 0;
         let value = u8::from(!erase);
         if self.segments.is_empty() {
-            self.notice = "Create a segment with n (Trim) or N (Fill) first".into();
+            self.notice = "Create a segmentation with a first".into();
             return 0;
         }
         let seg = self.active_seg;
@@ -619,13 +723,73 @@ impl Editor {
             self.brush_um,
         );
     }
+    fn add_image(&mut self, path: &Path) -> Result<()> {
+        if self.source_path == path || self.extra_images.iter().any(|v| v.path == path) {
+            self.notice = "This image is already loaded".into();
+            return Ok(());
+        }
+        let volume = Volume::load(path)?;
+        self.source
+            .validate_grid(&volume)
+            .context("Additional image must match source voxel grid")?;
+        let window = volume.auto_window();
+        self.extra_images.push(ImageLayer {
+            path: path.to_path_buf(),
+            volume,
+            window,
+        });
+        self.selected_image = self.extra_images.len();
+        self.notice = format!("Loaded image: {}", name(path));
+        Ok(())
+    }
+    fn selected_window(&self) -> (f32, f32) {
+        if self.selected_image == 0 {
+            self.windows
+        } else {
+            self.extra_images[self.selected_image - 1].window
+        }
+    }
+    fn set_selected_window(&mut self, window: (f32, f32)) {
+        if self.selected_image == 0 {
+            self.windows = window;
+        } else {
+            self.extra_images[self.selected_image - 1].window = window;
+        }
+    }
+    fn selected_path(&self) -> &Path {
+        if self.selected_image == 0 {
+            &self.source_path
+        } else {
+            &self.extra_images[self.selected_image - 1].path
+        }
+    }
+    fn selected_volume(&self) -> &Volume {
+        if self.selected_image == 0 {
+            &self.source
+        } else {
+            &self.extra_images[self.selected_image - 1].volume
+        }
+    }
+    fn cycle_image(&mut self) {
+        self.selected_image = (self.selected_image + 1) % (self.extra_images.len() + 1);
+    }
+    fn cycle_apply_region(&mut self) {
+        self.finish_stroke();
+        if let Some(seg) = self.segments.get_mut(self.active_seg) {
+            seg.region = seg.region.next();
+            let label = seg.region.label();
+            self.rebuild_all();
+            self.dirty = true;
+            self.notice = format!("Intensity operation: {label} (press I to set target value)");
+        }
+    }
     fn change_zoom(&mut self, delta: f32) {
         let axis = self.active_view;
         if self.zoom[axis] <= 1.001 && delta > 0. {
             let (h, v) = axes(axis);
             self.centers[axis] = [self.coordinates[h] as f64, self.coordinates[v] as f64];
         }
-        self.zoom[axis] = (self.zoom[axis] + delta).clamp(1., 8.);
+        self.zoom[axis] = (self.zoom[axis] + delta).clamp(1., 16.);
     }
     fn pan(&mut self, axis: usize, dh: f64, dv: f64) {
         let (h, v) = axes(axis);
@@ -649,7 +813,6 @@ impl Editor {
         } else {
             self.notice = "At least one orthogonal view must remain visible".into();
         }
-        self.solo = false;
         self.hover = None;
     }
     fn seg_visible(&mut self) {
@@ -701,7 +864,7 @@ impl Editor {
     }
     fn sample_fill(&mut self) {
         let p = self.hover.unwrap_or(self.coordinates);
-        let source = self.work[p];
+        let source = self.selected_volume().data[p];
         let value = if source > 0. && source.is_finite() {
             source
         } else {
@@ -715,7 +878,8 @@ impl Editor {
                             if (0..3).any(|k| a[k] < 0 || a[k] >= dims[k] as isize) {
                                 continue;
                             }
-                            let v = self.work[[a[0] as usize, a[1] as usize, a[2] as usize]];
+                            let v = self.selected_volume().data
+                                [[a[0] as usize, a[1] as usize, a[2] as usize]];
                             if v.is_finite() && v > 0. {
                                 nearest = Some(v);
                                 break 'search;
@@ -726,17 +890,14 @@ impl Editor {
             }
             nearest.unwrap_or(self.default_fill_value())
         };
-        if self
-            .segments
-            .get(self.active_seg)
-            .is_some_and(|s| s.role == Role::Fill)
-        {
+        if !self.segments.is_empty() {
             self.segments[self.active_seg].fill_value = value;
             self.rebuild_all();
             self.dirty = true;
-            self.notice = format!("Fill intensity = {value:.5} (sampled near cursor)");
+            self.notice =
+                format!("Segmentation target intensity = {value:.5} (sampled near cursor)");
         } else {
-            self.notice = "Select a Fill segment first (N)".into();
+            self.notice = "Create a segmentation with a first".into();
         }
     }
     fn output_paths(&self) -> Vec<PathBuf> {
@@ -799,10 +960,11 @@ impl Editor {
                 let seg = &self.segments[i - segment_start];
                 let info = SegmentMetadata {
                     version: 1,
-                    role: seg.role.name().to_lowercase(),
+                    role: "segment".into(),
                     fill_value: seg.fill_value,
                     color: seg.color,
                     visible: seg.visible,
+                    region: Some(seg.region),
                 };
                 let content = toml::to_string_pretty(&info)?;
                 let info_path = metadata_path(path);
@@ -847,9 +1009,15 @@ fn axes(axis: usize) -> (usize, usize) {
         _ => (0, 1),
     }
 }
-fn source_aspect(vol: &Volume, axis: usize) -> f64 {
+fn source_aspect(vol: &Volume, axis: usize, rotation: u8) -> f64 {
     let (h, v) = axes(axis);
-    vol.dims()[h] as f64 * vol.spacing[h] as f64 / (vol.dims()[v] as f64 * vol.spacing[v] as f64)
+    let ratio = vol.dims()[h] as f64 * vol.spacing[h] as f64
+        / (vol.dims()[v] as f64 * vol.spacing[v] as f64);
+    if rotation % 2 == 1 {
+        1. / ratio
+    } else {
+        ratio
+    }
 }
 fn canvas(vol: &Volume, editor: &Editor) -> Result<Canvas> {
     let (cols, rows) = terminal::size()?;
@@ -878,20 +1046,16 @@ fn canvas(vol: &Volume, editor: &Editor) -> Result<Canvas> {
         height,
     };
     let mut panes = Vec::new();
-    let tiles = if editor.solo {
-        vec![editor.active_view]
-    } else {
-        (0..3)
-            .filter(|&a| editor.visible_views[a])
-            .collect::<Vec<_>>()
-    };
+    let tiles = (0..3)
+        .filter(|&a| editor.visible_views[a])
+        .collect::<Vec<_>>();
     let margin = 6usize.min(width / 20).min(height / 20);
     for (n, &axis) in tiles.iter().enumerate() {
         let col_start = n * width / tiles.len();
         let col_end = (n + 1) * width / tiles.len();
         let available_w = col_end.saturating_sub(col_start + 2 * margin).max(1);
         let available_h = height.saturating_sub(2 * margin).max(1);
-        let ratio = source_aspect(vol, axis).clamp(0.01, 100.);
+        let ratio = source_aspect(vol, axis, editor.rotation[axis]).clamp(0.01, 100.);
         let (w, h) = if available_w as f64 / available_h as f64 > ratio {
             (
                 ((available_h as f64 * ratio).round() as usize).max(1),
@@ -923,19 +1087,58 @@ fn canvas(vol: &Volume, editor: &Editor) -> Result<Canvas> {
 fn plane_center(editor: &Editor, axis: usize) -> (f64, f64) {
     (editor.centers[axis][0], editor.centers[axis][1])
 }
+// Screen coordinates have right/up positive directions. Orthoplane rotation
+// and flipping are display-only: the voxel array is never reoriented.
+fn display_from_native(editor: &Editor, axis: usize, uv: [f64; 2]) -> [f64; 2] {
+    let (u, v) = (uv[0], uv[1]);
+    let (mut x, mut y) = match editor.rotation[axis] % 4 {
+        0 => (u, v),
+        1 => (v, -u),
+        2 => (-u, -v),
+        _ => (-v, u),
+    };
+    if editor.flip_h[axis] {
+        x = -x;
+    }
+    if editor.flip_v[axis] {
+        y = -y;
+    }
+    [x, y]
+}
+fn native_from_display(editor: &Editor, axis: usize, xy: [f64; 2]) -> [f64; 2] {
+    let mut x = xy[0];
+    let mut y = xy[1];
+    if editor.flip_h[axis] {
+        x = -x;
+    }
+    if editor.flip_v[axis] {
+        y = -y;
+    }
+    let (u, v) = match editor.rotation[axis] % 4 {
+        0 => (x, y),
+        1 => (-y, x),
+        2 => (-x, -y),
+        _ => (y, -x),
+    };
+    [u, v]
+}
 fn voxel_at(editor: &Editor, pane: &Pane, x: usize, y: usize) -> Option<[usize; 3]> {
     if x < pane.x || x >= pane.x + pane.w || y < pane.y || y >= pane.y + pane.h {
         return None;
     }
     let (ha, va) = axes(pane.axis);
     let dims = editor.dims();
+    let [u, v] = native_from_display(
+        editor,
+        pane.axis,
+        [
+            ((x - pane.x) as f64 + 0.5) / pane.w as f64 - 0.5,
+            0.5 - ((y - pane.y) as f64 + 0.5) / pane.h as f64,
+        ],
+    );
     let (center_h, center_v) = plane_center(editor, pane.axis);
-    let span_h = dims[ha] as f64 / editor.zoom[pane.axis] as f64;
-    let span_v = dims[va] as f64 / editor.zoom[pane.axis] as f64;
-    let h = (center_h + ((x - pane.x) as f64 + 0.5) / pane.w as f64 * span_h - span_h / 2.).round()
-        as isize;
-    let v = (center_v + span_v / 2. - ((y - pane.y) as f64 + 0.5) / pane.h as f64 * span_v).round()
-        as isize;
+    let h = (center_h + u * dims[ha] as f64 / editor.zoom[pane.axis] as f64).round() as isize;
+    let v = (center_v + v * dims[va] as f64 / editor.zoom[pane.axis] as f64).round() as isize;
     if h < 0 || h >= dims[ha] as isize || v < 0 || v >= dims[va] as isize {
         return None;
     }
@@ -944,15 +1147,36 @@ fn voxel_at(editor: &Editor, pane: &Pane, x: usize, y: usize) -> Option<[usize; 
     xyz[va] = v as usize;
     Some(xyz)
 }
-fn pixel_for(editor: &Editor, pane: &Pane, point: [usize; 3]) -> (isize, isize) {
+fn pixel_for_native(editor: &Editor, pane: &Pane, h: f64, v: f64) -> (isize, isize) {
     let (ha, va) = axes(pane.axis);
     let dims = editor.dims();
     let (ch, cv) = plane_center(editor, pane.axis);
-    let sx = dims[ha] as f64 / editor.zoom[pane.axis] as f64;
-    let sy = dims[va] as f64 / editor.zoom[pane.axis] as f64;
-    let px = pane.x as f64 + pane.w as f64 * ((point[ha] as f64 - ch) / sx + 0.5);
-    let py = pane.y as f64 + pane.h as f64 * (0.5 - (point[va] as f64 - cv) / sy);
-    (px.round() as isize, py.round() as isize)
+    let [x, y] = display_from_native(
+        editor,
+        pane.axis,
+        [
+            (h - ch) / (dims[ha] as f64 / editor.zoom[pane.axis] as f64),
+            (v - cv) / (dims[va] as f64 / editor.zoom[pane.axis] as f64),
+        ],
+    );
+    (
+        (pane.x as f64 + pane.w as f64 * (x + 0.5)).round() as isize,
+        (pane.y as f64 + pane.h as f64 * (0.5 - y)).round() as isize,
+    )
+}
+fn pixel_for(editor: &Editor, pane: &Pane, point: [usize; 3]) -> (isize, isize) {
+    let (h, v) = axes(pane.axis);
+    pixel_for_native(editor, pane, point[h] as f64, point[v] as f64)
+}
+fn pan_screen(editor: &mut Editor, pane: &Pane, dx: f64, dy: f64) {
+    // Positive dx means the image moves right: shift the view center left.
+    let native = native_from_display(editor, pane.axis, [-dx / pane.w as f64, dy / pane.h as f64]);
+    let (h, v) = axes(pane.axis);
+    editor.pan(
+        pane.axis,
+        native[0] * editor.dims()[h] as f64 / editor.zoom[pane.axis] as f64,
+        native[1] * editor.dims()[v] as f64 / editor.zoom[pane.axis] as f64,
+    );
 }
 fn blend(dst: &mut [u8], fg: [u8; 3], alpha: f32) {
     let a = alpha.clamp(0., 1.);
@@ -967,16 +1191,18 @@ fn put(rgb: &mut [u8], width: usize, height: usize, x: isize, y: isize, color: [
     }
 }
 fn colorized(editor: &Editor, pos: [usize; 3]) -> [u8; 3] {
-    let value = if editor.show_raw {
-        editor
-            .raw
-            .as_ref()
-            .map(|r| r.data[pos])
-            .unwrap_or(editor.work[pos])
+    // Always show *original* data under translucent segments by default.
+    // Composited/zeroed intensities appear only when preview_output is enabled.
+    let value = if editor.selected_image == 0 {
+        if editor.preview_output {
+            editor.work[pos]
+        } else {
+            editor.source.data[pos]
+        }
     } else {
-        editor.work[pos]
+        editor.extra_images[editor.selected_image - 1].volume.data[pos]
     };
-    let (lo, hi) = editor.windows;
+    let (lo, hi) = editor.selected_window();
     let grey = if value.is_finite() {
         ((value - lo) / (hi - lo).max(f32::EPSILON) * 255.).clamp(0., 255.) as u8
     } else {
@@ -1049,8 +1275,6 @@ fn render_canvas(editor: &Editor, canvas: &Canvas) -> Vec<u8> {
                 border,
             );
         }
-        // Display both orthogonal intersection lines on every pane. Their
-        // voxel locations remain synchronized as the active slice scrolls.
         let (cross_x, cross_y) = pixel_for(editor, pane, editor.coordinates);
         if cross_x >= pane.x as isize && cross_x < (pane.x + pane.w) as isize {
             for y in pane.y + 1..pane.y + pane.h.saturating_sub(1) {
@@ -1064,40 +1288,50 @@ fn render_canvas(editor: &Editor, canvas: &Canvas) -> Vec<u8> {
                 blend(&mut rgb[k..k + 3], [168, 208, 238], 0.32);
             }
         }
-        // Show the 3D brush's planar cross section in the currently hovered
-        // pane; this preview does not modify voxel data.
-        if pane.axis == editor.active_view && !editor.segments.is_empty() {
-            let center = editor.hover.unwrap_or(editor.coordinates);
-            let (px, py) = pixel_for(editor, pane, center);
+        // Draw the brush outline in every orthogonal view, not just the
+        // hovered one. Use the actual 3D sphere/plane intersection.
+        {
+            let brush_color = editor
+                .segments
+                .get(editor.active_seg)
+                .map(|seg| seg.color)
+                .unwrap_or(palette(Role::Fill, 0));
+            let brush_center = editor.hover.unwrap_or(editor.coordinates);
+            let depth_axis = pane.axis;
+            let d_um = ((brush_center[depth_axis] as isize
+                - editor.coordinates[depth_axis] as isize)
+                .abs() as f32)
+                * editor.source.spacing[depth_axis]
+                * physical_scale(&editor.source);
+            let ghost = d_um > editor.brush_um;
+            let planar_radius = if ghost {
+                editor.brush_um
+            } else {
+                (editor.brush_um.powi(2) - d_um.powi(2)).sqrt()
+            };
             let (ha, va) = axes(pane.axis);
-            let scale = physical_scale(&editor.source);
-            let rx = editor.brush_um / (editor.source.spacing[ha] * scale)
-                * pane.w as f32
-                * editor.zoom[pane.axis]
-                / editor.dims()[ha] as f32;
-            let ry = editor.brush_um / (editor.source.spacing[va] * scale)
-                * pane.h as f32
-                * editor.zoom[pane.axis]
-                / editor.dims()[va] as f32;
-            let (rx, ry) = (rx.clamp(1., 1000.), ry.clamp(1., 1000.));
-            let n = (((rx + ry) * 2.) as usize).clamp(24, 360);
-            for k in 0..n {
-                let t = k as f32 * std::f32::consts::TAU / n as f32;
-                let x = px + (t.cos() * rx).round() as isize;
-                let y = py + (t.sin() * ry).round() as isize;
+            let su = (editor.source.spacing[ha] * physical_scale(&editor.source)).max(0.001);
+            let sv = (editor.source.spacing[va] * physical_scale(&editor.source)).max(0.001);
+            let n = 96usize;
+            for j in 0..n {
+                if ghost && j % 4 >= 2 {
+                    continue;
+                }
+                let t = j as f64 * std::f64::consts::TAU / n as f64;
+                let px = brush_center[ha] as f64 + t.cos() * planar_radius as f64 / su as f64;
+                let py = brush_center[va] as f64 + t.sin() * planar_radius as f64 / sv as f64;
+                let (x, y) = pixel_for_native(editor, pane, px, py);
                 if x > pane.x as isize
                     && y > pane.y as isize
                     && x < (pane.x + pane.w - 1) as isize
                     && y < (pane.y + pane.h - 1) as isize
                 {
-                    put(
-                        &mut rgb,
-                        canvas.width,
-                        canvas.height,
-                        x,
-                        y,
-                        editor.segments[editor.active_seg].color,
-                    );
+                    let c = if ghost {
+                        [brush_color[0] / 2, brush_color[1] / 2, brush_color[2] / 2]
+                    } else {
+                        brush_color
+                    };
+                    put(&mut rgb, canvas.width, canvas.height, x, y, c);
                 }
             }
         }
@@ -1116,135 +1350,220 @@ fn draw(
     let canvas = canvas(&editor.source, editor)?;
     let frame = kitty::encode_pixels(&render_canvas(editor, &canvas), false)?;
     let seg = editor.segments.get(editor.active_seg);
-    let seg_label = seg
-        .map(|s| s.name.as_str())
-        .unwrap_or("none (n/N to create)");
+    let hover = editor.hover.unwrap_or(editor.coordinates);
+    let v = editor.selected_volume().data[hover];
+    let (col0, col1) = (
+        Color::Rgb {
+            r: 110,
+            g: 220,
+            b: 232,
+        },
+        Color::Grey,
+    );
     queue!(
         out,
         MoveTo(0, 0),
         Clear(ClearType::CurrentLine),
-        SetForegroundColor(Color::Cyan),
+        SetForegroundColor(col0),
         Print(cut(
             &format!(
-                "niv EDIT | X Y Z [{},{},{}] | focus {} | segment {} | {}",
+                "niv EDIT  [{},{},{}]  ·  focus {}  ·  voxel {:.5}",
                 editor.coordinates[0],
                 editor.coordinates[1],
                 editor.coordinates[2],
                 ["X", "Y", "Z"][editor.active_view],
-                seg_label,
-                if editor.solo { "solo" } else { "multiview" }
+                v
             ),
             canvas.cols as usize
         )),
         ResetColor
     )?;
-    let hover = editor.hover.unwrap_or(editor.coordinates);
-    let v = editor.work[hover];
-    let mask = editor.binary[hover];
-    let seg_details = seg
-        .map(|s| {
-            format!(
-                "{}{}",
-                s.role.name(),
-                if s.role == Role::Fill {
-                    format!("={:.5}", s.fill_value)
-                } else {
-                    "".into()
-                }
-            )
+    let seg_name = seg
+        .map(|s| format!("{} · {} {:.4}", s.name, s.region.label(), s.fill_value))
+        .unwrap_or_else(|| "no segmentation".into());
+    let seg_color = seg
+        .map(|s| Color::Rgb {
+            r: s.color[0],
+            g: s.color[1],
+            b: s.color[2],
         })
-        .unwrap_or("No segmentation".into());
-    queue!(out,MoveTo(0,1),Clear(ClearType::CurrentLine),SetForegroundColor(Color::Grey),
-        Print(cut(&format!("Hover [{},{},{}] {:.5} mask {} | {} | diameter {:.0}µm | stride {} | zoom {:.2}× | ? help",
-            hover[0],hover[1],hover[2],v,mask,seg_details,
-            editor.brush_um*2.,editor.stride,editor.zoom[editor.active_view]),canvas.cols as usize)),ResetColor)?;
+        .unwrap_or(Color::DarkGrey);
+    queue!(
+        out,
+        MoveTo(0, 1),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(col1),
+        Print(format!(
+            "brush {:.0}µm  ·  stride {}  ·  zoom {:.2}×  ·  ",
+            editor.brush_um * 2.,
+            editor.stride,
+            editor.zoom[editor.active_view]
+        )),
+        SetForegroundColor(seg_color),
+        Print(seg_name),
+        ResetColor
+    )?;
     queue!(out, MoveTo(0, HEADER_ROWS))?;
     let id = *next;
     *next = next.wrapping_add(1).max(1);
     kitty::replace(out, id, &frame, canvas.geom, 0, *active)?;
     *active = Some(id);
-    let footer = HEADER_ROWS + canvas.geom.rows;
+    let foot = HEADER_ROWS + canvas.geom.rows;
+    let cols = canvas.cols as usize;
     queue!(
         out,
-        MoveTo(0, footer),
+        MoveTo(0, foot),
         Clear(ClearType::CurrentLine),
         SetForegroundColor(Color::Grey),
-        Print("Segments: ")
+        Print("Segments ")
     )?;
-    let mut available = canvas.cols.saturating_sub(10) as usize;
-    for (i, seg) in editor.segments.iter().enumerate() {
-        if available == 0 {
+    let mut seg_space = cols.saturating_sub(10);
+    for (i, s) in editor.segments.iter().enumerate() {
+        if seg_space == 0 {
             break;
         }
         let label = format!(
             "{}{}:{}{}  ",
             if i == editor.active_seg { "❯" } else { "" },
             i + 1,
-            seg.name,
-            if seg.visible { "" } else { " [hidden]" }
+            s.name,
+            if s.visible { "" } else { " (off)" }
         );
-        let clipped = cut(&label, available);
-        available = available.saturating_sub(clipped.chars().count());
+        let clipped = cut(&label, seg_space);
+        seg_space = seg_space.saturating_sub(clipped.chars().count());
         queue!(
             out,
             SetForegroundColor(Color::Rgb {
-                r: seg.color[0],
-                g: seg.color[1],
-                b: seg.color[2]
+                r: s.color[0],
+                g: s.color[1],
+                b: s.color[2]
             }),
             Print(clipped)
         )?;
     }
     if editor.segments.is_empty() {
-        queue!(out, Print("none — n Trim / N Fill"))?;
+        queue!(out, Print("none · a to add"))?;
     }
-    queue!(out,ResetColor,MoveTo(0,footer+1),Clear(ClearType::CurrentLine),SetForegroundColor(Color::Grey),
-        Print(cut("z/x/c focus · Z/X/C show · Tab view · ↑↓ scroll · [ ] stride · , . diameter · Shift+wheel diameter · Ctrl+wheel zoom · l segments",canvas.cols as usize)),ResetColor)?;
+    let top = format!("╭{}╮", "─".repeat(cols.saturating_sub(2)));
+    let bottom = format!("╰{}╯", "─".repeat(cols.saturating_sub(2)));
+    queue!(
+        out,
+        ResetColor,
+        MoveTo(0, foot + 1),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(Color::DarkGrey),
+        Print(cut(&top, cols)),
+        MoveTo(0, foot + 2),
+        Clear(ClearType::CurrentLine),
+        Print("│ ")
+    )?;
+    let mut img_space = cols.saturating_sub(4);
+    for i in 0..=editor.extra_images.len() {
+        if img_space == 0 {
+            break;
+        }
+        let path = if i == 0 {
+            &editor.source_path
+        } else {
+            &editor.extra_images[i - 1].path
+        };
+        let label = format!(
+            "{}{}:{}  ",
+            if i == editor.selected_image {
+                "❯"
+            } else {
+                ""
+            },
+            i + 1,
+            name(path)
+        );
+        let clipped = cut(&label, img_space);
+        img_space = img_space.saturating_sub(clipped.chars().count());
+        queue!(
+            out,
+            SetForegroundColor(if i == editor.selected_image {
+                Color::Cyan
+            } else {
+                Color::Grey
+            }),
+            Print(clipped)
+        )?;
+    }
+    queue!(
+        out,
+        ResetColor,
+        MoveTo(0, foot + 3),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(Color::DarkGrey),
+        Print(cut(&bottom, cols)),
+        ResetColor
+    )?;
+    let state = if editor.preview_output && editor.selected_image == 0 {
+        "EDITED PREVIEW"
+    } else {
+        "ORIGINAL VIEW"
+    };
     let msg = if let Some((kind, txt)) = editor.edit_value.as_ref() {
         format!(
-            "{} (Enter apply, Esc cancel): {txt}",
+            "{}: {txt}  ·  Enter apply / Esc cancel",
             match kind {
-                EntryKind::Fill => "Fill intensity",
-                EntryKind::Window => "Window min,max",
+                EntryKind::Fill => "Intensity",
+                EntryKind::Window => "Range min,max",
+                EntryKind::Minimum => "Minimum",
+                EntryKind::Maximum => "Maximum",
                 EntryKind::Name => "Segment name",
             }
         )
     } else if editor.quit_armed {
-        "Unsaved edits: press q again to quit without saving, or s to save".to_string()
-    } else if editor.notice.is_empty() {
+        "Unsaved changes · q again to quit, s to save".into()
+    } else if !editor.notice.is_empty() {
+        editor.notice.clone()
+    } else {
         format!(
-            "{} | {} | {} | export mask: {} | out: {}",
+            "{state} · {} · ? help",
             if editor.dirty {
                 "UNSAVED"
             } else {
                 "saved / unchanged"
-            },
-            if editor.show_raw { "raw" } else { "edited" },
-            if editor.show_mask {
-                "mask visible"
-            } else {
-                "mask hidden"
-            },
-            if editor.export_mask {
-                "yes"
-            } else {
-                "no (B toggle)"
-            },
-            editor.out_dir.display()
+            }
         )
-    } else {
-        editor.notice.clone()
     };
     queue!(
         out,
-        MoveTo(0, footer + 2),
+        MoveTo(0, foot + 4),
         Clear(ClearType::CurrentLine),
         SetForegroundColor(Color::DarkGrey),
-        Print(cut(&msg, canvas.cols as usize)),
+        Print(cut(&msg, cols)),
         ResetColor
     )?;
     out.flush()?;
     Ok(canvas)
+}
+// Clickable footer entries use the same label geometry as the bottom image bar.
+fn footer_image_at(editor: &Editor, canvas: &Canvas, col: usize) -> Option<usize> {
+    let mut cursor = 2usize;
+    for i in 0..=editor.extra_images.len() {
+        let path = if i == 0 {
+            &editor.source_path
+        } else {
+            &editor.extra_images[i - 1].path
+        };
+        let text = format!(
+            "{}{}:{}  ",
+            if i == editor.selected_image {
+                "❯"
+            } else {
+                ""
+            },
+            i + 1,
+            name(path)
+        );
+        cursor += text.chars().count();
+        if col < cursor {
+            return Some(i);
+        }
+    }
+    None
 }
 fn mouse_voxel(editor: &Editor, canvas: &Canvas, mouse: MouseEvent) -> Option<(usize, [usize; 3])> {
     let (cw, ch) = crate::render::cell_pixels(canvas.cols, canvas.rows);
@@ -1265,34 +1584,57 @@ fn mouse_voxel(editor: &Editor, canvas: &Canvas, mouse: MouseEvent) -> Option<(u
 }
 fn show_text_menu(out: &mut impl Write, title: &str, lines: &[String]) -> Result<()> {
     let (cols, rows) = terminal::size()?;
-    queue!(
-        out,
-        MoveTo(0, 0),
-        Clear(ClearType::All),
-        SetForegroundColor(Color::Cyan),
-        Print(cut(title, cols as usize)),
-        ResetColor
-    )?;
-    for (i, line) in lines
-        .iter()
-        .take(rows.saturating_sub(2) as usize)
-        .enumerate()
-    {
+    let width = (lines.iter().map(|s| s.chars().count()).max().unwrap_or(40) + 6)
+        .min(cols.saturating_sub(2) as usize)
+        .max(24);
+    let height = (lines.len() + 5)
+        .min(rows.saturating_sub(2) as usize)
+        .max(5);
+    let x = (cols as usize).saturating_sub(width) / 2;
+    let y = (rows as usize).saturating_sub(height) / 2;
+    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+    for i in 0..height {
+        let (left, right) = if i == 0 {
+            ('╭', '╮')
+        } else if i == height - 1 {
+            ('╰', '╯')
+        } else {
+            ('│', '│')
+        };
+        let filler = if i == 0 || i == height - 1 {
+            '─'
+        } else {
+            ' '
+        };
+        let frame = format!("{left}{}{right}", filler.to_string().repeat(width - 2));
         queue!(
             out,
-            MoveTo(0, i as u16 + 1),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(Color::Grey),
-            Print(cut(line, cols as usize)),
-            ResetColor
+            MoveTo(x as u16, (y + i) as u16),
+            SetForegroundColor(Color::DarkGrey),
+            Print(frame)
         )?;
     }
     queue!(
         out,
-        MoveTo(0, rows.saturating_sub(1)),
-        Clear(ClearType::CurrentLine),
+        MoveTo((x + 2) as u16, y as u16),
+        SetForegroundColor(Color::Cyan),
+        Print(cut(title, width.saturating_sub(4)))
+    )?;
+    for (i, line) in lines.iter().take(height.saturating_sub(4)).enumerate() {
+        let heading = line.starts_with("# ");
+        let txt = if heading { &line[2..] } else { line.as_str() };
+        queue!(
+            out,
+            MoveTo((x + 2) as u16, (y + 2 + i) as u16),
+            SetForegroundColor(if heading { Color::Cyan } else { Color::Grey }),
+            Print(cut(txt, width.saturating_sub(4)))
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo((x + 2) as u16, (y + height - 2) as u16),
         SetForegroundColor(Color::DarkGrey),
-        Print("Esc / ? to return"),
+        Print("Esc to close"),
         ResetColor
     )?;
     out.flush()?;
@@ -1300,52 +1642,236 @@ fn show_text_menu(out: &mut impl Write, title: &str, lines: &[String]) -> Result
 }
 fn help(out: &mut impl Write, _editor: &Editor) -> Result<()> {
     let lines = vec![
-        "Ctrl+E (viewer): enter editor · q exits back to viewer".into(),
-        "z/x/c or y focus Z/X/Y · 1/2/3 focus X/Y/Z · Tab next view".into(),
-        "Z/X/C toggle displayed orthoplane · f focused/all three".into(),
-        "Up/Down or wheel scroll focused view; [ ] change slice stride".into(),
-        "Shift+arrows pan selected view; Shift+left drag pan".into(),
-        "Ctrl+wheel / +/- zoom selected view; 0 reset zoom".into(),
-        "Shift+wheel adjusts brush diameter; ,/. diameter -/+".into(),
-        "Left drag 3D sphere paint; right drag erase".into(),
-        "Shift+hover moves crosshairs in other two views (no paint)".into(),
-        "n new Trim segment (zero voxels) · N new Fill segment".into(),
-        "Name segment after n/N (Enter keeps default); r rename; Ctrl+A clears".into(),
-        "l segmentation list: arrows select, Space toggle, Enter return".into(),
-        "; next segment · V toggle selected segment visibility".into(),
-        "o/O decrease/increase segment opacity · m toggle brain mask".into(),
-        "i sample nearby intensity · I manually specify Fill intensity".into(),
-        "u or Cmd+Z undo · U or Ctrl+R redo".into(),
-        "B enable/disable writing a binary brain mask (threshold > 0)".into(),
-        "w set display window · s save (inputs never overwritten)".into(),
-        "? / Esc close help · Ctrl+C force exit".into(),
-    ];
-    show_text_menu(out, "niv edit — shortcuts", &lines)
+        "# Views and navigation",
+        "Tab switch focused plane · z/x/c/y toggle planes",
+        "f / Enter single plane or restore all three",
+        "↑↓ move focused slice · ←→ move linked plane · [ ] stride",
+        "Shift+arrows / Shift+drag / middle-drag pan",
+        "Ctrl+wheel / +/- zoom · 0 reset zoom",
+        "r rotate 90° · h horizontal flip · v vertical flip",
+        "# Segmentation",
+        "a create/name segmentation · F2 rename · ; next segment",
+        "1–9 select segment · Shift+1–9 toggle visibility",
+        "Left-drag paint sphere · right-drag erase · e keyboard erase",
+        "Shift+hover update crosshairs without painting",
+        "Shift+wheel / , . brush diameter · o/O opacity",
+        "t cycle effect: off / set inside / set outside",
+        "I set target intensity · = sample nearby intensity",
+        "l segmentation list · u/Ctrl+Z/Cmd+Z undo",
+        "U/Ctrl+R/Ctrl+Shift+Z/Cmd+Shift+Z redo",
+        "# Images and output",
+        "n load aligned NIfTI · Tab file picker completion",
+        "\\ cycle displayed image · m/M edit min/max · w edit range",
+        "i selected image information · p preview edited output",
+        "b show/hide existing mask · B toggle binary mask export · s save",
+        "q return to viewer · ? help",
+    ]
+    .iter()
+    .map(|v| (*v).to_string())
+    .collect::<Vec<_>>();
+    show_text_menu(out, "niv edit · help", &lines)
 }
 fn segment_list(out: &mut impl Write, editor: &Editor) -> Result<()> {
     let mut lines = vec![
-        "Up/Down select · Space show/hide · r rename · Enter/Esc return".into(),
+        "# Segmentations".into(),
+        "↑↓ select · Space toggle · F2 rename · Esc close".into(),
         String::new(),
     ];
     for (i, s) in editor.segments.iter().enumerate() {
         lines.push(format!(
-            "{} {:02} {:<22} {:<4} {} {}",
+            "{} {:02} {:<20} {}  {}={:.5}",
             if i == editor.active_seg { "❯" } else { " " },
             i + 1,
             s.name,
-            s.role.name(),
-            if s.visible { "visible" } else { "hidden" },
-            if s.role == Role::Fill {
-                format!("value {}", s.fill_value)
-            } else {
-                "".into()
-            }
+            if s.visible { "shown" } else { "hidden" },
+            s.region.label(),
+            s.fill_value
         ));
     }
     if editor.segments.is_empty() {
-        lines.push("No segments yet: close list and press n or N".into());
+        lines.push("No segments: press a to create one".into());
     }
-    show_text_menu(out, "niv edit — segmentations", &lines)
+    show_text_menu(out, "niv edit · segments", &lines)?;
+    let (cols, rows) = terminal::size()?;
+    let width = (lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(40)
+        + 6)
+    .min(cols.saturating_sub(2) as usize)
+    .max(24);
+    let height = (lines.len() + 5)
+        .min(rows.saturating_sub(2) as usize)
+        .max(5);
+    let x = (cols as usize).saturating_sub(width) / 2;
+    let y = (rows as usize).saturating_sub(height) / 2;
+    for (i, seg) in editor.segments.iter().enumerate() {
+        if i + 3 >= height.saturating_sub(4) {
+            break;
+        }
+        queue!(
+            out,
+            MoveTo((x + 2) as u16, (y + i + 5) as u16),
+            SetForegroundColor(Color::Rgb {
+                r: seg.color[0],
+                g: seg.color[1],
+                b: seg.color[2]
+            }),
+            Print(cut(&lines[i + 3], width.saturating_sub(4))),
+            ResetColor
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+fn image_info(out: &mut impl Write, editor: &Editor) -> Result<()> {
+    let vol = editor.selected_volume();
+    let lines = vec![
+        "# Selected NIfTI".to_owned(),
+        format!("Path: {}", editor.selected_path().display()),
+        format!("Dimensions: {:?} voxels", vol.dims()),
+        format!("Voxel spacing: {:?}", vol.spacing),
+        format!("Spatial units: {}", vol.spatial_units),
+        format!("Datatype code: {}", vol.datatype),
+        format!(
+            "Display min/max: {:.7}, {:.7}",
+            editor.selected_window().0,
+            editor.selected_window().1
+        ),
+        format!(
+            "Focused view: {} · rotation {}° · flips h={} v={}",
+            ["X", "Y", "Z"][editor.active_view],
+            editor.rotation[editor.active_view] as usize * 90,
+            editor.flip_h[editor.active_view],
+            editor.flip_v[editor.active_view]
+        ),
+        format!("Output directory: {}", editor.out_dir.display()),
+    ];
+    show_text_menu(out, "niv edit · image information", &lines)
+}
+fn file_picker(out: &mut impl Write, picker: &PickerState) -> Result<()> {
+    let count = picker.matches.values.len();
+    let (cols, rows) = terminal::size()?;
+    let visible = rows.saturating_sub(11) as usize;
+    let selected = picker.matches.selected_index();
+    let start = selected
+        .saturating_sub(visible / 2)
+        .min(count.saturating_sub(visible));
+    let mut lines = vec![
+        "# Search NIfTI image".into(),
+        format!("Filter: {}▏", picker.text),
+        format!(
+            "{} matches in {}",
+            count,
+            if picker.matches.directory.is_empty() {
+                "."
+            } else {
+                &picker.matches.directory
+            }
+        ),
+        String::new(),
+    ];
+    for (i, item) in picker
+        .matches
+        .values
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
+        lines.push(format!(
+            "{} {}",
+            if i == selected { "❯" } else { " " },
+            item.path
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "↑↓ select · Enter open · ← parent · Tab complete · Esc cancel · {cols} cols"
+    ));
+    show_text_menu(out, "niv edit · load image", &lines)
+}
+enum PickerAction {
+    None,
+    Load(PathBuf),
+    Cancel,
+}
+fn picker_key(picker: &mut PickerState, key: event::KeyEvent) -> PickerAction {
+    match key.code {
+        KeyCode::Esc => return PickerAction::Cancel,
+        KeyCode::Up => picker.matches.move_by(-1),
+        KeyCode::Down => picker.matches.move_by(1),
+        KeyCode::Tab => path_complete::advance(&mut picker.text, &mut picker.matches, false),
+        KeyCode::BackTab => path_complete::advance(&mut picker.text, &mut picker.matches, true),
+        KeyCode::Left => {
+            let mut path = path_complete::resolve(&picker.text);
+            if !path.pop() {
+                picker.text.clear();
+            } else {
+                picker.text = format!("{}/", path.display());
+            }
+            picker.refresh();
+        }
+        KeyCode::Right | KeyCode::Enter => {
+            let path = picker
+                .matches
+                .selected()
+                .map(|m| m.path.clone())
+                .unwrap_or_else(|| picker.text.clone());
+            let resolved = path_complete::resolve(&path);
+            if resolved.is_dir() {
+                picker.text = if path.ends_with('/') {
+                    path
+                } else {
+                    format!("{path}/")
+                };
+                picker.refresh();
+            } else if path_complete::is_nifti_file(&resolved) {
+                return PickerAction::Load(resolved);
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.text.clear();
+            picker.refresh();
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            picker.text.push(c);
+            picker.refresh();
+        }
+        KeyCode::Backspace => {
+            picker.text.pop();
+            picker.refresh();
+        }
+        _ => {}
+    }
+    PickerAction::None
+}
+/// Start in the same NIfTI file browser when `niv` is invoked without paths.
+pub fn pick_first_nifti() -> Result<Option<PathBuf>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("niv requires an interactive terminal when no input file is given");
+    }
+    let _guard = crate::TerminalGuard::enter(true, false)?;
+    let mut out = io::stdout().lock();
+    let mut picker = PickerState::open();
+    loop {
+        file_picker(&mut out, &picker)?;
+        match event::read()? {
+            Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                match picker_key(&mut picker, key) {
+                    PickerAction::Load(path) => return Ok(Some(path)),
+                    PickerAction::Cancel => return Ok(None),
+                    PickerAction::None => {}
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn paint_path(editor: &mut Editor, from: [usize; 3], to: [usize; 3], erase: bool) {
@@ -1396,14 +1922,18 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
     let mut current_canvas = canvas(&editor.source, &editor)?;
     let mut redraw = true;
     let mut help_open = false;
-    let mut last_pan: Option<(usize, u16, u16)> = None;
+    let mut last_pan: Option<(usize, u16, u16, MouseButton)> = None;
     let mut last_frame = Instant::now() - Duration::from_millis(100);
     let frame_interval = Duration::from_millis(40);
     let mut dragging: Option<(MouseButton, [usize; 3])> = None;
     loop {
         if redraw && last_frame.elapsed() >= frame_interval {
-            if help_open {
+            if let Some(picker) = editor.picker.as_ref() {
+                file_picker(stdout, picker)?;
+            } else if help_open {
                 help(stdout, &editor)?;
+            } else if editor.info_open {
+                image_info(stdout, &editor)?;
             } else if editor.seg_list_open {
                 segment_list(stdout, &editor)?;
             } else {
@@ -1415,11 +1945,8 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
         if !event::poll(Duration::from_millis(15))? {
             continue;
         }
-        let event = event::read()?;
-        match event {
-            Event::Resize(_, _) => {
-                redraw = true;
-            }
+        match event::read()? {
+            Event::Resize(_, _) => redraw = true,
             Event::Key(key) => {
                 if key.kind == event::KeyEventKind::Release {
                     continue;
@@ -1427,14 +1954,31 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     break;
                 }
-                if help_open {
-                    if matches!(
-                        key.code,
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                    ) || (key.code == KeyCode::Char('/')
-                        && key.modifiers.contains(KeyModifiers::SHIFT))
+                if let Some(picker) = editor.picker.as_mut() {
+                    match picker_key(picker, key) {
+                        PickerAction::None => {}
+                        PickerAction::Cancel => {
+                            editor.picker = None;
+                            execute!(stdout, Clear(ClearType::All))?;
+                        }
+                        PickerAction::Load(path) => {
+                            editor.picker = None;
+                            if let Err(err) = editor.add_image(&path) {
+                                editor.notice = format!("Cannot load image: {err:#}");
+                            }
+                            execute!(stdout, Clear(ClearType::All))?;
+                        }
+                    }
+                    redraw = true;
+                    continue;
+                }
+                if help_open || editor.info_open {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?' | 'i'))
+                        || (key.code == KeyCode::Char('/')
+                            && key.modifiers.contains(KeyModifiers::SHIFT))
                     {
                         help_open = false;
+                        editor.info_open = false;
                         execute!(stdout, Clear(ClearType::All))?;
                         redraw = true;
                     }
@@ -1458,7 +2002,7 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                             }
                         }
                         KeyCode::Char(' ') => editor.seg_visible(),
-                        KeyCode::Char('r') => {
+                        KeyCode::F(2) => {
                             if let Some(seg) = editor.segments.get(editor.active_seg) {
                                 editor.edit_value = Some((EntryKind::Name, seg.name.clone()));
                                 editor.seg_list_open = false;
@@ -1472,27 +2016,23 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                 }
                 if editor.edit_value.is_some() {
                     match key.code {
-                        KeyCode::Esc => {
-                            editor.edit_value = None;
-                        }
+                        KeyCode::Esc => editor.edit_value = None,
                         KeyCode::Backspace => {
                             if let Some((_, txt)) = editor.edit_value.as_mut() {
                                 txt.pop();
                             }
                         }
-                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some((_, txt)) = editor.edit_value.as_mut() {
-                                txt.clear();
-                            }
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('a' | 'u')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
                             if let Some((_, txt)) = editor.edit_value.as_mut() {
                                 txt.clear();
                             }
                         }
                         KeyCode::Char(c)
-                            if c.is_ascii_alphanumeric()
-                                || matches!(c, '.' | ',' | '-' | '_' | ' ' | '+') =>
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
                         {
                             if let Some((_, txt)) = editor.edit_value.as_mut() {
                                 txt.push(c);
@@ -1503,42 +2043,29 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                             let answer = match entry {
                                 EntryKind::Fill => match string.parse::<f32>() {
                                     Ok(v) if v.is_finite() && v >= 0. => {
-                                        if editor
-                                            .segments
-                                            .get(editor.active_seg)
-                                            .is_some_and(|s| s.role == Role::Fill)
-                                        {
+                                        if editor.segments.is_empty() {
+                                            Err("Create a segmentation with a first".to_string())
+                                        } else {
                                             editor.segments[editor.active_seg].fill_value = v;
                                             editor.rebuild_all();
                                             editor.dirty = true;
-                                            Ok(format!("Fill intensity set to {v}"))
-                                        } else {
-                                            Err("Choose a Fill segment first".to_owned())
+                                            Ok(format!("Target intensity = {v}"))
                                         }
                                     }
-                                    _ => Err("Invalid finite, nonnegative intensity".to_owned()),
+                                    _ => Err("Intensity must be finite and nonnegative".into()),
                                 },
                                 EntryKind::Name => {
-                                    let previous = editor
-                                        .segments
-                                        .get(editor.active_seg)
-                                        .map(|s| s.name.clone())
-                                        .unwrap_or_default();
                                     if !string.is_empty() {
                                         editor.seg_name(&string);
                                     }
-                                    let updated = editor
-                                        .segments
-                                        .get(editor.active_seg)
-                                        .map(|s| s.name.clone())
-                                        .unwrap_or_default();
-                                    if previous == updated
-                                        && Editor::sanitize_name(&string) != previous
-                                    {
-                                        Err(editor.notice.clone())
-                                    } else {
-                                        Ok(format!("Segment name: {updated}"))
-                                    }
+                                    Ok(format!(
+                                        "Segment: {}",
+                                        editor
+                                            .segments
+                                            .get(editor.active_seg)
+                                            .map(|s| s.name.as_str())
+                                            .unwrap_or("none")
+                                    ))
                                 }
                                 EntryKind::Window => {
                                     match string.split_once(',').and_then(|(a, b)| {
@@ -1550,16 +2077,37 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                                         Some((lo, hi))
                                             if lo.is_finite() && hi.is_finite() && lo < hi =>
                                         {
-                                            editor.windows = (lo, hi);
+                                            editor.set_selected_window((lo, hi));
                                             Ok(format!("Display window {lo}..{hi}"))
                                         }
-                                        _ => Err("Window must be two increasing numbers: min,max"
-                                            .to_owned()),
+                                        _ => Err("Enter min,max with min < max".into()),
+                                    }
+                                }
+                                EntryKind::Minimum | EntryKind::Maximum => {
+                                    match string.parse::<f32>() {
+                                        Ok(v) if v.is_finite() => {
+                                            let (lo, hi) = editor.selected_window();
+                                            let window = if entry == EntryKind::Minimum {
+                                                (v, hi)
+                                            } else {
+                                                (lo, v)
+                                            };
+                                            if window.0 < window.1 {
+                                                editor.set_selected_window(window);
+                                                Ok(format!(
+                                                    "Display window {:.5}..{:.5}",
+                                                    window.0, window.1
+                                                ))
+                                            } else {
+                                                Err("Minimum must be smaller than maximum".into())
+                                            }
+                                        }
+                                        _ => Err("Invalid finite display value".into()),
                                     }
                                 }
                             };
                             editor.notice = match answer {
-                                Ok(msg) | Err(msg) => msg,
+                                Ok(m) | Err(m) => m,
                             };
                         }
                         _ => {}
@@ -1567,24 +2115,60 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                     redraw = true;
                     continue;
                 }
-                if key.modifiers.contains(KeyModifiers::SUPER)
-                    && matches!(key.code, KeyCode::Char('z' | 'Z'))
-                {
-                    editor.undo();
+                // Keyboard enhancement can report shifted characters as either
+                // uppercase letters or lowercase letters with SHIFT set.
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if (cmd || ctrl) && matches!(key.code, KeyCode::Char('z' | 'Z')) {
+                    if shift || key.code == KeyCode::Char('Z') {
+                        editor.redo();
+                    } else {
+                        editor.undo();
+                    }
                     redraw = true;
                     continue;
                 }
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('r' | 'R'))
-                {
+                if ctrl && matches!(key.code, KeyCode::Char('r' | 'R')) {
                     editor.redo();
                     redraw = true;
                     continue;
                 }
+                if let KeyCode::Char(c) = key.code {
+                    // Support both Kitty-shift-modified digits and legacy
+                    // terminal !@#... sequences for toggling visibility.
+                    let digit = if c.is_ascii_digit() {
+                        c.to_digit(10)
+                    } else {
+                        "!@#$%^&*("
+                            .chars()
+                            .position(|mark| mark == c)
+                            .map(|i| i as u32 + 1)
+                    };
+                    if let Some(n) = digit {
+                        if n == 0 {
+                            let a = editor.active_view;
+                            editor.zoom[a] = 1.;
+                            let (h, v) = axes(a);
+                            let dims = editor.dims();
+                            editor.centers[a] =
+                                [(dims[h] - 1) as f64 / 2., (dims[v] - 1) as f64 / 2.];
+                        } else if (n as usize) <= editor.segments.len() {
+                            if shift || !c.is_ascii_digit() {
+                                editor.segments[n as usize - 1].visible =
+                                    !editor.segments[n as usize - 1].visible;
+                            } else {
+                                editor.finish_stroke();
+                                editor.active_seg = n as usize - 1;
+                            }
+                        }
+                        redraw = true;
+                        continue;
+                    }
+                }
                 match key.code {
                     KeyCode::Char('?') | KeyCode::Char('/')
-                        if key.code == KeyCode::Char('?')
-                            || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        if key.code == KeyCode::Char('?') || shift =>
                     {
                         editor.finish_stroke();
                         if let Some(id) = active_image.take() {
@@ -1604,107 +2188,90 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                         editor.quit_armed = false;
                         editor.notice.clear();
                     }
-                    KeyCode::Char('1' | '2' | '3') => {
-                        editor.active_view = match key.code {
-                            KeyCode::Char('1') => 0,
-                            KeyCode::Char('2') => 1,
-                            _ => 2,
-                        };
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let advance = if key.code == KeyCode::Tab { 1 } else { 2 };
+                        for _ in 0..3 {
+                            editor.active_view = (editor.active_view + advance) % 3;
+                            if editor.visible_views[editor.active_view] {
+                                break;
+                            }
+                        }
                         editor.hover = None;
                     }
-                    KeyCode::Char('x' | 'y' | 'c' | 'z')
-                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
-                    {
+                    KeyCode::Char('x' | 'X' | 'c' | 'C' | 'y' | 'Y' | 'z' | 'Z') => {
                         let axis = match key.code {
-                            KeyCode::Char('x') => 0,
-                            KeyCode::Char('c' | 'y') => 1,
+                            KeyCode::Char('x' | 'X') => 0,
+                            KeyCode::Char('c' | 'C' | 'y' | 'Y') => 1,
                             _ => 2,
                         };
                         editor.toggle_view(axis);
                     }
-                    KeyCode::Char('x' | 'y' | 'c' | 'z')
-                        if !key.modifiers.contains(KeyModifiers::SHIFT) =>
-                    {
-                        editor.active_view = match key.code {
-                            KeyCode::Char('x') => 0,
-                            KeyCode::Char('y' | 'c') => 1,
-                            _ => 2,
-                        };
-                        if !editor.visible_views[editor.active_view] {
+                    KeyCode::Char('f') | KeyCode::Enter => {
+                        if editor.visible_views.iter().filter(|&&v| v).count() == 1 {
+                            editor.visible_views = [true; 3];
+                        } else {
+                            editor.visible_views = [false; 3];
                             editor.visible_views[editor.active_view] = true;
                         }
                         editor.hover = None;
                     }
-                    KeyCode::Char('X' | 'C' | 'Y' | 'Z') => {
-                        let axis = match key.code {
-                            KeyCode::Char('X') => 0,
-                            KeyCode::Char('Y' | 'C') => 1,
-                            _ => 2,
-                        };
-                        editor.toggle_view(axis);
+                    KeyCode::Char('r') => {
+                        editor.rotation[editor.active_view] =
+                            (editor.rotation[editor.active_view] + 1) % 4
                     }
-                    KeyCode::Tab => {
-                        for _ in 0..3 {
-                            editor.active_view = (editor.active_view + 1) % 3;
-                            if editor.visible_views[editor.active_view] {
-                                break;
-                            }
-                        }
-                        editor.hover = None;
+                    KeyCode::Char('h') => {
+                        editor.flip_h[editor.active_view] = !editor.flip_h[editor.active_view]
                     }
-                    KeyCode::BackTab => {
-                        for _ in 0..3 {
-                            editor.active_view = (editor.active_view + 2) % 3;
-                            if editor.visible_views[editor.active_view] {
-                                break;
-                            }
-                        }
-                        editor.hover = None;
-                    }
-                    KeyCode::Char('f') => {
-                        editor.solo = !editor.solo;
-                        editor.hover = None;
+                    KeyCode::Char('v') => {
+                        editor.flip_v[editor.active_view] = !editor.flip_v[editor.active_view]
                     }
                     KeyCode::Up
                     | KeyCode::Down
                     | KeyCode::Left
                     | KeyCode::Right
                     | KeyCode::Char('j' | 'k') => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            let units = 4. / editor.zoom[editor.active_view] as f64;
-                            let dh = if key.code == KeyCode::Left {
-                                -units
-                            } else if key.code == KeyCode::Right {
-                                units
-                            } else {
-                                0.
-                            };
-                            let dv = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
-                                units
-                            } else if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                                -units
-                            } else {
-                                0.
-                            };
-                            editor.pan(editor.active_view, dh, dv);
-                        } else if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-                            let (h, _) = axes(editor.active_view);
-                            editor.move_slice(h, if key.code == KeyCode::Right { 1 } else { -1 });
+                        let axis = editor.active_view;
+                        let mult = if shift {
+                            4
+                        } else if ctrl {
+                            3
+                        } else if key.modifiers.contains(KeyModifiers::ALT) {
+                            2
                         } else {
-                            let step = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                3
-                            } else if key.modifiers.contains(KeyModifiers::ALT) {
-                                2
-                            } else {
-                                1
+                            1
+                        };
+                        let step = editor.stride * mult;
+                        if shift {
+                            let (dx, dy) = match key.code {
+                                KeyCode::Left => (-1., 0.),
+                                KeyCode::Right => (1., 0.),
+                                KeyCode::Up | KeyCode::Char('k') => (0., 1.),
+                                _ => (0., -1.),
                             };
+                            let nat = native_from_display(&editor, axis, [dx, dy]);
+                            editor.pan(
+                                axis,
+                                -nat[0] * editor.stride as f64,
+                                -nat[1] * editor.stride as f64,
+                            );
+                        } else if key.code == KeyCode::Left || key.code == KeyCode::Right {
+                            let (h, _) = axes(axis);
+                            editor.move_slice(
+                                h,
+                                if key.code == KeyCode::Right {
+                                    step as isize
+                                } else {
+                                    -(step as isize)
+                                },
+                            );
+                        } else {
                             let forward = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
                             editor.move_slice(
-                                editor.active_view,
+                                axis,
                                 if forward {
-                                    (editor.stride * step) as isize
+                                    step as isize
                                 } else {
-                                    -((editor.stride * step) as isize)
+                                    -(step as isize)
                                 },
                             );
                         }
@@ -1714,33 +2281,51 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                     KeyCode::Char(']') => editor.stride = (editor.stride + 1).min(256),
                     KeyCode::Char(',' | '<') => editor.radius(-12.5),
                     KeyCode::Char('.' | '>') => editor.radius(12.5),
-                    KeyCode::Char('+' | '=') => editor.change_zoom(0.25),
-                    KeyCode::Char('-') => editor.change_zoom(-0.25),
-                    KeyCode::Char('0') => editor.zoom[editor.active_view] = 1.,
-                    KeyCode::Char('p') => editor.tool = Tool::Paint,
-                    KeyCode::Char('e') => editor.tool = Tool::Erase,
+                    KeyCode::Char('+') => editor.change_zoom(0.10),
+                    KeyCode::Char('-') => editor.change_zoom(-0.10),
+                    KeyCode::Char('=') => editor.sample_fill(),
+                    KeyCode::Char('p') => editor.preview_output = !editor.preview_output,
+                    KeyCode::Char('e') => {
+                        editor.tool = if editor.tool == Tool::Paint {
+                            Tool::Erase
+                        } else {
+                            Tool::Paint
+                        };
+                        editor.notice = format!(
+                            "Keyboard brush: {}",
+                            if editor.tool == Tool::Paint {
+                                "paint"
+                            } else {
+                                "erase"
+                            }
+                        );
+                    }
                     KeyCode::Char(' ') => {
                         editor.begin_stroke();
-                        let coords = editor.coordinates;
-                        let erase = editor.tool == Tool::Erase;
-                        editor.paint_sphere(coords, erase);
+                        editor.paint_sphere(editor.coordinates, editor.tool == Tool::Erase);
                         editor.finish_stroke();
                     }
-                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        editor.new_segment(Role::Fill);
+                    KeyCode::Char('a') => {
+                        editor.new_segment();
                         editor.edit_value = Some((EntryKind::Name, String::new()));
                     }
-                    KeyCode::Char('n') => {
-                        editor.new_segment(Role::Trim);
-                        editor.edit_value = Some((EntryKind::Name, String::new()));
-                    }
-                    KeyCode::Char('N') => {
-                        editor.new_segment(Role::Fill);
-                        editor.edit_value = Some((EntryKind::Name, String::new()));
-                    }
-                    KeyCode::Char('r') => {
+                    KeyCode::F(2) => {
                         if let Some(seg) = editor.segments.get(editor.active_seg) {
                             editor.edit_value = Some((EntryKind::Name, seg.name.clone()));
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        if let Some(id) = active_image.take() {
+                            kitty::delete(stdout, id)?;
+                        }
+                        editor.picker = Some(PickerState::open());
+                        execute!(stdout, Clear(ClearType::All))?;
+                    }
+                    KeyCode::Char('\\') => editor.cycle_image(),
+                    KeyCode::Char(';') => {
+                        if !editor.segments.is_empty() {
+                            editor.finish_stroke();
+                            editor.active_seg = (editor.active_seg + 1) % editor.segments.len();
                         }
                     }
                     KeyCode::Char('l') => {
@@ -1748,49 +2333,29 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                             kitty::delete(stdout, id)?;
                         }
                         editor.seg_list_open = true;
+                        execute!(stdout, Clear(ClearType::All))?;
                     }
-                    KeyCode::Char('V') => editor.seg_visible(),
-                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        editor.seg_visible()
-                    }
-                    KeyCode::Char(';') => {
-                        if !editor.segments.is_empty() {
-                            editor.active_seg = (editor.active_seg + 1) % editor.segments.len();
+                    KeyCode::Char('t') => editor.cycle_apply_region(),
+                    KeyCode::Char('I') => {
+                        if let Some(seg) = editor.segments.get(editor.active_seg) {
+                            editor.edit_value =
+                                Some((EntryKind::Fill, format!("{}", seg.fill_value)));
                         }
                     }
-                    KeyCode::Char('B') => {
-                        editor.export_mask = !editor.export_mask;
-                        editor.notice = if editor.export_mask {
-                            "Will export binary brain mask"
-                        } else {
-                            "Binary mask export disabled"
-                        }
-                        .into();
-                    }
-                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        editor.export_mask = !editor.export_mask;
-                    }
-                    KeyCode::Char('S') => {
-                        if !editor.segments.is_empty() {
-                            editor.finish_stroke();
-                            editor.active_seg = (editor.active_seg + 1) % editor.segments.len();
+                    KeyCode::Char('i') if shift => {
+                        if let Some(seg) = editor.segments.get(editor.active_seg) {
+                            editor.edit_value =
+                                Some((EntryKind::Fill, format!("{}", seg.fill_value)));
                         }
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        editor.redo()
-                    }
-                    KeyCode::Char('u') => editor.undo(),
-                    KeyCode::Char('U') => editor.redo(),
-
-                    KeyCode::Char('v') => {
-                        if editor.raw.is_some() {
-                            editor.show_raw = !editor.show_raw;
-                        } else {
-                            editor.notice = "No --raw volume loaded".into();
+                    KeyCode::Char('i') => {
+                        if let Some(id) = active_image.take() {
+                            kitty::delete(stdout, id)?;
                         }
+                        editor.info_open = true;
+                        execute!(stdout, Clear(ClearType::All))?;
                     }
-                    KeyCode::Char('m') => editor.show_mask = !editor.show_mask,
-                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    KeyCode::Char('o') if shift => {
                         editor.overlay_opacity = (editor.overlay_opacity + 0.05).min(1.)
                     }
                     KeyCode::Char('o') => {
@@ -1799,40 +2364,36 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                     KeyCode::Char('O') => {
                         editor.overlay_opacity = (editor.overlay_opacity + 0.05).min(1.)
                     }
-                    KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if editor
-                            .segments
-                            .get(editor.active_seg)
-                            .is_some_and(|s| s.role == Role::Fill)
-                        {
-                            editor.edit_value = Some((
-                                EntryKind::Fill,
-                                format!("{}", editor.segments[editor.active_seg].fill_value),
-                            ));
-                        }
+                    KeyCode::Char('m') if shift => {
+                        editor.edit_value = Some((
+                            EntryKind::Maximum,
+                            format!("{}", editor.selected_window().1),
+                        ));
                     }
-                    KeyCode::Char('i') => editor.sample_fill(),
-                    KeyCode::Char('I') => {
-                        if editor
-                            .segments
-                            .get(editor.active_seg)
-                            .is_some_and(|s| s.role == Role::Fill)
-                        {
-                            editor.edit_value = Some((
-                                EntryKind::Fill,
-                                format!("{}", editor.segments[editor.active_seg].fill_value),
-                            ));
-                        } else {
-                            editor.notice =
-                                "New Fill segment with N before setting its intensity".into();
-                        }
+                    KeyCode::Char('m') => {
+                        editor.edit_value = Some((
+                            EntryKind::Minimum,
+                            format!("{}", editor.selected_window().0),
+                        ));
+                    }
+                    KeyCode::Char('M') => {
+                        editor.edit_value = Some((
+                            EntryKind::Maximum,
+                            format!("{}", editor.selected_window().1),
+                        ));
                     }
                     KeyCode::Char('w') => {
-                        editor.edit_value = Some((
-                            EntryKind::Window,
-                            format!("{},{}", editor.windows.0, editor.windows.1),
-                        ))
+                        let (lo, hi) = editor.selected_window();
+                        editor.edit_value = Some((EntryKind::Window, format!("{lo},{hi}")));
                     }
+                    KeyCode::Char('b') => editor.show_mask = !editor.show_mask,
+                    KeyCode::Char('B') => {
+                        editor.export_mask = !editor.export_mask;
+                        editor.notice = format!("Binary brain-mask export: {}", editor.export_mask);
+                    }
+                    KeyCode::Char('u') if shift => editor.redo(),
+                    KeyCode::Char('u') => editor.undo(),
+                    KeyCode::Char('U') => editor.redo(),
                     KeyCode::Char('s') => {
                         if let Err(e) = editor.save() {
                             editor.notice = format!("Save error: {e:#}");
@@ -1842,7 +2403,23 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                 }
                 redraw = true;
             }
-            Event::Mouse(mouse) if !help_open && !editor.seg_list_open => {
+            Event::Mouse(mouse)
+                if !help_open
+                    && !editor.seg_list_open
+                    && !editor.info_open
+                    && editor.picker.is_none() =>
+            {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && mouse.row == HEADER_ROWS + current_canvas.geom.rows + 2
+                {
+                    if let Some(i) =
+                        footer_image_at(&editor, &current_canvas, mouse.column as usize)
+                    {
+                        editor.selected_image = i;
+                        redraw = true;
+                    }
+                    continue;
+                }
                 let hit = mouse_voxel(&editor, &current_canvas, mouse);
                 match mouse.kind {
                     MouseEventKind::ScrollUp
@@ -1860,9 +2437,7 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                         if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                             editor.radius(-sign * 25.);
                         } else if mouse.modifiers.contains(KeyModifiers::CONTROL) {
-                            editor.change_zoom(-sign * 0.25);
-                        } else if mouse.modifiers.contains(KeyModifiers::ALT) {
-                            editor.radius(-sign * 12.5);
+                            editor.change_zoom(-sign * 0.10);
                         } else {
                             editor.move_slice(
                                 editor.active_view,
@@ -1877,11 +2452,20 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                     }
                     MouseEventKind::Moved => {
                         if let Some((axis, p)) = hit {
-                            editor.active_view = axis;
                             editor.hover = Some(p);
                             if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                                // No brush-distance threshold: update for every
+                                // newly sampled voxel under the cursor.
                                 editor.move_crosshair_in_plane(axis, p);
                             }
+                            redraw = true;
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Middle) => {
+                        if let Some((axis, p)) = hit {
+                            editor.active_view = axis;
+                            editor.hover = Some(p);
+                            last_pan = Some((axis, mouse.column, mouse.row, MouseButton::Middle));
                             redraw = true;
                         }
                     }
@@ -1891,56 +2475,54 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                         if let Some((axis, p)) = hit {
                             editor.active_view = axis;
                             editor.hover = Some(p);
-                            last_pan = Some((axis, mouse.column, mouse.row));
+                            last_pan = Some((axis, mouse.column, mouse.row, MouseButton::Left));
                             redraw = true;
                         }
                     }
-                    MouseEventKind::Down(MouseButton::Left | MouseButton::Right) => {
+                    MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) => {
                         if let Some((axis, p)) = hit {
                             editor.active_view = axis;
                             editor.hover = Some(p);
                             editor.coordinates = p;
                             if editor.segments.is_empty() {
-                                editor.notice = "Create a segment first: n Trim / N Fill".into();
+                                editor.notice = "Press a to create a segmentation first".into();
                             } else {
                                 editor.begin_stroke();
-                                let erase = mouse.kind == MouseEventKind::Down(MouseButton::Right);
-                                editor.paint_sphere(p, erase);
-                                dragging = Some((
-                                    if erase {
-                                        MouseButton::Right
-                                    } else {
-                                        MouseButton::Left
-                                    },
-                                    p,
-                                ));
+                                editor.paint_sphere(p, button == MouseButton::Right);
+                                dragging = Some((button, p));
                             }
                             redraw = true;
                         }
                     }
-                    MouseEventKind::Drag(MouseButton::Left) if last_pan.is_some() => {
-                        if let Some((axis, col, row)) = last_pan {
-                            let pane = current_canvas.panes.iter().find(|p| p.axis == axis);
-                            if let Some(pane) = pane {
-                                let (ha, va) = axes(axis);
-                                let cells_per_px =
-                                    current_canvas.width as f64 / current_canvas.cols as f64;
-                                let rows_per_px =
-                                    current_canvas.height as f64 / current_canvas.geom.rows as f64;
-                                let dh = -((mouse.column as f64 - col as f64) * cells_per_px)
-                                    * editor.dims()[ha] as f64
-                                    / (pane.w as f64 * editor.zoom[axis] as f64);
-                                let dv = ((mouse.row as f64 - row as f64) * rows_per_px)
-                                    * editor.dims()[va] as f64
-                                    / (pane.h as f64 * editor.zoom[axis] as f64);
-                                editor.pan(axis, dh, dv);
+                    MouseEventKind::Drag(button) => {
+                        if last_pan.is_none()
+                            && button == MouseButton::Left
+                            && mouse.modifiers.contains(KeyModifiers::SHIFT)
+                        {
+                            if let Some((axis, p)) = hit {
+                                editor.active_view = axis;
+                                editor.hover = Some(p);
+                                last_pan = Some((axis, mouse.column, mouse.row, button));
+                                dragging = None;
+                            }
+                        }
+                        if let Some((axis, col, row, pan_button)) = last_pan {
+                            if button == pan_button {
+                                if let Some(pane) =
+                                    current_canvas.panes.iter().find(|pane| pane.axis == axis)
+                                {
+                                    let dx = (mouse.column as f64 - col as f64)
+                                        * current_canvas.width as f64
+                                        / current_canvas.cols as f64;
+                                    let dy = (mouse.row as f64 - row as f64)
+                                        * current_canvas.height as f64
+                                        / current_canvas.geom.rows as f64;
+                                    pan_screen(&mut editor, pane, dx, dy);
+                                }
+                                last_pan = Some((axis, mouse.column, mouse.row, pan_button));
                                 redraw = true;
                             }
-                            last_pan = Some((axis, mouse.column, mouse.row));
-                        }
-                    }
-                    MouseEventKind::Drag(button) => {
-                        if let (Some((axis, p)), Some((started, last))) = (hit, dragging) {
+                        } else if let (Some((axis, p)), Some((started, last))) = (hit, dragging) {
                             if button == started {
                                 editor.active_view = axis;
                                 editor.hover = Some(p);
@@ -1956,14 +2538,6 @@ fn run_loop(mut editor: Editor, stdout: &mut impl Write) -> Result<()> {
                         dragging = None;
                         last_pan = None;
                         redraw = true;
-                    }
-                    MouseEventKind::Down(MouseButton::Middle) => {
-                        if let Some((axis, p)) = hit {
-                            editor.active_view = axis;
-                            editor.coordinates = p;
-                            editor.hover = Some(p);
-                            redraw = true;
-                        }
                     }
                 }
             }
@@ -2009,10 +2583,14 @@ mod tests {
             mask_path: Some(PathBuf::from("mask.nii.gz")),
             export_mask: true,
             raw: None,
+            extra_images: Vec::new(),
+            selected_image: 0,
+            picker: None,
+            info_open: false,
+            preview_output: false,
             segments: Vec::new(),
             active_seg: 0,
             active_view: 0,
-            solo: false,
             visible_views: [true; 3],
             zoom: [1.; 3],
             centers: [
@@ -2020,9 +2598,11 @@ mod tests {
                 [dims[0] as f64 / 2., dims[2] as f64 / 2.],
                 [dims[0] as f64 / 2., dims[1] as f64 / 2.],
             ],
+            rotation: [0; 3],
+            flip_h: [false; 3],
+            flip_v: [false; 3],
             stride: 1,
             tool: Tool::Paint,
-            show_raw: false,
             show_mask: true,
             overlay_opacity: 0.22,
             seg_list_open: false,
@@ -2039,7 +2619,8 @@ mod tests {
             quit_armed: false,
             edit_value: None,
         };
-        e.new_segment(Role::Trim);
+        e.new_segment();
+        e.segments[0].region = ApplyRegion::Inside;
         e
     }
     #[test]
@@ -2087,6 +2668,7 @@ mod tests {
             fill_value: 0.,
             color: palette(Role::Trim, 0),
             visible: false,
+            region: Some(ApplyRegion::Inside),
         };
         let restored: SegmentMetadata = toml::from_str(&toml::to_string(&meta).unwrap()).unwrap();
         assert!(!restored.visible);
@@ -2109,8 +2691,9 @@ mod tests {
         assert_eq!(e.work[mid], 0.);
         assert_eq!(e.binary[mid], 0);
         assert_eq!(e.source.data[mid], 10.);
-        e.new_segment(Role::Fill);
+        e.new_segment();
         e.segments[e.active_seg].fill_value = 37.;
+        e.segments[e.active_seg].region = ApplyRegion::Inside;
         e.begin_stroke();
         e.paint_sphere(mid, false);
         e.finish_stroke();
@@ -2129,12 +2712,78 @@ mod tests {
             fill_value: 37.125,
             color: [24, 210, 190],
             visible: true,
+            region: Some(ApplyRegion::Outside),
         };
         let serialized = toml::to_string_pretty(&metadata).unwrap();
         let restored: SegmentMetadata = toml::from_str(&serialized).unwrap();
         assert_eq!(restored.fill_value, 37.125);
         assert_eq!(restored.color, [24, 210, 190]);
         assert_eq!(restored.role, "fill");
+    }
+    #[test]
+    fn generic_segment_inside_outside_and_overlay_keep_source_intact() {
+        let mut e = synthetic([9, 9, 9], [50.; 3]);
+        let center = e.coordinates;
+        e.paint_sphere(center, false);
+        e.finish_stroke();
+        assert_eq!(e.source.data[center], 10.);
+        assert_eq!(e.work[center], 0.);
+        assert_eq!(e.selected_volume().data[center], 10.);
+        let c = colorized(&e, center);
+        assert!(c[1] > c[0]); // green translucent overlay over original gray
+        e.segments[0].fill_value = 17.;
+        e.segments[0].region = ApplyRegion::Outside;
+        e.rebuild_all();
+        assert_eq!(e.work[center], 10.);
+        assert_eq!(e.work[[0, 0, 0]], 17.);
+        e.segments[0].region = ApplyRegion::Off;
+        e.rebuild_all();
+        assert_eq!(e.work[[0, 0, 0]], 10.);
+    }
+    #[test]
+    fn orientation_view_roundtrip_works_with_rotations_and_flips() {
+        let mut e = synthetic([13, 15, 17], [50.; 3]);
+        let pane = Pane {
+            axis: 1,
+            x: 20,
+            y: 10,
+            w: 400,
+            h: 360,
+        };
+        for rot in 0..4 {
+            e.rotation[1] = rot;
+            for flip in [false, true] {
+                e.flip_h[1] = flip;
+                e.flip_v[1] = !flip;
+                let p = [8, 7, 11];
+                let (x, y) = pixel_for(&e, &pane, p);
+                let q = voxel_at(&e, &pane, x as usize, y as usize).unwrap();
+                assert!((q[0] as isize - p[0] as isize).abs() <= 1);
+                assert!((q[2] as isize - p[2] as isize).abs() <= 1);
+            }
+        }
+    }
+    #[test]
+    fn selected_image_window_does_not_modify_edit_source_window() {
+        let mut e = synthetic([7; 3], [50.; 3]);
+        let other = Volume {
+            data: e.source.data.clone(),
+            spacing: [50.; 3],
+            spatial_units: 3,
+            sform: None,
+            datatype: 16,
+        };
+        e.extra_images.push(ImageLayer {
+            path: "extra.nii.gz".into(),
+            window: (2., 11.),
+            volume: other,
+        });
+        e.selected_image = 1;
+        e.set_selected_window((4., 8.));
+        assert_eq!(e.windows, (0., 100.));
+        assert_eq!(e.selected_window(), (4., 8.));
+        e.cycle_image();
+        assert_eq!(e.selected_image, 0);
     }
     #[test]
     fn completed_drag_stroke_is_a_single_undo_operation() {

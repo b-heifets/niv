@@ -12,7 +12,7 @@
 
 ## Features
 
-- **Experimental mask editing** (`Ctrl+E` or `niv edit`): synchronized X/Y/Z planes, 3D sphere painting/erasing, separate trim/fill segmentations, raw-image comparison, and non-destructive NIfTI output. See [Mask editing](docs/mask-editing.md).
+- **Experimental mask editing** (`Ctrl+E` or `niv edit`): synchronized X/Y/Z planes, 3D sphere painting/erasing, generic named segmentations, translucent overlays, inside/outside intensity operations, and non-destructive NIfTI output. See [Mask editing](docs/mask-editing.md).
 
 - **Responsive slice browsing** in the X, Y or Z voxel-index axis with raw/CCF viewing presets and independent rotation/flip settings. NIfTI sform/qform metadata never reorders the voxel array.
 - **Multiple image layers** with reorder, hide/show, adjustable intensity windows, opacity, and grayscale, warm, cool, or deterministic categorical colors.
@@ -82,7 +82,9 @@ niv edit autofluo_50um_masked.nii.gz \
   --mask autofluo_50um_brain_mask.nii.gz --raw autofluo_50um.nii.gz
 ```
 
-Press `n` to create and name a green Trim segmentation, or `N` for a Fill segmentation. Use a 3D spherical brush, inspect three synchronized orthogonal panes, and save new NIfTI images without changing the source. `z/x/c` focuses planes, `Z/X/C` toggles their visibility; Shift+wheel adjusts brush diameter and Ctrl+wheel zooms only the active pane. The segmentation list (`l`) supports selection and show/hide. A brain mask is optional and can be derived from positive image intensities when saving (`B`). See [the mask-editing guide](docs/mask-editing.md) for the complete controls and file format.
+Press **`a`** to create a named segmentation; nothing is created automatically. The first label is green, with a default opacity of 22%. Paint with a 3D physical sphere (left drag) or erase (right drag). The original grayscale image stays visible beneath the overlay. Press **`t`** to select whether the segment sets intensities inside or outside painted voxels, then **`I`** to choose the target value; `p` previews the derived output.
+
+`Tab` cycles the focused plane, while `z/x/c` toggles individual planes. Middle-button drag or Shift+drag pans, Shift+wheel adjusts the brush, and Ctrl+wheel zooms one plane. Press **`n`** to load another grid-aligned NIfTI, click its name in the bottom image bar to select it, and use `m/M` to adjust grayscale min/max. Press **`?`** for the sectioned help menu and **`B`** if you want to export an optional binary brain mask. See [the mask-editing guide](docs/mask-editing.md) for complete instructions.
 
 ## Quick start
 
@@ -90,6 +92,7 @@ Press `n` to create and name a green Trim segmentation, or `N` for a Fill segmen
 niv image.nii.gz                              # raw voxel index view (Z, rotation 0°)
 niv --view-preset ccf clusters.nii.gz -a -t    # CCFv3 X, rotation 90°
 niv --view-preset raw reg_inputs/autofl_50um.nii.gz
+niv                                        # searchable NIfTI picker
 niv template.nii.gz clusters.nii.gz -a         # cluster layer + configured atlas
 niv -i image_1.nii.gz image_2.nii.gz           # multiple images
 niv image.nii.gz -a -t                        # add configured atlas and template
